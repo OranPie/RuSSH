@@ -1,0 +1,21 @@
+[package]
+name = "russh-net"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Async tokio networking layer for RuSSH"
+
+[lints]
+workspace = true
+
+[dependencies]
+russh-auth    = { path = "../russh-auth" }
+russh-channel = { path = "../russh-channel" }
+russh-core    = { path = "../russh-core" }
+russh-scp     = { path = "../russh-scp" }
+russh-sftp    = { path = "../russh-sftp" }
+russh-transport = { path = "../russh-transport" }
+tokio.workspace = true

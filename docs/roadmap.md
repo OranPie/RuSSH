@@ -10,11 +10,14 @@ security hardening, and libfuzzer fuzz targets.
 
 158 tests, 0 unsafe blocks.
 
-## v0.2 — Async networked transport
-- Async TCP I/O layer (tokio feature flag)
-- Client `connect()` → negotiation → auth → channel pipeline
-- Server `bind()` → accept loop → per-connection session
-- Proper framing over `AsyncRead` / `AsyncWrite`
+## v0.2 ✅ (current)
+Async networked transport (`russh-net` crate, tokio):
+- `SshClient::connect()` → full KEX → password auth → channel pipeline
+- `SshServer::bind()` → accept loop → per-connection session
+- `exec`, SFTP v3 (upload + read-back), SCP upload over real TCP
+- Self-contained loopback integration test (RuSSH client ↔ RuSSH server)
+
+All tests pass (zero unsafe blocks).
 
 ## v0.3 — OpenSSH interoperability
 - Spawn real `sshd` / `ssh` binaries in integration tests

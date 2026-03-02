@@ -32,6 +32,7 @@ RuSSH is a layered Rust workspace for building secure, OpenSSH-compatible SSH cl
 | `russh-scp` | SCP wire protocol (`ScpFileHeader`, `ScpDirHeader`, build/parse helpers) |
 | `russh-config` | OpenSSH config parser, `resolve_for_host`, Host glob matching, token expansion |
 | `russh-observability` | `EventSink` / `MetricsHook` traits; `tracing` and `metrics` optional backends |
+| `russh-net` | **v0.2** Async TCP client/server (`SshClient`, `SshServer`, SFTP, SCP, exec) |
 | `russh-integration` | End-to-end smoke scenarios, OpenSSH interop helpers |
 
 ## Quick start

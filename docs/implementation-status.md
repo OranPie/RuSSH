@@ -1,4 +1,30 @@
-# RuSSH Implementation Status — v0.1
+# RuSSH Implementation Status — v0.2
+
+## Delivered in v0.2
+
+### Async networked transport (`russh-net`)
+- `PacketStream<S>`: async framing over `tokio::net::TcpStream` using `PacketCodec`
+- `SshClient::connect()`: TCP connect → banner exchange → KEXINIT → ECDH → NEWKEYS → service request
+- `SshClientConnection::authenticate_password()`: password auth request/response loop
+- `SshClientConnection::exec()`: channel open → exec request → data collection → exit-status
+- `SshClientConnection::sftp()`: SFTP subsystem channel open → `SftpSession` (init/write_file/read_file/close)
+- `SshClientConnection::scp_upload()`: exec `scp -t` → SCP wire protocol upload
+- `SshClientConnection::disconnect()`: `SSH_MSG_DISCONNECT`
+- `SshServer::bind()`: `tokio::net::TcpListener` wrapper
+- `SshServer::accept()`: returns `SshServerConnection`
+- `SshServerConnection::run()`: full server handshake, password auth, exec/SFTP/SCP channel dispatch
+- `SessionHandler` trait: pluggable exec handler, sftp root, scp root
+- `DefaultSessionHandler`: built-in `echo <text>` and filesystem-backed SFTP/SCP
+- Loopback integration test covering exec + SFTP + SCP in a single tokio test
+
+### Bug fixes applied during v0.2
+
+- **`russh-transport`**: `receive_kex_ecdh_reply_and_send_newkeys` now clears
+  `local_kexinit_sent`, `remote_kexinit_received`, and rekey counters so that
+  strict-KEX packet-order enforcement is correctly reset after a completed exchange.
+- **`russh-transport`**: Added `ClientSession::store_server_kexinit_payload()` so
+  that the server's raw KEXINIT bytes are captured in `kex_context` before the
+  exchange hash is computed.
 
 ## Delivered in v0.1
 

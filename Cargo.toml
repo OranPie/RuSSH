@@ -7,6 +7,7 @@ members = [
     "crates/russh-core",
     "crates/russh-crypto",
     "crates/russh-integration",
+    "crates/russh-net",
     "crates/russh-observability",
     "crates/russh-scp",
     "crates/russh-sftp",
@@ -33,6 +34,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 getrandom = "0.2"
 rand_core = { version = "0.6", features = ["getrandom"] }
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "sync", "macros", "time"] }
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 

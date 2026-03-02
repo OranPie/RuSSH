@@ -1233,6 +1233,9 @@ impl ClientSession {
             strict_kex: false,
         });
         self.state = SessionState::Established;
+        self.local_kexinit_sent = false;
+        self.remote_kexinit_received = false;
+        self.reset_rekey_counters();
 
         self.bump_outgoing_sequence();
         Ok((newkeys_frame, keys))
@@ -1271,6 +1274,20 @@ impl ClientSession {
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
         self.authenticated_user.is_some()
+    }
+
+    /// Store the raw KEXINIT payload received from the server so the exchange
+    /// hash can include it during `receive_kex_ecdh_reply_and_send_newkeys`.
+    /// Must be called after `send_kexinit` and before `send_kex_ecdh_init`.
+    pub fn store_server_kexinit_payload(&mut self, payload: Vec<u8>) -> Result<(), RusshError> {
+        let ctx = self.kex_context.as_mut().ok_or_else(|| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "no active kex context to store remote kexinit payload",
+            )
+        })?;
+        ctx.remote_kexinit_payload = payload;
+        Ok(())
     }
 
     #[must_use]
