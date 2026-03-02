@@ -751,6 +751,15 @@ impl ClientSession {
             .await
     }
 
+    /// Override the local SSH version string used in the exchange hash.
+    ///
+    /// Call this **before** `handshake` / `send_kexinit` when the networking
+    /// layer uses a banner different from the default.  The string must not
+    /// include the trailing `\r\n`.
+    pub fn set_local_version(&mut self, version: impl Into<String>) {
+        self.local_version = version.into();
+    }
+
     pub async fn handshake_with_peer(&mut self, peer: PeerDescription) -> Result<(), RusshError> {
         ready(()).await;
         self.ensure_state(SessionState::Initialized, "handshake")?;
@@ -763,7 +772,9 @@ impl ClientSession {
         }
 
         self.state = SessionState::BannerExchanged;
-        self.local_version = "SSH-2.0-RuSSH_0.1".to_string();
+        if self.local_version.is_empty() {
+            self.local_version = "SSH-2.0-RuSSH_0.1".to_string();
+        }
         self.remote_version = peer.banner.clone();
         self.events.push(TransportEvent::VersionExchange {
             local: "SSH-2.0-RuSSH_0.1".to_string(),
@@ -864,7 +875,8 @@ impl ClientSession {
         self.ensure_userauth_service_active()?;
 
         let request_user = match &request {
-            UserAuthRequest::PublicKey { user, .. }
+            UserAuthRequest::None { user, .. }
+            | UserAuthRequest::PublicKey { user, .. }
             | UserAuthRequest::Password { user, .. }
             | UserAuthRequest::KeyboardInteractive { user, .. } => user,
         };
@@ -1210,28 +1222,39 @@ impl ClientSession {
         self.session_keys = Some(keys.clone());
         self.kex_context = None;
 
-        let host_key_alg = self
+        let (host_key_alg, mac_c2s, mac_s2c, strict_kex, ext_info_c, ext_info_s) = self
             .negotiated
             .as_ref()
-            .map(|n| n.host_key.clone())
-            .unwrap_or_else(|| "ssh-ed25519".to_string());
-        let mac_c2s = self
-            .negotiated
-            .as_ref()
-            .map(|n| n.mac_client_to_server.clone())
-            .unwrap_or_else(|| "hmac-sha2-256-etm@openssh.com".to_string());
-        let mac_s2c = self
-            .negotiated
-            .as_ref()
-            .map(|n| n.mac_server_to_client.clone())
-            .unwrap_or_else(|| "hmac-sha2-256-etm@openssh.com".to_string());
+            .map(|n| {
+                (
+                    n.host_key.clone(),
+                    n.mac_client_to_server.clone(),
+                    n.mac_server_to_client.clone(),
+                    n.strict_kex,
+                    n.ext_info_c,
+                    n.ext_info_s,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    "ssh-ed25519".to_string(),
+                    "hmac-sha2-256-etm@openssh.com".to_string(),
+                    "hmac-sha2-256-etm@openssh.com".to_string(),
+                    false,
+                    false,
+                    false,
+                )
+            });
 
         self.events.push(TransportEvent::KeyExchangeComplete {
             host_key: host_key_alg,
             mac_client_to_server: mac_c2s,
             mac_server_to_client: mac_s2c,
-            strict_kex: false,
+            strict_kex,
         });
+        // Expect EXT_INFO if server advertised ext-info-s, or if client advertised ext-info-c
+        // (RFC 8308 servers may send EXT_INFO whenever the client signals ext-info-c).
+        self.awaiting_ext_info = ext_info_s || ext_info_c;
         self.state = SessionState::Established;
         self.local_kexinit_sent = false;
         self.remote_kexinit_received = false;
@@ -1468,6 +1491,8 @@ pub struct ServerSession {
     session_keys: Option<SessionKeys>,
     local_version: String,
     remote_version: String,
+    /// Raw client KEXINIT payload (original wire bytes, used for exchange hash).
+    raw_client_kexinit: Option<Vec<u8>>,
 }
 
 impl ServerSession {
@@ -1489,7 +1514,15 @@ impl ServerSession {
             session_keys: None,
             local_version: String::new(),
             remote_version: String::new(),
+            raw_client_kexinit: None,
         }
+    }
+
+    /// Store the raw (wire-format) bytes of the client's KEXINIT payload.
+    /// Must be called before `receive_message(KexInit)` so the exchange hash uses
+    /// the original bytes rather than a re-encoded version.
+    pub fn store_client_kexinit_payload(&mut self, payload: Vec<u8>) {
+        self.raw_client_kexinit = Some(payload);
     }
 
     pub fn activate_userauth(&mut self, policy: ServerAuthPolicy) {
@@ -1511,9 +1544,19 @@ impl ServerSession {
         }
 
         self.state = SessionState::BannerExchanged;
-        self.local_version = "SSH-2.0-RuSSH_0.1".to_string();
+        if self.local_version.is_empty() {
+            self.local_version = "SSH-2.0-RuSSH_0.1".to_string();
+        }
         self.remote_version = client_banner.to_string();
         Ok(())
+    }
+
+    /// Override the local SSH version string used in the exchange hash.
+    ///
+    /// Call this **before** `accept_banner` when the networking layer uses a
+    /// banner different from the default.  The string must not include `\r\n`.
+    pub fn set_local_version(&mut self, version: impl Into<String>) {
+        self.local_version = version.into();
     }
 
     pub fn negotiate_with_client(
@@ -1575,8 +1618,14 @@ impl ServerSession {
                 self.negotiated = Some(negotiated);
 
                 if self.config.host_key_seed.is_some() {
-                    // Real ECDH path: store context and return server's KexInit
-                    let client_kexinit_frame = TransportMessage::KexInit { proposal }.to_frame()?;
+                    // Real ECDH path: store context and return server's KexInit.
+                    // Use the raw client KEXINIT payload (original wire bytes) for the exchange
+                    // hash, falling back to re-encoding only if raw bytes weren't pre-stored.
+                    let remote_kexinit_payload = self.raw_client_kexinit.take().unwrap_or_else(|| {
+                        TransportMessage::KexInit { proposal }.to_frame()
+                            .map(|f| f.payload)
+                            .unwrap_or_default()
+                    });
                     let server_kexinit_frame = TransportMessage::KexInit {
                         proposal: Box::new(local),
                     }
@@ -1586,7 +1635,7 @@ impl ServerSession {
                         local_version: self.local_version.clone(),
                         remote_version: self.remote_version.clone(),
                         local_kexinit_payload: server_kexinit_frame.payload.clone(),
-                        remote_kexinit_payload: client_kexinit_frame.payload,
+                        remote_kexinit_payload,
                         ephemeral_private_key: keypair.secret_bytes().to_vec(),
                         ephemeral_public_key: keypair.public_key.clone(),
                     });
@@ -1670,10 +1719,10 @@ impl ServerSession {
                 let host_signer = Ed25519Signer::from_seed(&seed);
                 let host_key_blob = host_signer.public_key_blob();
                 let exchange_hash = compute_exchange_hash_curve25519(
-                    &ctx.remote_version,
                     &ctx.local_version,
-                    &ctx.remote_kexinit_payload,
+                    &ctx.remote_version,
                     &ctx.local_kexinit_payload,
+                    &ctx.remote_kexinit_payload,
                     &host_key_blob,
                     &client_pubkey,
                     &ctx.ephemeral_public_key,
@@ -1886,6 +1935,12 @@ impl ServerSession {
         request: UserAuthRequest,
     ) -> Result<Option<UserAuthMessage>, RusshError> {
         let (user, auth_request) = match request {
+            UserAuthRequest::None { user: _, service: _ } => {
+                // RFC 4252 §5.2: respond with the allowed methods list.
+                let methods = self.allowed_userauth_methods();
+                self.bump_outgoing_sequence();
+                return Ok(Some(UserAuthMessage::Failure { methods, partial_success: false }));
+            }
             UserAuthRequest::PublicKey {
                 user,
                 service,

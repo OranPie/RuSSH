@@ -6,7 +6,7 @@
 //! ## Client
 //!
 //! ```no_run
-//! use russh_net::{SshClient, SshClientConfig};
+//! use russh_net::SshClient;
 //! use russh_transport::ClientConfig;
 //!
 //! # async fn example() -> Result<(), russh_core::RusshError> {
@@ -34,18 +34,26 @@
 
 use std::path::{Path, PathBuf};
 
-use russh_auth::{ServerAuthPolicy, UserAuthMessage, UserAuthRequest};
+use russh_auth::{
+    ServerAuthPolicy, UserAuthMessage, UserAuthRequest, build_ed25519_signature_blob,
+    build_userauth_signing_payload,
+};
 use russh_channel::{ChannelKind, ChannelManager, ChannelMessage, ChannelRequest};
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
+use russh_crypto::{AeadCipher, Aes256GcmCipher, Signer};
 use russh_scp::build_scp_file_upload;
 use russh_sftp::{SftpFileServer, SftpFramer, SftpWirePacket};
 use russh_transport::{
-    ClientConfig, ClientSession, ServerConfig, ServerSession, TransportMessage,
+    ClientConfig, ClientSession, NegotiatedAlgorithms, ServerConfig, ServerSession,
+    SessionKeys, TransportMessage,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
-const OUR_BANNER: &str = "SSH-2.0-RuSSH_0.2";
+/// Re-exported for callers that want to use public-key auth without depending on `russh-crypto` directly.
+pub use russh_crypto::Ed25519Signer;
+
+const OUR_BANNER: &str = "SSH-2.0-RuSSH_0.3";
 
 // ── io helper ────────────────────────────────────────────────────────────────
 
@@ -57,15 +65,57 @@ fn protocol_err(msg: impl Into<String>) -> RusshError {
     RusshError::new(RusshErrorCategory::Protocol, msg)
 }
 
+// ── DirectionalCipher ────────────────────────────────────────────────────────
+
+/// Per-direction AEAD cipher state (used for one of TX or RX).
+///
+/// After NEWKEYS, both sides must encrypt/decrypt packets.  Only
+/// `aes256-gcm@openssh.com` is implemented here; all other negotiated ciphers
+/// fall back to `None` (plaintext), which works for loopback tests where both
+/// sides use RuSSH.
+enum DirectionalCipher {
+    None,
+    Aes256Gcm {
+        cipher: Box<Aes256GcmCipher>,
+        /// Current 12-byte nonce: first 4 bytes fixed, last 8 bytes counter.
+        nonce: [u8; 12],
+    },
+}
+
+impl DirectionalCipher {
+    /// Build a cipher from the negotiated algorithm name, key material, and IV.
+    fn new(name: &str, key: &[u8], iv: &[u8]) -> Self {
+        if name == "aes256-gcm@openssh.com" {
+            if let Ok(cipher) = Aes256GcmCipher::new(key) {
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&iv[..12]);
+                return Self::Aes256Gcm { cipher: Box::new(cipher), nonce };
+            }
+        }
+        Self::None
+    }
+
+    /// Increment the last 8 bytes of the nonce as a big-endian u64 counter.
+    fn increment_nonce(nonce: &mut [u8; 12]) {
+        let mut counter = u64::from_be_bytes(nonce[4..12].try_into().unwrap());
+        counter = counter.wrapping_add(1);
+        nonce[4..12].copy_from_slice(&counter.to_be_bytes());
+    }
+}
+
 // ── PacketStream ─────────────────────────────────────────────────────────────
 
 /// Async SSH packet framing over any `tokio` I/O stream.
 ///
 /// Handles the RFC 4253 §6 wire format:
 /// `uint32 packet_length | uint8 padding_length | payload | random_padding`
+///
+/// After NEWKEYS, AEAD encryption is applied via [`DirectionalCipher`].
 pub struct PacketStream<S> {
     inner: S,
     codec: PacketCodec,
+    tx_cipher: DirectionalCipher,
+    rx_cipher: DirectionalCipher,
 }
 
 impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
@@ -73,7 +123,40 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
         Self {
             inner: stream,
             codec: PacketCodec::with_defaults(),
+            tx_cipher: DirectionalCipher::None,
+            rx_cipher: DirectionalCipher::None,
         }
+    }
+
+    /// Enable AEAD encryption for the **client** side after NEWKEYS.
+    ///
+    /// Client → server direction uses `key_c2s` / `iv_c2s`;
+    /// server → client direction uses `key_s2c` / `iv_s2c`.
+    pub fn enable_client_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
+        self.tx_cipher =
+            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s);
+        self.rx_cipher =
+            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c);
+    }
+
+    /// Enable AEAD encryption for the **server** side after NEWKEYS.
+    pub fn enable_server_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
+        self.tx_cipher =
+            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c);
+        self.rx_cipher =
+            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s);
+    }
+
+    /// Enable only the TX (outgoing) cipher for the server after sending NEWKEYS.
+    pub fn enable_server_tx_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
+        self.tx_cipher =
+            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c);
+    }
+
+    /// Enable only the RX (incoming) cipher for the server after receiving client NEWKEYS.
+    pub fn enable_server_rx_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
+        self.rx_cipher =
+            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s);
     }
 
     /// Read lines until one starts with "SSH-" (the version banner).
@@ -110,27 +193,93 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
 
     /// Read exactly one SSH binary packet and return its `PacketFrame`.
     pub async fn read_packet(&mut self) -> Result<PacketFrame, RusshError> {
-        let mut len_buf = [0u8; 4];
-        self.inner.read_exact(&mut len_buf).await.map_err(io_err)?;
-        let pkt_len = u32::from_be_bytes(len_buf) as usize;
+        match &mut self.rx_cipher {
+            DirectionalCipher::None => {
+                let mut len_buf = [0u8; 4];
+                self.inner.read_exact(&mut len_buf).await.map_err(io_err)?;
+                let pkt_len = u32::from_be_bytes(len_buf) as usize;
 
-        if pkt_len > PacketCodec::DEFAULT_MAX_PACKET_SIZE + 512 {
-            return Err(protocol_err("incoming packet length too large"));
+                if pkt_len > PacketCodec::DEFAULT_MAX_PACKET_SIZE + 512 {
+                    return Err(protocol_err("incoming packet length too large"));
+                }
+
+                let mut body = vec![0u8; pkt_len];
+                self.inner.read_exact(&mut body).await.map_err(io_err)?;
+
+                let mut full = Vec::with_capacity(4 + pkt_len);
+                full.extend_from_slice(&len_buf);
+                full.extend_from_slice(&body);
+                self.codec.decode(&full)
+            }
+            DirectionalCipher::Aes256Gcm { cipher, nonce } => {
+                // AES-256-GCM@openssh.com wire format:
+                // [4-byte packet_length (plaintext AAD)]
+                // [packet_length bytes of ciphertext]
+                // [16-byte authentication tag]
+                let mut len_buf = [0u8; 4];
+                self.inner.read_exact(&mut len_buf).await.map_err(io_err)?;
+                let pkt_len = u32::from_be_bytes(len_buf) as usize;
+
+                if pkt_len > PacketCodec::DEFAULT_MAX_PACKET_SIZE + 512 {
+                    return Err(protocol_err("incoming packet length too large"));
+                }
+
+                // Read ciphertext + 16-byte tag together.
+                let mut ct_and_tag = vec![0u8; pkt_len + 16];
+                self.inner.read_exact(&mut ct_and_tag).await.map_err(io_err)?;
+
+                let plaintext = cipher.open(nonce, &len_buf, &ct_and_tag).map_err(|e| {
+                    RusshError::new(RusshErrorCategory::Crypto, e.to_string())
+                })?;
+                DirectionalCipher::increment_nonce(nonce);
+
+                if plaintext.is_empty() {
+                    return Err(protocol_err("AES-GCM decrypted to empty plaintext"));
+                }
+                let padding_len = plaintext[0] as usize;
+                let payload_end = plaintext.len().saturating_sub(padding_len);
+                if payload_end == 0 {
+                    return Err(protocol_err("AES-GCM padding exceeds plaintext length"));
+                }
+                Ok(PacketFrame::new(plaintext[1..payload_end].to_vec()))
+            }
         }
-
-        let mut body = vec![0u8; pkt_len];
-        self.inner.read_exact(&mut body).await.map_err(io_err)?;
-
-        let mut full = Vec::with_capacity(4 + pkt_len);
-        full.extend_from_slice(&len_buf);
-        full.extend_from_slice(&body);
-        self.codec.decode(&full)
     }
 
     /// Encode `frame` and write it to the stream.
     pub async fn write_packet(&mut self, frame: &PacketFrame) -> Result<(), RusshError> {
-        let bytes = self.codec.encode(frame)?;
-        self.inner.write_all(&bytes).await.map_err(io_err)
+        match &mut self.tx_cipher {
+            DirectionalCipher::None => {
+                let bytes = self.codec.encode(frame)?;
+                self.inner.write_all(&bytes).await.map_err(io_err)
+            }
+            DirectionalCipher::Aes256Gcm { cipher, nonce } => {
+                // Build plaintext: [padding_len (1 byte)] [payload] [padding]
+                // Plaintext length must be a multiple of 16 (AES block size).
+                const BLOCK: usize = 16;
+                let payload = &frame.payload;
+                let body_len = 1 + payload.len(); // padding_len byte + payload
+                let remainder = body_len % BLOCK;
+                let mut padding_len = if remainder == 0 { BLOCK } else { BLOCK - remainder };
+                if padding_len < 4 {
+                    padding_len += BLOCK;
+                }
+                let mut plaintext = Vec::with_capacity(body_len + padding_len);
+                plaintext.push(padding_len as u8);
+                plaintext.extend_from_slice(payload);
+                plaintext.extend(std::iter::repeat_n(0u8, padding_len));
+
+                let packet_length = (plaintext.len() as u32).to_be_bytes();
+                let ciphertext_and_tag = cipher
+                    .seal(nonce, &packet_length, &plaintext)
+                    .map_err(|e| RusshError::new(RusshErrorCategory::Crypto, e.to_string()))?;
+                DirectionalCipher::increment_nonce(nonce);
+
+                // Wire: [4-byte length (AAD)] [ciphertext] [16-byte tag]
+                self.inner.write_all(&packet_length).await.map_err(io_err)?;
+                self.inner.write_all(&ciphertext_and_tag).await.map_err(io_err)
+            }
+        }
     }
 
     /// Write raw bytes (e.g. a pre-encoded message).
@@ -197,6 +346,21 @@ impl<'a> SftpSession<'a> {
                 return Ok(pkt);
             }
             let frame = self.stream.read_packet().await?;
+            // Skip SSH_MSG_IGNORE(2), SSH_MSG_DEBUG(4), SSH_MSG_GLOBAL_REQUEST(80).
+            match frame.payload.first().copied() {
+                Some(2) | Some(4) => continue,
+                Some(80) => {
+                    let want_reply = if frame.payload.len() >= 5 {
+                        let nlen = u32::from_be_bytes([frame.payload[1], frame.payload[2], frame.payload[3], frame.payload[4]]) as usize;
+                        frame.payload.get(5 + nlen).copied().unwrap_or(0) != 0
+                    } else { false };
+                    if want_reply {
+                        self.stream.write_packet(&PacketFrame::new(vec![82])).await?;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match ch {
                 ChannelMessage::Data { data, .. } => self.framer.feed(&data),
@@ -344,6 +508,34 @@ pub struct SshClientConnection {
 }
 
 impl SshClientConnection {
+    /// Read the next packet from the server, skipping non-channel messages
+    /// (SSH_MSG_IGNORE=2, SSH_MSG_DEBUG=4, SSH_MSG_GLOBAL_REQUEST=80).
+    /// For GLOBAL_REQUEST with want_reply, sends REQUEST_FAILURE (82).
+    async fn read_channel_packet(&mut self) -> Result<PacketFrame, RusshError> {
+        loop {
+            let frame = self.stream.read_packet().await?;
+            match frame.payload.first().copied() {
+                Some(2) | Some(4) => continue, // SSH_MSG_IGNORE, SSH_MSG_DEBUG
+                Some(80) => {
+                    // SSH_MSG_GLOBAL_REQUEST
+                    let want_reply = if frame.payload.len() >= 5 {
+                        let nlen = u32::from_be_bytes([
+                            frame.payload[1], frame.payload[2],
+                            frame.payload[3], frame.payload[4],
+                        ]) as usize;
+                        frame.payload.get(5 + nlen).copied().unwrap_or(0) != 0
+                    } else {
+                        false
+                    };
+                    if want_reply {
+                        self.stream.write_packet(&PacketFrame::new(vec![82])).await?;
+                    }
+                }
+                _ => return Ok(frame),
+            }
+        }
+    }
+
     /// Connect to `addr` and perform the full SSH handshake through
     /// algorithm negotiation, key exchange, and service request.
     pub async fn connect(
@@ -358,6 +550,7 @@ impl SshClientConnection {
         let remote_banner = stream.read_banner_line().await?;
 
         let mut session = ClientSession::new(config);
+        session.set_local_version(OUR_BANNER);
         // Advance state machine through banner → AlgorithmsNegotiated.
         session.handshake(&remote_banner).await?;
 
@@ -386,11 +579,26 @@ impl SshClientConnection {
         // receive_kex_ecdh_reply_and_send_newkeys.
         let _server_newkeys_frame = stream.read_packet().await?;
 
+        // Enable AEAD encryption in both directions now that NEWKEYS is complete.
+        if let (Some(keys), Some(neg)) = (session.session_keys(), session.negotiated()) {
+            let keys = keys.clone();
+            let neg = neg.clone();
+            stream.enable_client_encryption(&keys, &neg);
+        }
+
         // ── Service request ──
         let service_frame = session.send_service_request("ssh-userauth")?;
         stream.write_packet(&service_frame).await?;
-        let service_accept_frame = stream.read_packet().await?;
-        let service_accept_msg = TransportMessage::from_frame(&service_accept_frame)?;
+        // Read responses; skip EXT_INFO (server may send it before service accept).
+        let service_accept_msg = loop {
+            let frame = stream.read_packet().await?;
+            let msg = TransportMessage::from_frame(&frame)?;
+            if matches!(msg, TransportMessage::ExtInfo { .. }) {
+                session.receive_message(msg)?;
+            } else {
+                break msg;
+            }
+        };
         session.receive_message(service_accept_msg)?;
 
         Ok(Self {
@@ -432,6 +640,62 @@ impl SshClientConnection {
         }
     }
 
+    /// Authenticate with an Ed25519 private key.  Returns `Ok(())` on success.
+    pub async fn authenticate_pubkey(&mut self, signer: &Ed25519Signer) -> Result<(), RusshError> {
+        let user = self.session.config.user.clone();
+        let session_id = self
+            .session
+            .session_keys()
+            .ok_or_else(|| protocol_err("no session keys for pubkey auth"))?
+            .session_id
+            .clone();
+
+        let public_key_blob = signer.public_key_blob();
+        let signing_payload = build_userauth_signing_payload(
+            &session_id,
+            &user,
+            "ssh-connection",
+            "ssh-ed25519",
+            &public_key_blob,
+        );
+        let raw_sig = signer.sign(&signing_payload)?;
+        let signature = build_ed25519_signature_blob(
+            raw_sig
+                .as_slice()
+                .try_into()
+                .map_err(|_| protocol_err("unexpected signature length"))?,
+        );
+
+        let request = UserAuthRequest::PublicKey {
+            user,
+            service: "ssh-connection".to_owned(),
+            algorithm: "ssh-ed25519".to_owned(),
+            public_key: public_key_blob,
+            signature: Some(signature),
+        };
+        let frame = self.session.send_userauth_request(request)?;
+        self.stream.write_packet(&frame).await?;
+
+        loop {
+            let response_frame = self.stream.read_packet().await?;
+            let msg = UserAuthMessage::from_frame(&response_frame)?;
+            self.session.receive_userauth_message(msg.clone())?;
+            match msg {
+                UserAuthMessage::Success => return Ok(()),
+                UserAuthMessage::Failure { .. } => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Auth,
+                        "public key authentication rejected",
+                    ));
+                }
+                UserAuthMessage::Banner { .. } | UserAuthMessage::PublicKeyOk { .. } => {}
+                _ => {
+                    return Err(protocol_err("unexpected auth response message"));
+                }
+            }
+        }
+    }
+
     /// Open a session channel, send `exec <cmd>`, and collect output.
     pub async fn exec(&mut self, cmd: &str) -> Result<ExecResult, RusshError> {
         let (local_id, open_msg) = self.channel_manager.open_channel(ChannelKind::Session);
@@ -439,7 +703,7 @@ impl SshClientConnection {
 
         // Wait for CHANNEL_OPEN_CONFIRMATION.
         let remote_id = loop {
-            let frame = self.stream.read_packet().await?;
+            let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match &ch {
                 ChannelMessage::OpenConfirmation {
@@ -473,7 +737,7 @@ impl SshClientConnection {
         let mut success_seen = false;
 
         loop {
-            let frame = self.stream.read_packet().await?;
+            let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             let responses = self.channel_manager.process(&ch)?;
             for r in responses {
@@ -519,7 +783,7 @@ impl SshClientConnection {
         self.stream.write_packet(&open_msg.to_frame()?).await?;
 
         let remote_id = loop {
-            let frame = self.stream.read_packet().await?;
+            let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match &ch {
                 ChannelMessage::OpenConfirmation {
@@ -550,7 +814,7 @@ impl SshClientConnection {
 
         // Wait for CHANNEL_SUCCESS.
         loop {
-            let frame = self.stream.read_packet().await?;
+            let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match ch {
                 ChannelMessage::Success { .. } => break,
@@ -561,7 +825,9 @@ impl SshClientConnection {
             }
         }
 
-        Ok(SftpSession::new(&mut self.stream, remote_id, local_id))
+        let mut sftp = SftpSession::new(&mut self.stream, remote_id, local_id);
+        sftp.init().await?;
+        Ok(sftp)
     }
 
     /// Upload `data` to `remote_path` on the server via SCP.
@@ -580,7 +846,7 @@ impl SshClientConnection {
         self.stream.write_packet(&open_msg.to_frame()?).await?;
 
         let remote_id = loop {
-            let frame = self.stream.read_packet().await?;
+            let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match &ch {
                 ChannelMessage::OpenConfirmation {
@@ -610,7 +876,7 @@ impl SshClientConnection {
 
         // Wait for CHANNEL_SUCCESS then receive the initial SCP ACK (0x00).
         loop {
-            let frame = self.stream.read_packet().await?;
+            let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match ch {
                 ChannelMessage::Success { .. } => break,
@@ -622,7 +888,7 @@ impl SshClientConnection {
         }
 
         // Read the server's initial ACK byte.
-        let frame = self.stream.read_packet().await?;
+        let frame = self.read_channel_packet().await?;
         let ch = ChannelMessage::from_bytes(&frame.payload)?;
         if let ChannelMessage::Data { data: ack, .. } = ch {
             if ack.first() != Some(&0x00) {
@@ -640,7 +906,7 @@ impl SshClientConnection {
 
         // Wait for server acknowledgement.
         loop {
-            let frame = self.stream.read_packet().await?;
+            let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match ch {
                 ChannelMessage::Data { data: ack, .. } => {
@@ -760,6 +1026,7 @@ impl SshServerConnection {
     /// Drive the full connection lifecycle: handshake → auth → channel loop.
     pub async fn run(mut self, handler: impl SessionHandler) -> Result<(), RusshError> {
         let mut session = ServerSession::new(self.config.clone());
+        session.set_local_version(OUR_BANNER);
 
         // ── Banner exchange ──
         self.stream.write_banner_line(OUR_BANNER).await?;
@@ -773,6 +1040,8 @@ impl SshServerConnection {
 
         // ── KEXINIT from client ──
         let client_kexinit_frame = self.stream.read_packet().await?;
+        // Store raw payload BEFORE parsing so the exchange hash uses original bytes.
+        session.store_client_kexinit_payload(client_kexinit_frame.payload.clone());
         let client_kexinit_msg = TransportMessage::from_frame(&client_kexinit_frame)?;
         // Returns the server's KexInit to send.
         if let Some(reply) = session.receive_message(client_kexinit_msg)? {
@@ -789,18 +1058,52 @@ impl SshServerConnection {
             self.stream.write_packet(&reply_frame).await?;
         }
 
-        // Send server NEWKEYS.
+        // Send server NEWKEYS, then immediately enable TX encryption.
+        // The server switches to encrypted TX after sending NEWKEYS.
         let newkeys_frame = TransportMessage::NewKeys.to_frame()?;
         self.stream.write_packet(&newkeys_frame).await?;
+        if let (Some(keys), Some(neg)) = (session.session_keys(), session.negotiated()) {
+            let keys = keys.clone();
+            let neg = neg.clone();
+            self.stream.enable_server_tx_encryption(&keys, &neg);
+        }
+
+        // Send EXT_INFO if we advertised ext-info-s (OpenSSH client expects it, encrypted).
+        let sends_ext_info = session
+            .negotiated()
+            .is_some_and(|n| n.ext_info_s);
+        if sends_ext_info {
+            let ext_info = TransportMessage::ExtInfo {
+                extensions: vec![
+                    ("server-sig-algs".to_owned(), "ssh-ed25519".to_owned()),
+                ],
+            };
+            self.stream.write_packet(&ext_info.to_frame()?).await?;
+        }
 
         // ── NEWKEYS from client ──
         let client_newkeys_frame = self.stream.read_packet().await?;
         let client_newkeys_msg = TransportMessage::from_frame(&client_newkeys_frame)?;
         session.receive_message(client_newkeys_msg)?;
 
+        // Enable RX decryption now that client has sent NEWKEYS and will start encrypting.
+        if let (Some(keys), Some(neg)) = (session.session_keys(), session.negotiated()) {
+            let keys = keys.clone();
+            let neg = neg.clone();
+            self.stream.enable_server_rx_encryption(&keys, &neg);
+        }
+
         // ── SERVICE_REQUEST ──
-        let service_req_frame = self.stream.read_packet().await?;
-        let service_req_msg = TransportMessage::from_frame(&service_req_frame)?;
+        // Skip EXT_INFO (client may send it before SERVICE_REQUEST when server advertised ext-info-s).
+        let service_req_msg = loop {
+            let frame = self.stream.read_packet().await?;
+            let msg = TransportMessage::from_frame(&frame)?;
+            if matches!(msg, TransportMessage::ExtInfo { .. }) {
+                session.receive_message(msg)?;
+            } else {
+                break msg;
+            }
+        };
         if let Some(service_accept) = session.receive_message(service_req_msg)? {
             self.stream.write_packet(&service_accept.to_frame()?).await?;
         }
@@ -810,7 +1113,8 @@ impl SshServerConnection {
         loop {
             let auth_frame = self.stream.read_packet().await?;
             let auth_msg = UserAuthMessage::from_frame(&auth_frame)?;
-            if let Some(reply) = session.receive_userauth_message(auth_msg)? {
+            let reply = session.receive_userauth_message(auth_msg)?;
+            if let Some(reply) = reply {
                 self.stream.write_packet(&reply.to_frame()?).await?;
                 if session.authenticated_user().is_some() {
                     break;
@@ -832,14 +1136,23 @@ impl SshServerConnection {
         let mut next_server_id: u32 = 0;
 
         loop {
-            let frame = self.stream.read_packet().await?;
+            let frame = match self.stream.read_packet().await {
+                Ok(f) => f,
+                // Treat connection-level IO errors (peer closed) as a clean session end.
+                Err(e) if e.category() == russh_core::RusshErrorCategory::Io => break,
+                Err(e) => return Err(e),
+            };
 
             // Check for disconnect.
             if frame.message_type() == Some(1) {
                 break;
             }
 
-            let msg = ChannelMessage::from_bytes(&frame.payload)?;
+            // Skip non-channel messages (e.g. GLOBAL_REQUEST, IGNORE, DEBUG).
+            let msg = match ChannelMessage::from_bytes(&frame.payload) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
             match msg {
                 ChannelMessage::Open {
                     sender_channel: client_ch,
@@ -985,8 +1298,19 @@ impl SshServerConnection {
                     }
                 }
 
-                ChannelMessage::Eof { .. } | ChannelMessage::Close { .. } => {
-                    // Closed channel — nothing to do for this minimal impl.
+                ChannelMessage::Eof { recipient_channel } => {
+                    // Client is done sending; send EOF + CLOSE back to unblock the client.
+                    let _ = self.stream.write_packet(
+                        &ChannelMessage::Eof { recipient_channel }.to_frame()?
+                    ).await;
+                    let _ = self.stream.write_packet(
+                        &ChannelMessage::Close { recipient_channel }.to_frame()?
+                    ).await;
+                    server_channels.remove(&recipient_channel);
+                }
+
+                ChannelMessage::Close { recipient_channel } => {
+                    server_channels.remove(&recipient_channel);
                 }
 
                 ChannelMessage::WindowAdjust { .. } => {}
@@ -1152,7 +1476,6 @@ mod tests {
 
         // ── SFTP ──
         let mut sftp = client.sftp().await.expect("open sftp");
-        sftp.init().await.expect("sftp init");
         sftp.write_file("test.txt", b"sftp-content")
             .await
             .expect("sftp write");

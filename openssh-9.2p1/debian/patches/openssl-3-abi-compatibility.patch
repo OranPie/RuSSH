@@ -1,0 +1,60 @@
+From 45e9a6aeb8179ed7bf306785f042fef6137e866a Mon Sep 17 00:00:00 2001
+From: Darren Tucker <dtucker@dtucker.net>
+Date: Mon, 8 May 2023 20:12:59 +1000
+Subject: Handle OpenSSL >=3 ABI compatibility.
+
+Beyond OpenSSL 3.0, the ABI compatibility guarantees are wider (only
+major must match instead of major and minor in earlier versions).
+bz#3548, ok djm@
+
+Origin: upstream, https://anongit.mindrot.org/openssh.git/commit/?id=b7afd8a4ecaca8afd3179b55e9db79c0ff210237
+Bug-Debian: https://bugs.debian.org/1110030
+Last-Update: 2025-07-28
+
+Patch-Name: openssl-3-abi-compatibility.patch
+---
+ openbsd-compat/openssl-compat.c | 20 +++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/openbsd-compat/openssl-compat.c b/openbsd-compat/openssl-compat.c
+index a37ca61bf..6c65003f2 100644
+--- a/openbsd-compat/openssl-compat.c
++++ b/openbsd-compat/openssl-compat.c
+@@ -33,10 +33,10 @@
+ 
+ /*
+  * OpenSSL version numbers: MNNFFPPS: major minor fix patch status
+- * We match major, minor, fix and status (not patch) for <1.0.0.
+- * After that, we acceptable compatible fix versions (so we
+- * allow 1.0.1 to work with 1.0.0). Going backwards is only allowed
+- * within a patch series.
++ * Versions >=3 require only major versions to match.
++ * For versions <3, we accept compatible fix versions (so we allow 1.0.1
++ * to work with 1.0.0). Going backwards is only allowed within a patch series.
++ * See https://www.openssl.org/policies/releasestrat.html
+  */
+ 
+ int
+@@ -48,15 +48,17 @@ ssh_compatible_openssl(long headerver, long libver)
+ 	if (headerver == libver)
+ 		return 1;
+ 
+-	/* for versions < 1.0.0, major,minor,fix,status must match */
+-	if (headerver < 0x1000000f) {
+-		mask = 0xfffff00fL; /* major,minor,fix,status */
++	/*
++	 * For versions >= 3.0, only the major and status must match.
++	 */
++	if (headerver >= 0x3000000f) {
++		mask = 0xf000000fL; /* major,status */
+ 		return (headerver & mask) == (libver & mask);
+ 	}
+ 
+ 	/*
+-	 * For versions >= 1.0.0, major,minor,status must match and library
+-	 * fix version must be equal to or newer than the header.
++	 * For versions >= 1.0.0, but <3, major,minor,status must match and
++	 * library fix version must be equal to or newer than the header.
+ 	 */
+ 	mask = 0xfff0000fL; /* major,minor,status */
+ 	hfix = (headerver & 0x000ff000) >> 12;

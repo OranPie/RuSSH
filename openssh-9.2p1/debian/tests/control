@@ -1,0 +1,17 @@
+Tests: regress
+Restrictions: needs-root allow-stderr
+Depends: devscripts,
+         haveged,
+         openssh-tests,
+         openssl,
+         putty-tools,
+         python3-twisted,
+         sudo,
+         sysvinit-utils,
+
+Tests: ssh-gssapi
+Restrictions: allow-stderr isolation-container needs-root
+Depends: krb5-admin-server,
+         krb5-kdc,
+         openssh-server,
+         sudo,

@@ -1,4 +1,33 @@
-# RuSSH Implementation Status — v0.2
+# RuSSH Implementation Status — v0.3
+
+## Delivered in v0.3
+
+### OpenSSH interoperability
+
+All four cross-implementation integration tests now pass:
+- `russh_client_exec_against_openssh_sshd` — RuSSH client exec to real `sshd`
+- `russh_client_sftp_against_openssh_sshd` — RuSSH client SFTP to real `sshd`
+- `openssh_ssh_exec_against_russh_server` — `ssh` exec to RuSSH server
+- `openssh_sftp_against_russh_server` — `sftp` SFTP to RuSSH server
+
+### Bug fixes applied during v0.3
+
+- **`russh-transport`**: `ServerSession` stores raw client KEXINIT bytes before
+  parsing (`store_client_kexinit_payload`) so the exchange hash uses the original
+  wire encoding, preventing mismatch when OpenSSH field order differs.
+- **`russh-core`**: Removed unimplemented ciphers (`chacha20-poly1305@openssh.com`,
+  `aes128-gcm@openssh.com`) from `AlgorithmSet::secure_defaults()`. Only
+  `aes256-gcm@openssh.com` is advertised, avoiding negotiation of an unsupported
+  cipher.
+- **`russh-auth`**: Added `UserAuthRequest::None { user, service }` variant to
+  handle OpenSSH's RFC 4252 §5.2 `"none"` method probe. Server responds with
+  `USERAUTH_FAILURE` listing allowed methods.
+- **`russh-sftp`**: `SftpFileServer::resolve_path` now treats `RootDir` as a
+  no-op (strips leading `/`) rather than returning `PermissionDenied`, so
+  absolute SFTP paths like `/upload.txt` work correctly under the chroot.
+- **`russh-net`**: On `CHANNEL_EOF` from the client, the server now sends
+  `CHANNEL_EOF + CHANNEL_CLOSE` back to unblock the remote; IO-level read errors
+  (peer closed connection) are treated as a clean session end.
 
 ## Delivered in v0.2
 

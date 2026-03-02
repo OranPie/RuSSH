@@ -1,0 +1,11 @@
+---
+include:
+  - https://salsa.debian.org/salsa-ci-team/pipeline/raw/master/recipes/debian.yml
+
+variables:
+  RELEASE: 'bookworm'
+  # This source package doesn't build on unstable for
+  # non-reproducibility-related reasons, and the salsa-ci pipeline doesn't
+  # currently support running reprotest on bookworm:
+  # https://salsa.debian.org/salsa-ci-team/pipeline/-/issues/236
+  SALSA_CI_DISABLE_REPROTEST: 1

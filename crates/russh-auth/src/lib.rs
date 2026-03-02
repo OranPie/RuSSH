@@ -222,6 +222,10 @@ pub trait AgentClient {
 /// SSH USERAUTH request payload variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UserAuthRequest {
+    None {
+        user: String,
+        service: String,
+    },
     PublicKey {
         user: String,
         service: String,
@@ -285,6 +289,11 @@ impl UserAuthMessage {
             Self::Request(request) => {
                 payload.push(Self::MSG_REQUEST);
                 match request {
+                    UserAuthRequest::None { user, service } => {
+                        write_string(&mut payload, user)?;
+                        write_string(&mut payload, service)?;
+                        write_string(&mut payload, "none")?;
+                    }
                     UserAuthRequest::PublicKey {
                         user,
                         service,
@@ -410,6 +419,7 @@ impl UserAuthMessage {
                 let method = read_string(body, &mut offset)?;
 
                 match method.as_str() {
+                    "none" => Self::Request(UserAuthRequest::None { user, service }),
                     "publickey" => {
                         let has_signature = read_bool(body, &mut offset)?;
                         let algorithm = read_string(body, &mut offset)?;
@@ -1202,7 +1212,7 @@ pub fn verify_publickey_auth_signature(
     verifier.verify(&payload, &sig_bytes)
 }
 
-fn build_userauth_signing_payload(
+pub fn build_userauth_signing_payload(
     session_id: &[u8],
     user: &str,
     service: &str,

@@ -1,0 +1,128 @@
+From 902b3eaff361ec5fe9aeb77b91d0c3f721621beb Mon Sep 17 00:00:00 2001
+From: Colin Watson <cjwatson@debian.org>
+Date: Fri, 14 Feb 2025 00:24:52 +0000
+Subject: Fix incorrect return values on a number of error paths
+
+At present, these have either no or minor known security consequences.
+
+Reported by Qualys.  Patch from the OpenSSH team.
+
+Last-Update: 2025-02-14
+
+Patch-Name: incorrect-return-values.patch
+---
+ krl.c           | 2 ++
+ ssh-agent.c     | 3 +++
+ ssh-sk-client.c | 2 ++
+ sshconnect2.c   | 3 +++
+ sshsig.c        | 1 +
+ 5 files changed, 11 insertions(+)
+
+diff --git a/krl.c b/krl.c
+index 473a9d737..d4161b93a 100644
+--- a/krl.c
++++ b/krl.c
+@@ -674,6 +674,7 @@ revoked_certs_generate(struct revoked_certs *rc, struct sshbuf *buf)
+ 			break;
+ 		case KRL_SECTION_CERT_SERIAL_BITMAP:
+ 			if (rs->lo - bitmap_start > INT_MAX) {
++				r = SSH_ERR_INVALID_FORMAT;
+ 				error_f("insane bitmap gap");
+ 				goto out;
+ 			}
+@@ -1008,6 +1009,7 @@ ssh_krl_from_blob(struct sshbuf *buf, struct ssh_krl **krlp,
+ 		goto out;
+ 
+ 	if ((krl = ssh_krl_init()) == NULL) {
++		r = SSH_ERR_ALLOC_FAIL;
+ 		error_f("alloc failed");
+ 		goto out;
+ 	}
+diff --git a/ssh-agent.c b/ssh-agent.c
+index 27bf9b5ad..5a39ddb0c 100644
+--- a/ssh-agent.c
++++ b/ssh-agent.c
+@@ -1189,6 +1189,7 @@ parse_key_constraint_extension(struct sshbuf *m, char **sk_providerp,
+ 	    "restrict-destination-v00@openssh.com") == 0) {
+ 		if (*dcsp != NULL) {
+ 			error_f("%s already set", ext_name);
++			r = SSH_ERR_INVALID_FORMAT;
+ 			goto out;
+ 		}
+ 		if ((r = sshbuf_froms(m, &b)) != 0) {
+@@ -1198,6 +1199,7 @@ parse_key_constraint_extension(struct sshbuf *m, char **sk_providerp,
+ 		while (sshbuf_len(b) != 0) {
+ 			if (*ndcsp >= AGENT_MAX_DEST_CONSTRAINTS) {
+ 				error_f("too many %s constraints", ext_name);
++				r = SSH_ERR_INVALID_FORMAT;
+ 				goto out;
+ 			}
+ 			*dcsp = xrecallocarray(*dcsp, *ndcsp, *ndcsp + 1,
+@@ -1654,6 +1656,7 @@ process_ext_session_bind(SocketEntry *e)
+ 	/* record new key/sid */
+ 	if (e->nsession_ids >= AGENT_MAX_SESSION_IDS) {
+ 		error_f("too many session IDs recorded");
++		r = -1;
+ 		goto out;
+ 	}
+ 	e->session_ids = xrecallocarray(e->session_ids, e->nsession_ids,
+diff --git a/ssh-sk-client.c b/ssh-sk-client.c
+index 321fe53a2..750accbbf 100644
+--- a/ssh-sk-client.c
++++ b/ssh-sk-client.c
+@@ -439,6 +439,7 @@ sshsk_load_resident(const char *provider_path, const char *device,
+ 		}
+ 		if ((srk = calloc(1, sizeof(*srk))) == NULL) {
+ 			error_f("calloc failed");
++			r = SSH_ERR_ALLOC_FAIL;
+ 			goto out;
+ 		}
+ 		srk->key = key;
+@@ -450,6 +451,7 @@ sshsk_load_resident(const char *provider_path, const char *device,
+ 		if ((tmp = recallocarray(srks, nsrks, nsrks + 1,
+ 		    sizeof(*srks))) == NULL) {
+ 			error_f("recallocarray keys failed");
++			r = SSH_ERR_ALLOC_FAIL;
+ 			goto out;
+ 		}
+ 		debug_f("srks[%zu]: %s %s uidlen %zu", nsrks,
+diff --git a/sshconnect2.c b/sshconnect2.c
+index 730894495..0785717f2 100644
+--- a/sshconnect2.c
++++ b/sshconnect2.c
+@@ -797,6 +797,7 @@ input_userauth_pk_ok(int type, u_int32_t seq, struct ssh *ssh)
+ 
+ 	if ((pktype = sshkey_type_from_name(pkalg)) == KEY_UNSPEC) {
+ 		debug_f("server sent unknown pkalg %s", pkalg);
++		r = SSH_ERR_INVALID_FORMAT;
+ 		goto done;
+ 	}
+ 	if ((r = sshkey_from_blob(pkblob, blen, &key)) != 0) {
+@@ -807,6 +808,7 @@ input_userauth_pk_ok(int type, u_int32_t seq, struct ssh *ssh)
+ 		error("input_userauth_pk_ok: type mismatch "
+ 		    "for decoded key (received %d, expected %d)",
+ 		    key->type, pktype);
++		r = SSH_ERR_INVALID_FORMAT;
+ 		goto done;
+ 	}
+ 
+@@ -826,6 +828,7 @@ input_userauth_pk_ok(int type, u_int32_t seq, struct ssh *ssh)
+ 		    SSH_FP_DEFAULT);
+ 		error_f("server replied with unknown key: %s %s",
+ 		    sshkey_type(key), fp == NULL ? "<ERROR>" : fp);
++		r = SSH_ERR_INVALID_FORMAT;
+ 		goto done;
+ 	}
+ 	ident = format_identity(id);
+diff --git a/sshsig.c b/sshsig.c
+index eb2a931e9..e476aa16c 100644
+--- a/sshsig.c
++++ b/sshsig.c
+@@ -863,6 +863,7 @@ cert_filter_principals(const char *path, u_long linenum,
+ 	}
+ 	if ((principals = sshbuf_dup_string(nprincipals)) == NULL) {
+ 		error_f("buffer error");
++		r = SSH_ERR_ALLOC_FAIL;
+ 		goto out;
+ 	}
+ 	/* success */
