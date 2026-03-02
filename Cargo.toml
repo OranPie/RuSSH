@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/russh-auth",
+    "crates/russh-channel",
+    "crates/russh-config",
+    "crates/russh-core",
+    "crates/russh-crypto",
+    "crates/russh-integration",
+    "crates/russh-observability",
+    "crates/russh-scp",
+    "crates/russh-sftp",
+    "crates/russh-transport",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/russh"
+authors = ["RuSSH Contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,16 @@
+[package]
+name = "russh-transport"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+russh-auth = { path = "../russh-auth" }
+russh-core = { path = "../russh-core" }
+russh-crypto = { path = "../russh-crypto" }

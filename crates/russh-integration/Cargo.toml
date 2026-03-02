@@ -1,0 +1,22 @@
+[package]
+name = "russh-integration"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+russh-auth = { path = "../russh-auth" }
+russh-channel = { path = "../russh-channel" }
+russh-config = { path = "../russh-config" }
+russh-core = { path = "../russh-core" }
+russh-crypto = { path = "../russh-crypto" }
+russh-observability = { path = "../russh-observability" }
+russh-scp = { path = "../russh-scp" }
+russh-sftp = { path = "../russh-sftp" }
+russh-transport = { path = "../russh-transport" }
