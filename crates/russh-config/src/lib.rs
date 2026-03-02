@@ -1,4 +1,42 @@
-//! OpenSSH-style configuration parser and normalization helpers.
+//! OpenSSH-style configuration parser and resolver for RuSSH.
+//!
+//! Parses `~/.ssh/config`-style files and resolves per-host settings with
+//! full OpenSSH first-match-wins semantics.
+//!
+//! ## Parsing
+//!
+//! [`parse_config`] reads a config string line-by-line, returning a
+//! [`ConfigFile`] whose `.directives` field holds every recognized directive
+//! plus [`Directive::Unknown`] for unrecognized keywords (preserved without
+//! error).
+//!
+//! ## Resolution
+//!
+//! [`ConfigFile::resolve_for_host`] applies all matching `Host` blocks to
+//! produce a [`ResolvedConfig`]:
+//!
+//! - **First-match-wins** — for each key, only the first value seen across
+//!   all matching blocks is kept (OpenSSH semantics).
+//! - **Pattern matching** — [`matches_host_patterns`] supports `*` / `?`
+//!   wildcards and `!negation` patterns per OpenSSH rules.
+//! - **Token expansion** — `%h` → hostname, `%u` → username, `%%` → `%`.
+//! - **Tilde expansion** — leading `~/` in path values expanded to `$HOME`.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use russh_config::parse_config;
+//!
+//! let cfg = parse_config("
+//! Host bastion
+//!   User admin
+//!   Port 2222
+//!   IdentityFile ~/.ssh/id_ed25519
+//! ").unwrap();
+//!
+//! let resolved = cfg.resolve_for_host("bastion");
+//! assert_eq!(resolved.port, Some(2222));
+//! ```
 
 use std::collections::BTreeMap;
 
@@ -63,6 +101,9 @@ impl ConfigFile {
                 Directive::ServerAliveInterval(seconds) => {
                     normalized.insert("ServerAliveInterval".to_string(), seconds.to_string());
                 }
+                Directive::Include(path) => {
+                    normalized.insert("Include".to_string(), path.clone());
+                }
                 Directive::Unknown(unknown) => {
                     normalized.insert(
                         format!("Unknown:{}", unknown.keyword),
@@ -97,7 +138,38 @@ pub enum Directive {
     Ciphers(Vec<String>),
     Macs(Vec<String>),
     ServerAliveInterval(u64),
+    Include(String),
     Unknown(UnknownDirective),
+}
+
+/// A parsed Host or Match block from an SSH config file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostBlock {
+    /// Patterns from `Host` line, e.g. ["*.example.com", "!dev.example.com"]
+    /// Empty vec means the default/global block (before any Host line)
+    pub patterns: Vec<String>,
+    /// True if this is a Match block (not Host)
+    pub is_match: bool,
+    /// Directives under this block
+    pub directives: Vec<Directive>,
+}
+
+/// The result of resolving a config for a specific host.
+/// First-match-wins: for each key, only the first value seen (across matching blocks) is kept.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedConfig {
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub hostname: Option<String>,
+    pub identity_files: Vec<String>,
+    pub forward_agent: Option<bool>,
+    pub local_forwards: Vec<(String, String)>,
+    pub remote_forwards: Vec<(String, String)>,
+    pub kex_algorithms: Option<Vec<String>>,
+    pub ciphers: Option<Vec<String>>,
+    pub macs: Option<Vec<String>>,
+    pub server_alive_interval: Option<u64>,
+    pub extra: std::collections::BTreeMap<String, String>,
 }
 
 /// Unknown directive representation preserved for diagnostics.
@@ -165,6 +237,7 @@ pub fn parse_config(input: &str) -> Result<ConfigFile, RusshError> {
                 line_number,
                 "ServerAliveInterval",
             )?),
+            "include" => Directive::Include(join_args(args, line_number, "Include")?),
             _ => {
                 file.warnings.push(ConfigWarning {
                     line: line_number,
@@ -257,9 +330,217 @@ fn parse_csv(args: &[String], line: usize, key: &str) -> Result<Vec<String>, Rus
     Ok(items)
 }
 
+impl ConfigFile {
+    /// Parse the flat directive list into Host blocks.
+    /// Directives before the first Host line form the "global" block (patterns = []).
+    #[must_use]
+    pub fn into_host_blocks(&self) -> Vec<HostBlock> {
+        let mut blocks: Vec<HostBlock> = Vec::new();
+        let mut current_patterns: Vec<String> = Vec::new();
+        let mut current_directives: Vec<Directive> = Vec::new();
+        let mut in_host_block = false;
+
+        for directive in &self.directives {
+            match directive {
+                Directive::Host(pattern_str) => {
+                    if in_host_block || !current_directives.is_empty() {
+                        blocks.push(HostBlock {
+                            patterns: current_patterns.clone(),
+                            is_match: false,
+                            directives: std::mem::take(&mut current_directives),
+                        });
+                    }
+                    current_patterns = pattern_str
+                        .split_whitespace()
+                        .map(ToOwned::to_owned)
+                        .collect();
+                    in_host_block = true;
+                }
+                other => {
+                    current_directives.push(other.clone());
+                }
+            }
+        }
+
+        if !current_directives.is_empty() || in_host_block {
+            blocks.push(HostBlock {
+                patterns: current_patterns,
+                is_match: false,
+                directives: current_directives,
+            });
+        }
+
+        blocks
+    }
+
+    /// Resolve configuration for a specific hostname using first-match-wins semantics.
+    ///
+    /// - Global directives (before any Host line) always apply
+    /// - Host blocks apply only when the hostname matches their patterns
+    /// - For each setting, the first value encountered wins
+    /// - Path values have `~` expanded to the HOME environment variable
+    /// - String values support `%h` → hostname, `%u` → username (from $USER/$LOGNAME)
+    #[must_use]
+    pub fn resolve_for_host(&self, hostname: &str) -> ResolvedConfig {
+        let blocks = self.into_host_blocks();
+        let mut resolved = ResolvedConfig::default();
+
+        for block in &blocks {
+            let applies =
+                block.patterns.is_empty() || matches_host_patterns(&block.patterns, hostname);
+            if !applies {
+                continue;
+            }
+            for directive in &block.directives {
+                apply_directive_first_match(directive, &mut resolved, hostname);
+            }
+        }
+
+        resolved
+    }
+}
+
+fn apply_directive_first_match(
+    directive: &Directive,
+    resolved: &mut ResolvedConfig,
+    hostname: &str,
+) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+
+    match directive {
+        Directive::User(v) if resolved.user.is_none() => {
+            resolved.user = Some(expand_tokens(v, hostname, &user));
+        }
+        Directive::Port(v) if resolved.port.is_none() => {
+            resolved.port = Some(*v);
+        }
+        Directive::HostName(v) if resolved.hostname.is_none() => {
+            resolved.hostname = Some(expand_tokens(v, hostname, &user));
+        }
+        Directive::IdentityFile(v) => {
+            resolved
+                .identity_files
+                .push(expand_tilde(&expand_tokens(v, hostname, &user), &home));
+        }
+        Directive::ForwardAgent(v) if resolved.forward_agent.is_none() => {
+            resolved.forward_agent = Some(*v);
+        }
+        Directive::LocalForward { bind, target } => {
+            resolved.local_forwards.push((bind.clone(), target.clone()));
+        }
+        Directive::RemoteForward { bind, target } => {
+            resolved
+                .remote_forwards
+                .push((bind.clone(), target.clone()));
+        }
+        Directive::KexAlgorithms(v) if resolved.kex_algorithms.is_none() => {
+            resolved.kex_algorithms = Some(v.clone());
+        }
+        Directive::Ciphers(v) if resolved.ciphers.is_none() => {
+            resolved.ciphers = Some(v.clone());
+        }
+        Directive::Macs(v) if resolved.macs.is_none() => {
+            resolved.macs = Some(v.clone());
+        }
+        Directive::ServerAliveInterval(v) if resolved.server_alive_interval.is_none() => {
+            resolved.server_alive_interval = Some(*v);
+        }
+        Directive::Unknown(u) => {
+            resolved
+                .extra
+                .entry(u.keyword.clone())
+                .or_insert_with(|| u.arguments.join(" "));
+        }
+        _ => {} // directive already set (first-match-wins) or Include (not resolved here)
+    }
+}
+
+/// Expand `~` at the start of a path to the HOME directory.
+fn expand_tilde(path: &str, home: &str) -> String {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        format!("{home}/{stripped}")
+    } else if path == "~" {
+        home.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Expand SSH config tokens: %h=hostname, %u=username, %%=literal %
+fn expand_tokens(value: &str, hostname: &str, user: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            match chars.next() {
+                Some('h') => result.push_str(hostname),
+                Some('u') => result.push_str(user),
+                Some('%') => result.push('%'),
+                Some(other) => {
+                    result.push('%');
+                    result.push(other);
+                }
+                None => result.push('%'),
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Returns true if `hostname` matches any non-negated pattern AND is not excluded
+/// by any negated pattern (patterns starting with `!`).
+///
+/// Rules:
+/// - `*` matches any sequence (including empty)
+/// - `?` matches exactly one character
+/// - Patterns starting with `!` are negation patterns
+/// - If any negation pattern matches, the host is excluded regardless of positive matches
+/// - Pattern matching is case-insensitive
+pub fn matches_host_patterns(patterns: &[String], hostname: &str) -> bool {
+    let mut positive_match = false;
+    let hostname_lower = hostname.to_ascii_lowercase();
+
+    for pattern in patterns {
+        if let Some(neg_pat) = pattern.strip_prefix('!') {
+            if glob_match(neg_pat, &hostname_lower) {
+                return false;
+            }
+        } else if glob_match(pattern, &hostname_lower) {
+            positive_match = true;
+        }
+    }
+
+    positive_match
+}
+
+/// Simple SSH-style glob matching (`*` = any sequence, `?` = any single char).
+/// Case-insensitive (caller should lowercase both inputs).
+pub fn glob_match(pattern: &str, value: &str) -> bool {
+    let pat = pattern.to_ascii_lowercase();
+    glob_match_impl(pat.as_bytes(), value.as_bytes())
+}
+
+fn glob_match_impl(pattern: &[u8], value: &[u8]) -> bool {
+    match (pattern.first(), value.first()) {
+        (None, None) => true,
+        (Some(b'*'), _) => {
+            glob_match_impl(&pattern[1..], value)
+                || (!value.is_empty() && glob_match_impl(pattern, &value[1..]))
+        }
+        (Some(b'?'), Some(_)) => glob_match_impl(&pattern[1..], &value[1..]),
+        (Some(p), Some(v)) if p == v => glob_match_impl(&pattern[1..], &value[1..]),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Directive, parse_config};
+    use super::{Directive, glob_match, matches_host_patterns, parse_config};
 
     #[test]
     fn parser_handles_known_and_unknown_directives() {
@@ -281,5 +562,93 @@ UnknownDirective value\n";
         let text = "ForwardAgent maybe\n";
         let err = parse_config(text).expect_err("parse should fail");
         assert!(err.message().contains("ForwardAgent expects yes/no"));
+    }
+
+    #[test]
+    fn host_glob_matches_wildcard() {
+        assert!(glob_match("*.example.com", "foo.example.com"));
+        assert!(glob_match("*.example.com", "bar.example.com"));
+        assert!(!glob_match("*.example.com", "example.com"));
+        assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn host_glob_question_mark() {
+        assert!(glob_match("host?", "host1"));
+        assert!(!glob_match("host?", "host12"));
+    }
+
+    #[test]
+    fn host_pattern_negation_excludes() {
+        let patterns = vec!["*.example.com".to_string(), "!dev.example.com".to_string()];
+        assert!(matches_host_patterns(&patterns, "prod.example.com"));
+        assert!(!matches_host_patterns(&patterns, "dev.example.com"));
+    }
+
+    #[test]
+    fn resolve_first_match_wins() {
+        let config = parse_config(
+            "
+Host *.example.com
+  User alice
+  Port 2222
+Host prod.example.com
+  User root
+  Port 22
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("prod.example.com");
+        assert_eq!(resolved.user.as_deref(), Some("alice")); // first match wins
+        assert_eq!(resolved.port, Some(2222));
+    }
+
+    #[test]
+    fn resolve_global_directives_always_apply() {
+        let config = parse_config(
+            "
+ServerAliveInterval 30
+Host special
+  Port 2222
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("other.host");
+        assert_eq!(resolved.server_alive_interval, Some(30));
+        assert_eq!(resolved.port, None);
+    }
+
+    #[test]
+    fn resolve_tilde_expansion_in_identity_file() {
+        let config = parse_config(
+            "
+Host *
+  IdentityFile ~/.ssh/id_ed25519
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("any.host");
+        assert!(!resolved.identity_files.is_empty());
+        assert!(!resolved.identity_files[0].starts_with('~'));
+    }
+
+    #[test]
+    fn resolve_token_substitution() {
+        let config = parse_config(
+            "
+Host myhost
+  HostName %h.internal.example.com
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("myhost");
+        assert_eq!(
+            resolved.hostname.as_deref(),
+            Some("myhost.internal.example.com")
+        );
     }
 }

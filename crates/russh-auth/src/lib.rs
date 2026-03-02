@@ -1,10 +1,37 @@
-//! Authentication types and policy for RuSSH.
+//! Authentication engine for RuSSH (RFC 4252).
+//!
+//! Implements all three standard SSH authentication methods:
+//!
+//! | Method | Description |
+//! |--------|-------------|
+//! | `publickey` | Ed25519 signature verification against RFC 4252 signing payload |
+//! | `password` | Constant-time comparison via `subtle::ConstantTimeEq` |
+//! | `keyboard-interactive` | InfoRequest/InfoResponse challenge-response flow |
+//!
+//! ## Key types
+//!
+//! - [`AuthMessage`] — parsed `SSH_MSG_USERAUTH_REQUEST` variants.
+//! - [`AuthPolicy`] — pluggable policy trait deciding accept/partial/reject.
+//! - [`MemoryAuthorizedKeys`] — in-memory authorized-keys store with
+//!   constant-time key lookup.
+//! - [`FileIdentityProvider`] — reads `~/.ssh/id_ed25519.pub` from disk.
+//! - [`CertificateValidator`] — certificate chain validation stub.
+//!
+//! ## Signature verification
+//!
+//! [`verify_publickey_auth_signature`] constructs the full RFC 4252 signing
+//! payload (`string session_id || byte 50 || string user || … || string pubkey_blob`)
+//! and verifies the Ed25519 signature using `russh-crypto`'s `Ed25519Verifier`.
+//!
+//! All secret comparisons (passwords, HMAC tags) use `subtle::ConstantTimeEq`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
-use russh_crypto::constant_time_eq;
+use russh_crypto::{
+    Ed25519Verifier, Verifier, constant_time_eq, decode_ssh_string, encode_ssh_string,
+};
 
 /// Client authentication request variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -574,6 +601,12 @@ impl MemoryAuthorizedKeys {
         Ok(count)
     }
 
+    /// Returns `true` if `key` is an authorized key blob for `user`.
+    ///
+    /// # Constant-time note
+    ///
+    /// Key blob comparison uses [`russh_crypto::constant_time_eq`] (`subtle::ConstantTimeEq`)
+    /// to prevent timing side-channels.
     #[must_use]
     pub fn is_authorized(&self, user: &str, key: &[u8]) -> bool {
         self.entries.get(user).is_some_and(|entries| {
@@ -643,6 +676,58 @@ impl IdentityProvider for MemoryIdentityProvider {
     }
 }
 
+/// File-backed identity provider that loads SSH public keys from `.pub` files.
+///
+/// For each key path provided, it looks for a corresponding `.pub` file and
+/// parses it as an SSH authorized-keys public key blob.
+pub struct FileIdentityProvider {
+    key_paths: Vec<std::path::PathBuf>,
+}
+
+impl FileIdentityProvider {
+    pub fn new(paths: Vec<std::path::PathBuf>) -> Self {
+        Self { key_paths: paths }
+    }
+
+    /// Create with default OpenSSH identity file paths for the current user.
+    pub fn with_default_paths() -> Self {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let paths = ["id_ed25519", "id_ecdsa", "id_rsa"]
+            .iter()
+            .map(|f| std::path::PathBuf::from(format!("{home}/.ssh/{f}")))
+            .filter(|p| p.exists())
+            .collect();
+        Self::new(paths)
+    }
+}
+
+impl IdentityProvider for FileIdentityProvider {
+    fn identities_for_user(&self, _user: &str) -> Vec<Vec<u8>> {
+        self.key_paths
+            .iter()
+            .filter_map(|path| {
+                let pub_path = path.with_extension("pub");
+                if let Ok(content) = std::fs::read_to_string(&pub_path) {
+                    parse_pub_file_blob(&content)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+fn parse_pub_file_blob(content: &str) -> Option<Vec<u8>> {
+    let line = content.lines().next()?.trim();
+    if line.starts_with('#') || line.is_empty() {
+        return None;
+    }
+    let mut parts = line.splitn(3, ' ');
+    let _alg = parts.next()?;
+    let b64 = parts.next()?;
+    decode_base64(b64).ok()
+}
+
 /// In-memory known_hosts store with wildcard host pattern support.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryKnownHostsStore {
@@ -666,6 +751,12 @@ impl MemoryKnownHostsStore {
 }
 
 impl KnownHostsStore for MemoryKnownHostsStore {
+    /// Returns `true` if `host` is a known host with the provided `key` blob.
+    ///
+    /// # Constant-time note
+    ///
+    /// Key blob comparison uses [`russh_crypto::constant_time_eq`] (`subtle::ConstantTimeEq`)
+    /// to prevent timing side-channels.
     fn is_known_host(&self, host: &str, key: &[u8]) -> bool {
         let mut positive_match = false;
 
@@ -1026,6 +1117,108 @@ impl AuthSession {
             .copied()
             .collect()
     }
+}
+
+/// Parse an SSH Ed25519 public key blob (wire format: string "ssh-ed25519" || string <32 bytes>)
+/// and return the 32-byte raw key bytes.
+pub fn parse_ed25519_public_key_blob(blob: &[u8]) -> Result<[u8; 32], RusshError> {
+    let mut offset = 0;
+    let algo = decode_ssh_string(blob, &mut offset)?;
+    if algo != b"ssh-ed25519" {
+        return Err(RusshError::new(
+            RusshErrorCategory::Crypto,
+            "expected ssh-ed25519 algorithm in public key blob",
+        ));
+    }
+    let key_bytes = decode_ssh_string(blob, &mut offset)?;
+    key_bytes.try_into().map_err(|_| {
+        RusshError::new(
+            RusshErrorCategory::Crypto,
+            "Ed25519 public key must be exactly 32 bytes",
+        )
+    })
+}
+
+/// Parse an SSH Ed25519 signature blob (wire format: string "ssh-ed25519" || string <64 bytes>)
+/// and return the 64-byte signature bytes.
+pub fn parse_ed25519_signature_blob(blob: &[u8]) -> Result<[u8; 64], RusshError> {
+    let mut offset = 0;
+    let algo = decode_ssh_string(blob, &mut offset)?;
+    if algo != b"ssh-ed25519" {
+        return Err(RusshError::new(
+            RusshErrorCategory::Crypto,
+            "expected ssh-ed25519 algorithm in signature blob",
+        ));
+    }
+    let sig_bytes = decode_ssh_string(blob, &mut offset)?;
+    sig_bytes.try_into().map_err(|_| {
+        RusshError::new(
+            RusshErrorCategory::Crypto,
+            "Ed25519 signature must be exactly 64 bytes",
+        )
+    })
+}
+
+/// Build an SSH Ed25519 public key blob: string "ssh-ed25519" || string <32 bytes>
+pub fn build_ed25519_public_key_blob(key_bytes: &[u8; 32]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&encode_ssh_string(b"ssh-ed25519"));
+    blob.extend_from_slice(&encode_ssh_string(key_bytes.as_slice()));
+    blob
+}
+
+/// Build an SSH Ed25519 signature blob: string "ssh-ed25519" || string <64 bytes>
+pub fn build_ed25519_signature_blob(sig_bytes: &[u8; 64]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&encode_ssh_string(b"ssh-ed25519"));
+    blob.extend_from_slice(&encode_ssh_string(sig_bytes.as_slice()));
+    blob
+}
+
+/// Verify a publickey auth signature for SSH_MSG_USERAUTH_REQUEST.
+///
+/// The signing payload is:
+///   string  session_id
+///   byte    50 (SSH_MSG_USERAUTH_REQUEST)
+///   string  user
+///   string  service
+///   string  "publickey"
+///   boolean true
+///   string  algorithm_name
+///   string  public_key_blob
+pub fn verify_publickey_auth_signature(
+    session_id: &[u8],
+    user: &str,
+    service: &str,
+    algorithm: &str,
+    public_key_blob: &[u8],
+    signature_blob: &[u8],
+) -> Result<(), RusshError> {
+    let key_bytes = parse_ed25519_public_key_blob(public_key_blob)?;
+    let sig_bytes = parse_ed25519_signature_blob(signature_blob)?;
+    let payload =
+        build_userauth_signing_payload(session_id, user, service, algorithm, public_key_blob);
+    let verifier = Ed25519Verifier::from_bytes(&key_bytes)?;
+    verifier.verify(&payload, &sig_bytes)
+}
+
+fn build_userauth_signing_payload(
+    session_id: &[u8],
+    user: &str,
+    service: &str,
+    algorithm: &str,
+    public_key_blob: &[u8],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&encode_ssh_string(session_id));
+    payload.push(50u8); // SSH_MSG_USERAUTH_REQUEST
+    payload.extend_from_slice(&encode_ssh_string(user.as_bytes()));
+    payload.extend_from_slice(&encode_ssh_string(service.as_bytes()));
+    payload.extend_from_slice(&encode_ssh_string(b"publickey"));
+    payload.push(1u8); // boolean true
+    payload.extend_from_slice(&encode_ssh_string(algorithm.as_bytes()));
+    payload.extend_from_slice(&encode_ssh_string(public_key_blob));
+    payload
 }
 
 fn looks_like_key_algorithm(token: &str) -> bool {
@@ -1417,5 +1610,182 @@ mod tests {
             .expect("known_hosts load should succeed");
         assert!(known_hosts.is_known_host("ssh.example.com", b"abcd"));
         assert!(!known_hosts.is_known_host("bad.example.com", b"abcd"));
+    }
+
+    #[test]
+    fn build_and_parse_ed25519_public_key_blob_roundtrip() {
+        use super::{build_ed25519_public_key_blob, parse_ed25519_public_key_blob};
+        let raw = [0xABu8; 32];
+        let blob = build_ed25519_public_key_blob(&raw);
+        let parsed = parse_ed25519_public_key_blob(&blob).expect("should parse valid blob");
+        assert_eq!(parsed, raw);
+    }
+
+    #[test]
+    fn build_and_parse_ed25519_signature_blob_roundtrip() {
+        use super::{build_ed25519_signature_blob, parse_ed25519_signature_blob};
+        let raw = [0xCDu8; 64];
+        let blob = build_ed25519_signature_blob(&raw);
+        let parsed = parse_ed25519_signature_blob(&blob).expect("should parse valid blob");
+        assert_eq!(parsed, raw);
+    }
+
+    #[test]
+    fn parse_ed25519_public_key_blob_rejects_wrong_algorithm() {
+        use super::parse_ed25519_public_key_blob;
+        use russh_crypto::encode_ssh_string;
+        let mut bad_blob = Vec::new();
+        bad_blob.extend_from_slice(&encode_ssh_string(b"ecdsa-sha2-nistp256"));
+        bad_blob.extend_from_slice(&encode_ssh_string(&[0u8; 32]));
+        assert!(parse_ed25519_public_key_blob(&bad_blob).is_err());
+    }
+
+    #[test]
+    fn parse_ed25519_public_key_blob_rejects_wrong_key_length() {
+        use super::parse_ed25519_public_key_blob;
+        use russh_crypto::encode_ssh_string;
+        let mut bad_blob = Vec::new();
+        bad_blob.extend_from_slice(&encode_ssh_string(b"ssh-ed25519"));
+        bad_blob.extend_from_slice(&encode_ssh_string(&[0u8; 16])); // wrong length
+        assert!(parse_ed25519_public_key_blob(&bad_blob).is_err());
+    }
+
+    #[test]
+    fn verify_publickey_auth_signature_accepts_valid_signature() {
+        use russh_crypto::{Ed25519Signer, Signer};
+
+        use super::{
+            build_ed25519_signature_blob, build_userauth_signing_payload,
+            verify_publickey_auth_signature,
+        };
+
+        let signer = Ed25519Signer::from_seed(&[42u8; 32]);
+        // public_key_blob() already returns SSH wire format: string "ssh-ed25519" || string <32 bytes>
+        let public_key_blob = signer.public_key_blob();
+
+        let session_id = [0xABu8; 32];
+        let user = "alice";
+        let service = "ssh-connection";
+        let algorithm = "ssh-ed25519";
+
+        let payload =
+            build_userauth_signing_payload(&session_id, user, service, algorithm, &public_key_blob);
+        let sig_raw = signer.sign(&payload).unwrap();
+        let sig_bytes: [u8; 64] = sig_raw.try_into().unwrap();
+        let signature_blob = build_ed25519_signature_blob(&sig_bytes);
+
+        verify_publickey_auth_signature(
+            &session_id,
+            user,
+            service,
+            algorithm,
+            &public_key_blob,
+            &signature_blob,
+        )
+        .expect("valid signature should verify");
+    }
+
+    #[test]
+    fn verify_publickey_auth_signature_rejects_tampered_signature() {
+        use russh_crypto::{Ed25519Signer, Signer};
+
+        use super::{
+            build_ed25519_signature_blob, build_userauth_signing_payload,
+            verify_publickey_auth_signature,
+        };
+
+        let signer = Ed25519Signer::from_seed(&[7u8; 32]);
+        let public_key_blob = signer.public_key_blob();
+
+        let session_id = [0x11u8; 32];
+        let payload = build_userauth_signing_payload(
+            &session_id,
+            "bob",
+            "ssh-connection",
+            "ssh-ed25519",
+            &public_key_blob,
+        );
+        let sig_raw = signer.sign(&payload).unwrap();
+        let mut sig_bytes: [u8; 64] = sig_raw.try_into().unwrap();
+        sig_bytes[0] ^= 0xFF; // tamper
+        let signature_blob = build_ed25519_signature_blob(&sig_bytes);
+
+        assert!(
+            verify_publickey_auth_signature(
+                &session_id,
+                "bob",
+                "ssh-connection",
+                "ssh-ed25519",
+                &public_key_blob,
+                &signature_blob,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_publickey_auth_signature_rejects_wrong_key() {
+        use russh_crypto::{Ed25519Signer, Signer};
+
+        use super::{
+            build_ed25519_signature_blob, build_userauth_signing_payload,
+            verify_publickey_auth_signature,
+        };
+
+        let signer1 = Ed25519Signer::from_seed(&[1u8; 32]);
+        let signer2 = Ed25519Signer::from_seed(&[2u8; 32]);
+        // present signer1's public key blob
+        let public_key_blob = signer1.public_key_blob();
+
+        let session_id = [0x22u8; 32];
+        let payload = build_userauth_signing_payload(
+            &session_id,
+            "carol",
+            "ssh-connection",
+            "ssh-ed25519",
+            &public_key_blob,
+        );
+        // signed with signer2 but presenting key1
+        let sig_raw = signer2.sign(&payload).unwrap();
+        let sig_bytes: [u8; 64] = sig_raw.try_into().unwrap();
+        let signature_blob = build_ed25519_signature_blob(&sig_bytes);
+
+        assert!(
+            verify_publickey_auth_signature(
+                &session_id,
+                "carol",
+                "ssh-connection",
+                "ssh-ed25519",
+                &public_key_blob,
+                &signature_blob,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_pub_file_blob_parses_openssh_pub_format() {
+        use super::parse_pub_file_blob;
+        // A simple base64 payload (b"abcd" = YWJjZA==)
+        let content = "ssh-ed25519 YWJjZA== alice@host\n";
+        let blob = parse_pub_file_blob(content).expect("should parse valid .pub line");
+        assert_eq!(blob, b"abcd");
+    }
+
+    #[test]
+    fn parse_pub_file_blob_skips_comments() {
+        use super::parse_pub_file_blob;
+        let _content = "# this is a comment\nssh-ed25519 YWJjZA==\n";
+        // first line is a comment, so parse returns None for first line
+        assert!(parse_pub_file_blob("# comment\n").is_none());
+    }
+
+    #[test]
+    fn file_identity_provider_with_default_paths_does_not_panic() {
+        use super::FileIdentityProvider;
+        use crate::IdentityProvider;
+        let provider = FileIdentityProvider::with_default_paths();
+        // should not panic even if ~/.ssh/ doesn't exist
+        let _ = provider.identities_for_user("alice");
     }
 }

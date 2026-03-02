@@ -14,3 +14,4 @@ workspace = true
 russh-auth = { path = "../russh-auth" }
 russh-core = { path = "../russh-core" }
 russh-crypto = { path = "../russh-crypto" }
+zeroize.workspace = true

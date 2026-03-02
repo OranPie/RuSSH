@@ -1,5 +1,34 @@
-//! SFTP protocol model and bootstrap client/server helpers.
+//! SFTP v3 protocol codec and server for RuSSH (draft-ietf-secsh-filexfer-02).
+//!
+//! ## Wire codec
+//!
+//! [`SftpWirePacket`] encodes and decodes all SFTP v3 wire packets:
+//! - **Client→Server**: INIT, OPEN, CLOSE, READ, WRITE, LSTAT, FSTAT,
+//!   SETSTAT, OPENDIR, READDIR, REMOVE, MKDIR, RMDIR, REALPATH, STAT, RENAME
+//! - **Server→Client**: VERSION, STATUS, HANDLE, DATA, NAME, ATTRS
+//!
+//! Packet format: `uint32 length || byte type || body` with all integers
+//! big-endian and strings length-prefixed per RFC 4251.
+//!
+//! [`FileAttrs`] carries file metadata (size, uid/gid, permissions, timestamps)
+//! with flags controlling which fields are present.
+//!
+//! [`SftpFramer`] buffers a byte stream and yields complete [`SftpWirePacket`]
+//! frames as they arrive.
+//!
+//! ## Filesystem server
+//!
+//! [`SftpFileServer`] processes SFTP v3 request packets against a chrooted
+//! local filesystem, returning the appropriate response packet for each request.
+//! Handles file handles (read/write), directory handles (readdir), and all
+//! standard filesystem operations.
+//!
+//! ## High-level client (existing)
+//!
+//! [`SftpClient`] provides a high-level API operating on a sandboxed local
+//! directory, suitable for testing and integration scenarios.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Component;
@@ -338,6 +367,1193 @@ fn metadata_to_sftp(metadata: &fs::Metadata) -> SftpFileMetadata {
         is_dir: metadata.is_dir(),
         is_file: metadata.is_file(),
         readonly: metadata.permissions().readonly(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SFTP v3 wire codec
+// ---------------------------------------------------------------------------
+
+/// SFTP v3 packet type constants (draft-ietf-secsh-filexfer-02)
+pub mod sftp_type {
+    pub const INIT: u8 = 1;
+    pub const VERSION: u8 = 2;
+    pub const OPEN: u8 = 3;
+    pub const CLOSE: u8 = 4;
+    pub const READ: u8 = 5;
+    pub const WRITE: u8 = 6;
+    pub const LSTAT: u8 = 7;
+    pub const FSTAT: u8 = 8;
+    pub const SETSTAT: u8 = 9;
+    pub const FSETSTAT: u8 = 10;
+    pub const OPENDIR: u8 = 11;
+    pub const READDIR: u8 = 12;
+    pub const REMOVE: u8 = 13;
+    pub const MKDIR: u8 = 14;
+    pub const RMDIR: u8 = 15;
+    pub const REALPATH: u8 = 16;
+    pub const STAT: u8 = 17;
+    pub const RENAME: u8 = 18;
+    pub const STATUS: u8 = 101;
+    pub const HANDLE: u8 = 102;
+    pub const DATA: u8 = 103;
+    pub const NAME: u8 = 104;
+    pub const ATTRS: u8 = 105;
+}
+
+/// SFTP v3 ATTRS flags
+pub mod attr_flags {
+    pub const SIZE: u32 = 0x00000001;
+    pub const UIDGID: u32 = 0x00000002;
+    pub const PERMISSIONS: u32 = 0x00000004;
+    pub const ACMODTIME: u32 = 0x00000008;
+}
+
+/// SFTP open flags (SSH_FXF_*)
+pub mod open_flags {
+    pub const READ: u32 = 0x00000001;
+    pub const WRITE: u32 = 0x00000002;
+    pub const APPEND: u32 = 0x00000004;
+    pub const CREAT: u32 = 0x00000008;
+    pub const TRUNC: u32 = 0x00000010;
+    pub const EXCL: u32 = 0x00000020;
+}
+
+// --- Private wire-encoding helpers ---
+
+fn sftp_read_u32(data: &[u8], off: &mut usize) -> Result<u32, RusshError> {
+    if *off + 4 > data.len() {
+        return Err(RusshError::new(
+            RusshErrorCategory::Protocol,
+            "unexpected end of SFTP packet",
+        ));
+    }
+    let v = u32::from_be_bytes([data[*off], data[*off + 1], data[*off + 2], data[*off + 3]]);
+    *off += 4;
+    Ok(v)
+}
+
+fn sftp_read_u64(data: &[u8], off: &mut usize) -> Result<u64, RusshError> {
+    if *off + 8 > data.len() {
+        return Err(RusshError::new(
+            RusshErrorCategory::Protocol,
+            "unexpected end of SFTP packet",
+        ));
+    }
+    let v = u64::from_be_bytes([
+        data[*off],
+        data[*off + 1],
+        data[*off + 2],
+        data[*off + 3],
+        data[*off + 4],
+        data[*off + 5],
+        data[*off + 6],
+        data[*off + 7],
+    ]);
+    *off += 8;
+    Ok(v)
+}
+
+fn sftp_read_string(data: &[u8], off: &mut usize) -> Result<Vec<u8>, RusshError> {
+    let len = sftp_read_u32(data, off)? as usize;
+    if *off + len > data.len() {
+        return Err(RusshError::new(
+            RusshErrorCategory::Protocol,
+            "unexpected end of SFTP string",
+        ));
+    }
+    let s = data[*off..*off + len].to_vec();
+    *off += len;
+    Ok(s)
+}
+
+fn sftp_read_utf8(data: &[u8], off: &mut usize) -> Result<String, RusshError> {
+    let bytes = sftp_read_string(data, off)?;
+    String::from_utf8(bytes).map_err(|_| {
+        RusshError::new(
+            RusshErrorCategory::Protocol,
+            "SFTP string is not valid UTF-8",
+        )
+    })
+}
+
+fn sftp_write_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+fn sftp_write_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+fn sftp_write_string(out: &mut Vec<u8>, s: &[u8]) {
+    sftp_write_u32(out, s.len() as u32);
+    out.extend_from_slice(s);
+}
+
+// --- Public types ---
+
+/// SSH_FX_* status codes
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SftpStatus {
+    Ok,
+    Eof,
+    NoSuchFile,
+    PermissionDenied,
+    Failure,
+    BadMessage,
+    Unsupported,
+}
+
+impl SftpStatus {
+    pub fn to_code(self) -> u32 {
+        match self {
+            Self::Ok => 0,
+            Self::Eof => 1,
+            Self::NoSuchFile => 2,
+            Self::PermissionDenied => 3,
+            Self::Failure => 4,
+            Self::BadMessage => 5,
+            Self::Unsupported => 8,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            0 => Self::Ok,
+            1 => Self::Eof,
+            2 => Self::NoSuchFile,
+            3 => Self::PermissionDenied,
+            4 => Self::Failure,
+            5 => Self::BadMessage,
+            _ => Self::Failure,
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Eof => "end of file",
+            Self::NoSuchFile => "no such file",
+            Self::PermissionDenied => "permission denied",
+            Self::Failure => "failure",
+            Self::BadMessage => "bad message",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// SFTP file attributes
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FileAttrs {
+    pub size: Option<u64>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub permissions: Option<u32>,
+    pub atime: Option<u32>,
+    pub mtime: Option<u32>,
+}
+
+impl FileAttrs {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut flags: u32 = 0;
+        if self.size.is_some() {
+            flags |= attr_flags::SIZE;
+        }
+        if self.uid.is_some() && self.gid.is_some() {
+            flags |= attr_flags::UIDGID;
+        }
+        if self.permissions.is_some() {
+            flags |= attr_flags::PERMISSIONS;
+        }
+        if self.atime.is_some() && self.mtime.is_some() {
+            flags |= attr_flags::ACMODTIME;
+        }
+        let mut out = Vec::new();
+        sftp_write_u32(&mut out, flags);
+        if let Some(sz) = self.size {
+            sftp_write_u64(&mut out, sz);
+        }
+        if let (Some(uid), Some(gid)) = (self.uid, self.gid) {
+            sftp_write_u32(&mut out, uid);
+            sftp_write_u32(&mut out, gid);
+        }
+        if let Some(perm) = self.permissions {
+            sftp_write_u32(&mut out, perm);
+        }
+        if let (Some(atime), Some(mtime)) = (self.atime, self.mtime) {
+            sftp_write_u32(&mut out, atime);
+            sftp_write_u32(&mut out, mtime);
+        }
+        out
+    }
+
+    pub fn decode(data: &[u8], offset: &mut usize) -> Result<Self, RusshError> {
+        let flags = sftp_read_u32(data, offset)?;
+        let size = if flags & attr_flags::SIZE != 0 {
+            Some(sftp_read_u64(data, offset)?)
+        } else {
+            None
+        };
+        let (uid, gid) = if flags & attr_flags::UIDGID != 0 {
+            (
+                Some(sftp_read_u32(data, offset)?),
+                Some(sftp_read_u32(data, offset)?),
+            )
+        } else {
+            (None, None)
+        };
+        let permissions = if flags & attr_flags::PERMISSIONS != 0 {
+            Some(sftp_read_u32(data, offset)?)
+        } else {
+            None
+        };
+        let (atime, mtime) = if flags & attr_flags::ACMODTIME != 0 {
+            (
+                Some(sftp_read_u32(data, offset)?),
+                Some(sftp_read_u32(data, offset)?),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            size,
+            uid,
+            gid,
+            permissions,
+            atime,
+            mtime,
+        })
+    }
+
+    pub fn from_fs_metadata(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                size: Some(meta.len()),
+                uid: Some(meta.uid()),
+                gid: Some(meta.gid()),
+                permissions: Some(meta.mode()),
+                atime: Some(meta.atime() as u32),
+                mtime: Some(meta.mtime() as u32),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {
+            size: Some(meta.len()),
+            ..Default::default()
+        }
+    }
+}
+
+/// A single entry in an SFTP SSH_FXP_NAME response
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SftpNameEntry {
+    pub filename: String,
+    pub longname: String,
+    pub attrs: FileAttrs,
+}
+
+/// A single SFTP v3 wire packet
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SftpWirePacket {
+    // Client → Server
+    Init {
+        version: u32,
+    },
+    Open {
+        id: u32,
+        filename: String,
+        pflags: u32,
+        attrs: FileAttrs,
+    },
+    Close {
+        id: u32,
+        handle: Vec<u8>,
+    },
+    Read {
+        id: u32,
+        handle: Vec<u8>,
+        offset: u64,
+        len: u32,
+    },
+    Write {
+        id: u32,
+        handle: Vec<u8>,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    Lstat {
+        id: u32,
+        path: String,
+    },
+    Fstat {
+        id: u32,
+        handle: Vec<u8>,
+    },
+    Setstat {
+        id: u32,
+        path: String,
+        attrs: FileAttrs,
+    },
+    Opendir {
+        id: u32,
+        path: String,
+    },
+    Readdir {
+        id: u32,
+        handle: Vec<u8>,
+    },
+    Remove {
+        id: u32,
+        filename: String,
+    },
+    Mkdir {
+        id: u32,
+        path: String,
+        attrs: FileAttrs,
+    },
+    Rmdir {
+        id: u32,
+        path: String,
+    },
+    Realpath {
+        id: u32,
+        path: String,
+    },
+    Stat {
+        id: u32,
+        path: String,
+    },
+    Rename {
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    },
+    // Server → Client
+    Version {
+        version: u32,
+    },
+    Status {
+        id: u32,
+        status: SftpStatus,
+        message: String,
+    },
+    Handle {
+        id: u32,
+        handle: Vec<u8>,
+    },
+    Data {
+        id: u32,
+        data: Vec<u8>,
+    },
+    Name {
+        id: u32,
+        entries: Vec<SftpNameEntry>,
+    },
+    AttrsReply {
+        id: u32,
+        attrs: FileAttrs,
+    },
+}
+
+impl SftpWirePacket {
+    /// Encode to `uint32 length || byte type || body`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        match self {
+            Self::Init { version } => {
+                body.push(sftp_type::INIT);
+                sftp_write_u32(&mut body, *version);
+            }
+            Self::Version { version } => {
+                body.push(sftp_type::VERSION);
+                sftp_write_u32(&mut body, *version);
+            }
+            Self::Open {
+                id,
+                filename,
+                pflags,
+                attrs,
+            } => {
+                body.push(sftp_type::OPEN);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, filename.as_bytes());
+                sftp_write_u32(&mut body, *pflags);
+                body.extend_from_slice(&attrs.encode());
+            }
+            Self::Close { id, handle } => {
+                body.push(sftp_type::CLOSE);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, handle);
+            }
+            Self::Read {
+                id,
+                handle,
+                offset,
+                len,
+            } => {
+                body.push(sftp_type::READ);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, handle);
+                sftp_write_u64(&mut body, *offset);
+                sftp_write_u32(&mut body, *len);
+            }
+            Self::Write {
+                id,
+                handle,
+                offset,
+                data,
+            } => {
+                body.push(sftp_type::WRITE);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, handle);
+                sftp_write_u64(&mut body, *offset);
+                sftp_write_string(&mut body, data);
+            }
+            Self::Lstat { id, path } => {
+                body.push(sftp_type::LSTAT);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, path.as_bytes());
+            }
+            Self::Fstat { id, handle } => {
+                body.push(sftp_type::FSTAT);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, handle);
+            }
+            Self::Setstat { id, path, attrs } => {
+                body.push(sftp_type::SETSTAT);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, path.as_bytes());
+                body.extend_from_slice(&attrs.encode());
+            }
+            Self::Opendir { id, path } => {
+                body.push(sftp_type::OPENDIR);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, path.as_bytes());
+            }
+            Self::Readdir { id, handle } => {
+                body.push(sftp_type::READDIR);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, handle);
+            }
+            Self::Remove { id, filename } => {
+                body.push(sftp_type::REMOVE);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, filename.as_bytes());
+            }
+            Self::Mkdir { id, path, attrs } => {
+                body.push(sftp_type::MKDIR);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, path.as_bytes());
+                body.extend_from_slice(&attrs.encode());
+            }
+            Self::Rmdir { id, path } => {
+                body.push(sftp_type::RMDIR);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, path.as_bytes());
+            }
+            Self::Realpath { id, path } => {
+                body.push(sftp_type::REALPATH);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, path.as_bytes());
+            }
+            Self::Stat { id, path } => {
+                body.push(sftp_type::STAT);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, path.as_bytes());
+            }
+            Self::Rename {
+                id,
+                oldpath,
+                newpath,
+            } => {
+                body.push(sftp_type::RENAME);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, oldpath.as_bytes());
+                sftp_write_string(&mut body, newpath.as_bytes());
+            }
+            Self::Status {
+                id,
+                status,
+                message,
+            } => {
+                body.push(sftp_type::STATUS);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_u32(&mut body, status.to_code());
+                sftp_write_string(&mut body, message.as_bytes());
+                sftp_write_string(&mut body, b"en");
+            }
+            Self::Handle { id, handle } => {
+                body.push(sftp_type::HANDLE);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, handle);
+            }
+            Self::Data { id, data } => {
+                body.push(sftp_type::DATA);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, data);
+            }
+            Self::Name { id, entries } => {
+                body.push(sftp_type::NAME);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_u32(&mut body, entries.len() as u32);
+                for entry in entries {
+                    sftp_write_string(&mut body, entry.filename.as_bytes());
+                    sftp_write_string(&mut body, entry.longname.as_bytes());
+                    body.extend_from_slice(&entry.attrs.encode());
+                }
+            }
+            Self::AttrsReply { id, attrs } => {
+                body.push(sftp_type::ATTRS);
+                sftp_write_u32(&mut body, *id);
+                body.extend_from_slice(&attrs.encode());
+            }
+        }
+        let mut out = Vec::new();
+        sftp_write_u32(&mut out, body.len() as u32);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Decode from `uint32 length || byte type || body` (including the 4-byte length prefix).
+    pub fn decode(data: &[u8]) -> Result<Self, RusshError> {
+        if data.len() < 5 {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "SFTP packet too short",
+            ));
+        }
+        let mut off = 0usize;
+        let len = sftp_read_u32(data, &mut off)? as usize;
+        if len == 0 || data.len() < 4 + len {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "SFTP packet truncated",
+            ));
+        }
+        let ptype = data[off];
+        off += 1;
+        let end = 4 + len;
+
+        let packet = match ptype {
+            sftp_type::INIT => {
+                let version = sftp_read_u32(data, &mut off)?;
+                Self::Init { version }
+            }
+            sftp_type::VERSION => {
+                let version = sftp_read_u32(data, &mut off)?;
+                Self::Version { version }
+            }
+            sftp_type::OPEN => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let filename = sftp_read_utf8(data, &mut off)?;
+                let pflags = sftp_read_u32(data, &mut off)?;
+                let attrs = FileAttrs::decode(data, &mut off)?;
+                Self::Open {
+                    id,
+                    filename,
+                    pflags,
+                    attrs,
+                }
+            }
+            sftp_type::CLOSE => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let handle = sftp_read_string(data, &mut off)?;
+                Self::Close { id, handle }
+            }
+            sftp_type::READ => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let handle = sftp_read_string(data, &mut off)?;
+                let offset = sftp_read_u64(data, &mut off)?;
+                let rlen = sftp_read_u32(data, &mut off)?;
+                Self::Read {
+                    id,
+                    handle,
+                    offset,
+                    len: rlen,
+                }
+            }
+            sftp_type::WRITE => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let handle = sftp_read_string(data, &mut off)?;
+                let offset = sftp_read_u64(data, &mut off)?;
+                let wdata = sftp_read_string(data, &mut off)?;
+                Self::Write {
+                    id,
+                    handle,
+                    offset,
+                    data: wdata,
+                }
+            }
+            sftp_type::LSTAT => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let path = sftp_read_utf8(data, &mut off)?;
+                Self::Lstat { id, path }
+            }
+            sftp_type::FSTAT => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let handle = sftp_read_string(data, &mut off)?;
+                Self::Fstat { id, handle }
+            }
+            sftp_type::SETSTAT => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let path = sftp_read_utf8(data, &mut off)?;
+                let attrs = FileAttrs::decode(data, &mut off)?;
+                Self::Setstat { id, path, attrs }
+            }
+            sftp_type::OPENDIR => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let path = sftp_read_utf8(data, &mut off)?;
+                Self::Opendir { id, path }
+            }
+            sftp_type::READDIR => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let handle = sftp_read_string(data, &mut off)?;
+                Self::Readdir { id, handle }
+            }
+            sftp_type::REMOVE => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let filename = sftp_read_utf8(data, &mut off)?;
+                Self::Remove { id, filename }
+            }
+            sftp_type::MKDIR => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let path = sftp_read_utf8(data, &mut off)?;
+                let attrs = FileAttrs::decode(data, &mut off)?;
+                Self::Mkdir { id, path, attrs }
+            }
+            sftp_type::RMDIR => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let path = sftp_read_utf8(data, &mut off)?;
+                Self::Rmdir { id, path }
+            }
+            sftp_type::REALPATH => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let path = sftp_read_utf8(data, &mut off)?;
+                Self::Realpath { id, path }
+            }
+            sftp_type::STAT => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let path = sftp_read_utf8(data, &mut off)?;
+                Self::Stat { id, path }
+            }
+            sftp_type::RENAME => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let oldpath = sftp_read_utf8(data, &mut off)?;
+                let newpath = sftp_read_utf8(data, &mut off)?;
+                Self::Rename {
+                    id,
+                    oldpath,
+                    newpath,
+                }
+            }
+            sftp_type::STATUS => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let code = sftp_read_u32(data, &mut off)?;
+                let msg_bytes = sftp_read_string(data, &mut off)?;
+                // skip optional language tag
+                if off < end {
+                    let _lang = sftp_read_string(data, &mut off);
+                }
+                let message = String::from_utf8(msg_bytes).unwrap_or_default();
+                Self::Status {
+                    id,
+                    status: SftpStatus::from_code(code),
+                    message,
+                }
+            }
+            sftp_type::HANDLE => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let handle = sftp_read_string(data, &mut off)?;
+                Self::Handle { id, handle }
+            }
+            sftp_type::DATA => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let pdata = sftp_read_string(data, &mut off)?;
+                Self::Data { id, data: pdata }
+            }
+            sftp_type::NAME => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let count = sftp_read_u32(data, &mut off)?;
+                let mut entries = Vec::new();
+                for _ in 0..count {
+                    let filename = sftp_read_utf8(data, &mut off)?;
+                    let longname = sftp_read_utf8(data, &mut off)?;
+                    let attrs = FileAttrs::decode(data, &mut off)?;
+                    entries.push(SftpNameEntry {
+                        filename,
+                        longname,
+                        attrs,
+                    });
+                }
+                Self::Name { id, entries }
+            }
+            sftp_type::ATTRS => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let attrs = FileAttrs::decode(data, &mut off)?;
+                Self::AttrsReply { id, attrs }
+            }
+            _ => {
+                return Err(RusshError::new(
+                    RusshErrorCategory::Protocol,
+                    format!("unknown SFTP packet type {ptype}"),
+                ));
+            }
+        };
+        Ok(packet)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SftpFileServer — processes SFTP v3 packets against the local filesystem
+// ---------------------------------------------------------------------------
+
+enum SftpHandle {
+    File(fs::File),
+    Dir(ReadDirState),
+}
+
+struct ReadDirState {
+    _path: PathBuf,
+    entries: Vec<SftpNameEntry>,
+    consumed: bool,
+}
+
+/// SFTP v3 server that handles requests against a chrooted local filesystem.
+pub struct SftpFileServer {
+    root: PathBuf,
+    handles: HashMap<Vec<u8>, SftpHandle>,
+    next_handle: u32,
+}
+
+impl SftpFileServer {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            handles: HashMap::new(),
+            next_handle: 0,
+        }
+    }
+
+    fn alloc_handle(&mut self) -> Vec<u8> {
+        let n = self.next_handle;
+        self.next_handle = self.next_handle.wrapping_add(1);
+        n.to_be_bytes().to_vec()
+    }
+
+    fn resolve_path(&self, path: &str) -> Result<PathBuf, RusshError> {
+        let p = Path::new(path);
+        let mut sanitized = PathBuf::new();
+        for component in p.components() {
+            match component {
+                Component::Normal(part) => sanitized.push(part),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Protocol,
+                        format!("path {:?} escapes SFTP root", path),
+                    ));
+                }
+            }
+        }
+        Ok(self.root.join(sanitized))
+    }
+
+    fn io_status(e: &std::io::Error) -> SftpStatus {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => SftpStatus::NoSuchFile,
+            std::io::ErrorKind::PermissionDenied => SftpStatus::PermissionDenied,
+            _ => SftpStatus::Failure,
+        }
+    }
+
+    fn status_ok(id: u32) -> SftpWirePacket {
+        SftpWirePacket::Status {
+            id,
+            status: SftpStatus::Ok,
+            message: SftpStatus::Ok.message().to_string(),
+        }
+    }
+
+    fn status_err(id: u32, e: &std::io::Error) -> SftpWirePacket {
+        SftpWirePacket::Status {
+            id,
+            status: Self::io_status(e),
+            message: e.to_string(),
+        }
+    }
+
+    /// Process a request packet and return the response packet.
+    pub fn process(&mut self, request: &SftpWirePacket) -> Result<SftpWirePacket, RusshError> {
+        match request {
+            SftpWirePacket::Init { .. } => Ok(SftpWirePacket::Version { version: 3 }),
+
+            SftpWirePacket::Open {
+                id,
+                filename,
+                pflags,
+                ..
+            } => {
+                let id = *id;
+                let full_path = match self.resolve_path(filename) {
+                    Err(_) => {
+                        return Ok(SftpWirePacket::Status {
+                            id,
+                            status: SftpStatus::PermissionDenied,
+                            message: "path escapes root".to_string(),
+                        });
+                    }
+                    Ok(p) => p,
+                };
+                let read = pflags & open_flags::READ != 0;
+                let write = pflags & open_flags::WRITE != 0;
+                let append = pflags & open_flags::APPEND != 0;
+                let creat = pflags & open_flags::CREAT != 0;
+                let trunc = pflags & open_flags::TRUNC != 0;
+                let excl = pflags & open_flags::EXCL != 0;
+                if creat {
+                    if let Some(parent) = full_path.parent() {
+                        let _mkdir = fs::create_dir_all(parent);
+                    }
+                }
+                let result = fs::OpenOptions::new()
+                    .read(read)
+                    .write(write || append)
+                    .append(append)
+                    .create(creat && !excl)
+                    .create_new(excl)
+                    .truncate(trunc)
+                    .open(&full_path);
+                match result {
+                    Ok(file) => {
+                        let handle = self.alloc_handle();
+                        self.handles.insert(handle.clone(), SftpHandle::File(file));
+                        Ok(SftpWirePacket::Handle { id, handle })
+                    }
+                    Err(e) => Ok(Self::status_err(id, &e)),
+                }
+            }
+
+            SftpWirePacket::Close { id, handle } => {
+                let id = *id;
+                self.handles.remove(handle);
+                Ok(Self::status_ok(id))
+            }
+
+            SftpWirePacket::Read {
+                id,
+                handle,
+                offset,
+                len,
+            } => {
+                let id = *id;
+                let offset = *offset;
+                let max = *len as usize;
+                match self.handles.get_mut(handle) {
+                    Some(SftpHandle::File(file)) => match file.seek(SeekFrom::Start(offset)) {
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                        Ok(_) => {
+                            let mut buf = vec![0u8; max];
+                            match file.read(&mut buf) {
+                                Err(e) => Ok(Self::status_err(id, &e)),
+                                Ok(0) => Ok(SftpWirePacket::Status {
+                                    id,
+                                    status: SftpStatus::Eof,
+                                    message: SftpStatus::Eof.message().to_string(),
+                                }),
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    Ok(SftpWirePacket::Data { id, data: buf })
+                                }
+                            }
+                        }
+                    },
+                    _ => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::Failure,
+                        message: "invalid handle".to_string(),
+                    }),
+                }
+            }
+
+            SftpWirePacket::Write {
+                id,
+                handle,
+                offset,
+                data,
+            } => {
+                let id = *id;
+                let offset = *offset;
+                match self.handles.get_mut(handle) {
+                    Some(SftpHandle::File(file)) => match file.seek(SeekFrom::Start(offset)) {
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                        Ok(_) => match file.write_all(data) {
+                            Err(e) => Ok(Self::status_err(id, &e)),
+                            Ok(_) => Ok(Self::status_ok(id)),
+                        },
+                    },
+                    _ => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::Failure,
+                        message: "invalid handle".to_string(),
+                    }),
+                }
+            }
+
+            SftpWirePacket::Stat { id, path } | SftpWirePacket::Lstat { id, path } => {
+                let id = *id;
+                match self.resolve_path(path) {
+                    Err(_) => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::PermissionDenied,
+                        message: "path escapes root".to_string(),
+                    }),
+                    Ok(full_path) => match fs::metadata(&full_path) {
+                        Ok(meta) => Ok(SftpWirePacket::AttrsReply {
+                            id,
+                            attrs: FileAttrs::from_fs_metadata(&meta),
+                        }),
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                    },
+                }
+            }
+
+            SftpWirePacket::Fstat { id, handle } => {
+                let id = *id;
+                match self.handles.get(handle) {
+                    Some(SftpHandle::File(file)) => match file.metadata() {
+                        Ok(meta) => Ok(SftpWirePacket::AttrsReply {
+                            id,
+                            attrs: FileAttrs::from_fs_metadata(&meta),
+                        }),
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                    },
+                    _ => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::Failure,
+                        message: "invalid handle".to_string(),
+                    }),
+                }
+            }
+
+            SftpWirePacket::Opendir { id, path } => {
+                let id = *id;
+                let full_path = match self.resolve_path(path) {
+                    Err(_) => {
+                        return Ok(SftpWirePacket::Status {
+                            id,
+                            status: SftpStatus::PermissionDenied,
+                            message: "path escapes root".to_string(),
+                        });
+                    }
+                    Ok(p) => p,
+                };
+                match fs::read_dir(&full_path) {
+                    Err(e) => Ok(Self::status_err(id, &e)),
+                    Ok(rd) => {
+                        let mut entries = Vec::new();
+                        for entry in rd {
+                            let entry = match entry {
+                                Err(e) => return Ok(Self::status_err(id, &e)),
+                                Ok(e) => e,
+                            };
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let attrs = entry
+                                .metadata()
+                                .map(|m| FileAttrs::from_fs_metadata(&m))
+                                .unwrap_or_default();
+                            entries.push(SftpNameEntry {
+                                filename: name.clone(),
+                                longname: name,
+                                attrs,
+                            });
+                        }
+                        entries.sort_unstable_by(|a, b| a.filename.cmp(&b.filename));
+                        let handle = self.alloc_handle();
+                        self.handles.insert(
+                            handle.clone(),
+                            SftpHandle::Dir(ReadDirState {
+                                _path: full_path,
+                                entries,
+                                consumed: false,
+                            }),
+                        );
+                        Ok(SftpWirePacket::Handle { id, handle })
+                    }
+                }
+            }
+
+            SftpWirePacket::Readdir { id, handle } => {
+                let id = *id;
+                match self.handles.get_mut(handle) {
+                    Some(SftpHandle::Dir(state)) => {
+                        if state.consumed || state.entries.is_empty() {
+                            state.consumed = true;
+                            Ok(SftpWirePacket::Status {
+                                id,
+                                status: SftpStatus::Eof,
+                                message: SftpStatus::Eof.message().to_string(),
+                            })
+                        } else {
+                            let entries = state.entries.drain(..).collect();
+                            state.consumed = true;
+                            Ok(SftpWirePacket::Name { id, entries })
+                        }
+                    }
+                    _ => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::Failure,
+                        message: "invalid handle".to_string(),
+                    }),
+                }
+            }
+
+            SftpWirePacket::Remove { id, filename } => {
+                let id = *id;
+                match self.resolve_path(filename) {
+                    Err(_) => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::PermissionDenied,
+                        message: "path escapes root".to_string(),
+                    }),
+                    Ok(p) => match fs::remove_file(&p) {
+                        Ok(_) => Ok(Self::status_ok(id)),
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                    },
+                }
+            }
+
+            SftpWirePacket::Mkdir { id, path, .. } => {
+                let id = *id;
+                match self.resolve_path(path) {
+                    Err(_) => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::PermissionDenied,
+                        message: "path escapes root".to_string(),
+                    }),
+                    Ok(p) => match fs::create_dir_all(&p) {
+                        Ok(_) => Ok(Self::status_ok(id)),
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                    },
+                }
+            }
+
+            SftpWirePacket::Rmdir { id, path } => {
+                let id = *id;
+                match self.resolve_path(path) {
+                    Err(_) => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::PermissionDenied,
+                        message: "path escapes root".to_string(),
+                    }),
+                    Ok(p) => match fs::remove_dir(&p) {
+                        Ok(_) => Ok(Self::status_ok(id)),
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                    },
+                }
+            }
+
+            SftpWirePacket::Realpath { id, path } => {
+                let id = *id;
+                match self.resolve_path(path) {
+                    Err(_) => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::PermissionDenied,
+                        message: "path escapes root".to_string(),
+                    }),
+                    Ok(full_path) => {
+                        let resolved = fs::canonicalize(&full_path).unwrap_or(full_path);
+                        let name = resolved.to_string_lossy().to_string();
+                        Ok(SftpWirePacket::Name {
+                            id,
+                            entries: vec![SftpNameEntry {
+                                filename: name.clone(),
+                                longname: name,
+                                attrs: FileAttrs::default(),
+                            }],
+                        })
+                    }
+                }
+            }
+
+            SftpWirePacket::Rename {
+                id,
+                oldpath,
+                newpath,
+            } => {
+                let id = *id;
+                let old = match self.resolve_path(oldpath) {
+                    Err(_) => {
+                        return Ok(SftpWirePacket::Status {
+                            id,
+                            status: SftpStatus::PermissionDenied,
+                            message: "path escapes root".to_string(),
+                        });
+                    }
+                    Ok(p) => p,
+                };
+                let new = match self.resolve_path(newpath) {
+                    Err(_) => {
+                        return Ok(SftpWirePacket::Status {
+                            id,
+                            status: SftpStatus::PermissionDenied,
+                            message: "path escapes root".to_string(),
+                        });
+                    }
+                    Ok(p) => p,
+                };
+                match fs::rename(&old, &new) {
+                    Ok(_) => Ok(Self::status_ok(id)),
+                    Err(e) => Ok(Self::status_err(id, &e)),
+                }
+            }
+
+            // Unsupported or server→client packets
+            _ => Ok(SftpWirePacket::Status {
+                id: 0,
+                status: SftpStatus::Unsupported,
+                message: SftpStatus::Unsupported.message().to_string(),
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SftpFramer — streaming framer that yields complete packets
+// ---------------------------------------------------------------------------
+
+/// Buffers incoming bytes and yields complete `SftpWirePacket` frames.
+pub struct SftpFramer {
+    buf: Vec<u8>,
+}
+
+impl SftpFramer {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub fn feed(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Returns the next complete packet, or `None` if more data is needed.
+    pub fn next_packet(&mut self) -> Result<Option<SftpWirePacket>, RusshError> {
+        if self.buf.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+        if self.buf.len() < 4 + len {
+            return Ok(None);
+        }
+        let frame: Vec<u8> = self.buf.drain(..4 + len).collect();
+        Ok(Some(SftpWirePacket::decode(&frame)?))
+    }
+}
+
+impl Default for SftpFramer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

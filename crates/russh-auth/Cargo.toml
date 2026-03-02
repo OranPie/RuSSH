@@ -13,3 +13,4 @@ workspace = true
 [dependencies]
 russh-core = { path = "../russh-core" }
 russh-crypto = { path = "../russh-crypto" }
+subtle.workspace = true

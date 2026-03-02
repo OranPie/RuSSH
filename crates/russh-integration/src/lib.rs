@@ -1,4 +1,22 @@
-//! Integration harness primitives and smoke scenarios.
+//! Integration harness and smoke scenarios for RuSSH.
+//!
+//! This crate wires together all RuSSH subsystems to verify end-to-end
+//! behaviour and provide interoperability helpers.
+//!
+//! ## Smoke scenarios
+//!
+//! [`run_handshake_smoke`] exercises the full connection lifecycle:
+//! config parse → transport negotiation → auth → channel open → teardown.
+//!
+//! ## OpenSSH interop helpers
+//!
+//! - [`openssh_available`] — returns `true` if the `ssh` binary is on `PATH`.
+//! - [`openssh_version`] — returns the OpenSSH version string.
+//! - [`run_openssh_version_check`] — verifies OpenSSH is callable, or skips
+//!   gracefully when it is not installed.
+//!
+//! These helpers form the foundation for future interoperability test suites
+//! that spawn real OpenSSH client/server processes against RuSSH endpoints.
 
 use std::future::ready;
 use std::path::{Path, PathBuf};
@@ -292,6 +310,41 @@ fn futures_block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     }
 }
 
+/// Checks whether the `ssh` binary is available on PATH.
+pub fn openssh_available() -> bool {
+    std::process::Command::new("ssh")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Returns the version string of the installed OpenSSH client, or None.
+pub fn openssh_version() -> Option<String> {
+    let output = std::process::Command::new("ssh").arg("-V").output().ok()?;
+    // ssh -V prints to stderr
+    let bytes = if output.stderr.is_empty() {
+        output.stdout
+    } else {
+        output.stderr
+    };
+    String::from_utf8(bytes).ok().map(|s| s.trim().to_string())
+}
+
+/// Run a self-contained interop smoke test.
+/// Returns `Ok(())` if OpenSSH is not available (skip gracefully).
+/// Returns `Err` if OpenSSH is available but the test fails.
+pub fn run_openssh_version_check() -> Result<(), String> {
+    if !openssh_available() {
+        return Ok(()); // skip — OpenSSH not installed
+    }
+    let version = openssh_version().unwrap_or_default();
+    if version.is_empty() {
+        return Err("OpenSSH available but version string is empty".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use russh_core::{PacketCodec, PacketFrame, RusshErrorCategory};
@@ -364,5 +417,10 @@ mod tests {
     #[test]
     fn scp_recursive_flow_succeeds() {
         run_scp_recursive_flow().expect("scp flow should succeed");
+    }
+
+    #[test]
+    fn openssh_version_check_or_skip() {
+        super::run_openssh_version_check().expect("openssh version check failed");
     }
 }

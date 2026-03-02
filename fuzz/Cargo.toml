@@ -1,0 +1,34 @@
+[package]
+name = "russh-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+
+[[bin]]
+name = "fuzz_packet_codec"
+path = "fuzz_targets/fuzz_packet_codec.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_auth_parse"
+path = "fuzz_targets/fuzz_auth_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_config_parse"
+path = "fuzz_targets/fuzz_config_parse.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+russh-core = { path = "../crates/russh-core" }
+russh-auth = { path = "../crates/russh-auth" }
+russh-config = { path = "../crates/russh-config" }
+
+[workspace]

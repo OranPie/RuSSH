@@ -12,6 +12,7 @@ members = [
     "crates/russh-sftp",
     "crates/russh-transport",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
@@ -19,6 +20,21 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/russh"
 authors = ["RuSSH Contributors"]
+
+[workspace.dependencies]
+tracing = "0.1"
+metrics = "0.23"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
+getrandom = "0.2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

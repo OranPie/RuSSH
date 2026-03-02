@@ -1,4 +1,25 @@
-//! SCP compatibility primitives for RuSSH.
+//! SCP wire protocol helpers and client primitives for RuSSH.
+//!
+//! ## Wire protocol
+//!
+//! SCP uses a line-oriented protocol layered over an SSH `exec` channel:
+//!
+//! - **[`ScpFileHeader`]** — `C<mode> <size> <filename>\n` file copy header.
+//! - **[`ScpDirHeader`]** — `D<mode> 0 <dirname>\n` directory descend header.
+//! - **`SCP_END_DIR`** — `E\n` directory ascend marker.
+//! - **`SCP_ACK`** / **`SCP_ERR`** — single-byte acknowledgement / error codes.
+//!
+//! ## Helpers
+//!
+//! - [`build_scp_file_upload`] — builds a complete source-side upload sequence
+//!   (header + data + ACK) for a single in-memory file.
+//! - [`parse_scp_file_receive`] — parses a complete sink-side receive sequence
+//!   from a byte buffer, returning `(filename, data)`.
+//!
+//! ## High-level client (existing)
+//!
+//! [`ScpClient`] performs recursive local-to-local copies with path sanitization
+//! and is wired to accept an SSH channel for future remote-copy integration.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -225,7 +246,7 @@ impl ScpClient {
         options: ScpCopyOptions,
         stats: &mut ScpTransferStats,
     ) -> Result<(), RusshError> {
-        let _ = &self.channel;
+        let _channel = &self.channel; // channel available for future wire protocol integration
 
         for entry in fs::read_dir(source_dir).map_err(|error| {
             RusshError::new(
@@ -353,6 +374,145 @@ fn ensure_target_not_inside_source(source: &Path, target: &Path) -> Result<(), R
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SCP wire protocol helpers
+// ---------------------------------------------------------------------------
+
+/// SCP file copy header sent by the source process.
+/// Format: `C<mode> <size> <filename>\n`
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScpFileHeader {
+    pub mode: u32,
+    pub size: u64,
+    pub filename: String,
+}
+
+impl ScpFileHeader {
+    pub fn encode(&self) -> Vec<u8> {
+        format!("C{:04o} {} {}\n", self.mode, self.size, self.filename).into_bytes()
+    }
+
+    pub fn decode(line: &[u8]) -> Result<Self, RusshError> {
+        let s = std::str::from_utf8(line).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "SCP header is not valid UTF-8",
+            )
+        })?;
+        let s = s.trim_end_matches('\n');
+        if !s.starts_with('C') {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "expected SCP C header",
+            ));
+        }
+        let parts: Vec<&str> = s[1..].splitn(3, ' ').collect();
+        if parts.len() != 3 {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "malformed SCP C header",
+            ));
+        }
+        let mode = u32::from_str_radix(parts[0], 8).map_err(|_| {
+            RusshError::new(RusshErrorCategory::Protocol, "SCP mode is not valid octal")
+        })?;
+        let size: u64 = parts[1].parse().map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "SCP size is not valid integer",
+            )
+        })?;
+        Ok(Self {
+            mode,
+            size,
+            filename: parts[2].to_string(),
+        })
+    }
+}
+
+/// SCP directory header `D<mode> 0 <dirname>\n`
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScpDirHeader {
+    pub mode: u32,
+    pub dirname: String,
+}
+
+impl ScpDirHeader {
+    pub fn encode(&self) -> Vec<u8> {
+        format!("D{:04o} 0 {}\n", self.mode, self.dirname).into_bytes()
+    }
+
+    pub fn decode(line: &[u8]) -> Result<Self, RusshError> {
+        let s = std::str::from_utf8(line).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "SCP dir header is not valid UTF-8",
+            )
+        })?;
+        let s = s.trim_end_matches('\n');
+        if !s.starts_with('D') {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "expected SCP D header",
+            ));
+        }
+        let parts: Vec<&str> = s[1..].splitn(3, ' ').collect();
+        if parts.len() != 3 {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "malformed SCP D header",
+            ));
+        }
+        let mode = u32::from_str_radix(parts[0], 8).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "SCP dir mode is not valid octal",
+            )
+        })?;
+        Ok(Self {
+            mode,
+            dirname: parts[2].to_string(),
+        })
+    }
+}
+
+/// SCP end-of-directory marker `E\n`
+pub const SCP_END_DIR: &[u8] = b"E\n";
+/// SCP ACK byte (success)
+pub const SCP_ACK: u8 = 0;
+/// SCP error indicator
+pub const SCP_ERR: u8 = 1;
+
+/// Build a complete SCP upload sequence for a single file in memory.
+/// Returns `[C-header][file-data][NUL-ACK]`.
+pub fn build_scp_file_upload(filename: &str, mode: u32, data: &[u8]) -> Vec<u8> {
+    let header = ScpFileHeader {
+        mode,
+        size: data.len() as u64,
+        filename: filename.to_string(),
+    };
+    let mut out = header.encode();
+    out.extend_from_slice(data);
+    out.push(SCP_ACK);
+    out
+}
+
+/// Parse a complete SCP receive sequence from a byte buffer.
+/// Returns `(filename, data)` if a complete file is present.
+pub fn parse_scp_file_receive(buf: &[u8]) -> Result<Option<(String, Vec<u8>)>, RusshError> {
+    let nl = match buf.iter().position(|&b| b == b'\n') {
+        Some(pos) => pos,
+        None => return Ok(None),
+    };
+    let header = ScpFileHeader::decode(&buf[..=nl])?;
+    let data_start = nl + 1;
+    let data_end = data_start + header.size as usize;
+    if buf.len() < data_end + 1 {
+        return Ok(None);
+    }
+    Ok(Some((header.filename, buf[data_start..data_end].to_vec())))
 }
 
 #[cfg(test)]
