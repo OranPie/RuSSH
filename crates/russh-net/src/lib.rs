@@ -1629,14 +1629,21 @@ impl SshServerConnection {
         }
 
         // ── SERVICE_REQUEST ──
-        // Skip EXT_INFO (client may send it before SERVICE_REQUEST when server advertised ext-info-s).
+        // Skip transport-layer housekeeping messages that may arrive before SERVICE_REQUEST.
+        // Clients (especially PuTTY) may send EXT_INFO, IGNORE (2), DEBUG (4),
+        // GLOBAL_REQUEST (80), or other unknown types before the service request.
         let service_req_msg = loop {
             let frame = self.stream.read_packet().await?;
             let msg = TransportMessage::from_frame(&frame)?;
-            if matches!(msg, TransportMessage::ExtInfo { .. }) {
-                session.receive_message(msg)?;
-            } else {
-                break msg;
+            match &msg {
+                TransportMessage::ExtInfo { .. }
+                | TransportMessage::Ignore { .. } => {
+                    session.receive_message(msg)?;
+                }
+                TransportMessage::Unknown { .. } => {
+                    // silently ignore unrecognised transport messages
+                }
+                _ => break msg,
             }
         };
         if let Some(service_accept) = session.receive_message(service_req_msg)? {
@@ -1654,6 +1661,13 @@ impl SshServerConnection {
         session.activate_userauth(auth_policy);
         loop {
             let auth_frame = self.stream.read_packet().await?;
+            // Skip transport-layer housekeeping messages (IGNORE=2, DEBUG=4, etc.)
+            // that PuTTY and other clients may send during the auth phase.
+            let msg_type = auth_frame.message_type().unwrap_or(0);
+            if msg_type < 50 || msg_type == 80 {
+                // GLOBAL_REQUEST (80) and all transport-layer messages are silently skipped.
+                continue;
+            }
             let auth_msg = UserAuthMessage::from_frame(&auth_frame)?;
             let reply = session.receive_userauth_message(auth_msg)?;
             if let Some(reply) = reply {
