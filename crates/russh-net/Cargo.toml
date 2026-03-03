@@ -20,3 +20,6 @@ russh-scp     = { path = "../russh-scp" }
 russh-sftp    = { path = "../russh-sftp" }
 russh-transport = { path = "../russh-transport" }
 tokio.workspace = true
+nix = { version = "0.29", features = ["process", "fs", "term"] }
+pty-process = { version = "0.4", features = ["async"] }
+
