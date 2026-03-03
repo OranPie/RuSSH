@@ -124,6 +124,10 @@ pub struct ServerAuthPolicy {
     allowed_methods: BTreeSet<AuthMethod>,
     required_methods: BTreeSet<AuthMethod>,
     pub max_attempts: u8,
+    /// If set, incoming certificate-based auth is validated using this validator.
+    /// Certificate auth is always verified cryptographically (CA signature); this
+    /// adds policy checks (trusted CA keys, required principal).
+    pub certificate_validator: Option<CertificateValidator>,
 }
 
 impl ServerAuthPolicy {
@@ -141,7 +145,13 @@ impl ServerAuthPolicy {
             allowed_methods,
             required_methods: BTreeSet::new(),
             max_attempts: 6,
+            certificate_validator: None,
         }
+    }
+
+    /// Configure a certificate validator for cert-based publickey auth.
+    pub fn set_certificate_validator(&mut self, v: CertificateValidator) {
+        self.certificate_validator = Some(v);
     }
 
     #[must_use]
@@ -902,19 +912,213 @@ pub fn parse_known_hosts(input: &str) -> Result<Vec<KnownHostEntry>, RusshError>
     Ok(entries)
 }
 
-/// Minimal OpenSSH certificate model for policy validation.
+/// OpenSSH certificate (`ssh-ed25519-cert-v01@openssh.com`) wire-format model.
+///
+/// Wire layout (all fields encoded as SSH data types per RFC 4251 §5):
+/// ```text
+/// string  key_type      "ssh-ed25519-cert-v01@openssh.com"
+/// string  nonce
+/// string  public_key    (32-byte Ed25519 public key)
+/// uint64  serial
+/// uint32  cert_type     (1 = user, 2 = host)
+/// string  key_id
+/// string  valid_principals  (buffer: sequence of SSH strings)
+/// uint64  valid_after
+/// uint64  valid_before
+/// string  critical_options  (buffer: name+data pairs)
+/// string  extensions        (buffer: name+data pairs)
+/// string  reserved
+/// string  ca_public_key     (CA public key blob, e.g. ssh-ed25519 format)
+/// string  signature         (CA signature blob)
+/// ```
+/// `signed_data` = all bytes from the start of the blob through and including
+/// the `ca_public_key` field (i.e., everything before `signature`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenSshCertificate {
+    pub nonce: Vec<u8>,
+    /// Raw 32-byte Ed25519 public key embedded in the certificate.
+    pub public_key: Vec<u8>,
+    pub serial: u64,
+    /// 1 = user certificate, 2 = host certificate.
+    pub cert_type: u32,
     pub key_id: String,
     pub principals: Vec<String>,
     pub valid_after_unix: u64,
     pub valid_before_unix: u64,
+    pub critical_options: Vec<(String, Vec<u8>)>,
+    pub extensions: Vec<(String, Vec<u8>)>,
+    /// CA public key blob (SSH wire format: `string "ssh-ed25519" || string 32_bytes`).
+    pub ca_public_key: Vec<u8>,
+    /// CA signature blob (SSH wire format: `string "ssh-ed25519" || string 64_bytes`).
+    pub signature: Vec<u8>,
+    /// The bytes that were signed: cert blob[0..offset_after_ca_public_key].
+    pub signed_data: Vec<u8>,
 }
 
-/// Certificate validator for principal + validity checks.
+impl OpenSshCertificate {
+    pub const CERT_TYPE_USER: u32 = 1;
+    pub const CERT_TYPE_HOST: u32 = 2;
+
+    /// Parse a certificate from its SSH wire encoding.
+    ///
+    /// The blob must start with the key-type string
+    /// `"ssh-ed25519-cert-v01@openssh.com"`.
+    pub fn parse(blob: &[u8]) -> Result<Self, RusshError> {
+        let mut off = 0;
+
+        // key_type
+        let key_type = decode_ssh_string(blob, &mut off)?;
+        if key_type != b"ssh-ed25519-cert-v01@openssh.com" {
+            return Err(RusshError::new(
+                RusshErrorCategory::Auth,
+                "expected ssh-ed25519-cert-v01@openssh.com key type",
+            ));
+        }
+
+        // nonce
+        let nonce = decode_ssh_string(blob, &mut off)?;
+
+        // ed25519 public key (raw 32 bytes)
+        let public_key = decode_ssh_string(blob, &mut off)?;
+        if public_key.len() != 32 {
+            return Err(RusshError::new(
+                RusshErrorCategory::Auth,
+                "certificate ed25519 public key must be 32 bytes",
+            ));
+        }
+
+        // serial (uint64)
+        let serial = Self::read_u64(blob, &mut off)?;
+
+        // cert_type (uint32)
+        let cert_type = Self::read_u32(blob, &mut off)?;
+
+        // key_id
+        let key_id = String::from_utf8(decode_ssh_string(blob, &mut off)?).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Auth,
+                "certificate key_id is not valid UTF-8",
+            )
+        })?;
+
+        // valid_principals — a buffer of SSH strings
+        let principals_buf = decode_ssh_string(blob, &mut off)?;
+        let principals = Self::parse_string_list(&principals_buf)?;
+
+        // valid_after / valid_before (uint64)
+        let valid_after_unix = Self::read_u64(blob, &mut off)?;
+        let valid_before_unix = Self::read_u64(blob, &mut off)?;
+
+        // critical_options — buffer of name+data pairs
+        let crit_buf = decode_ssh_string(blob, &mut off)?;
+        let critical_options = Self::parse_string_pairs(&crit_buf)?;
+
+        // extensions — buffer of name+data pairs
+        let ext_buf = decode_ssh_string(blob, &mut off)?;
+        let extensions = Self::parse_string_pairs(&ext_buf)?;
+
+        // reserved (ignore)
+        let _ = decode_ssh_string(blob, &mut off)?;
+
+        // CA public key blob
+        let ca_public_key = decode_ssh_string(blob, &mut off)?;
+
+        // Signed data = everything from start through the CA key (inclusive).
+        let signed_data = blob[..off].to_vec();
+
+        // signature blob
+        let signature = decode_ssh_string(blob, &mut off)?;
+
+        Ok(Self {
+            nonce,
+            public_key,
+            serial,
+            cert_type,
+            key_id,
+            principals,
+            valid_after_unix,
+            valid_before_unix,
+            critical_options,
+            extensions,
+            ca_public_key,
+            signature,
+            signed_data,
+        })
+    }
+
+    /// Verify the CA signature over `self.signed_data`.
+    ///
+    /// Only Ed25519 CA keys are supported. Returns `Ok(())` if valid.
+    pub fn verify_ca_signature(&self) -> Result<(), RusshError> {
+        let ca_key_bytes = parse_ed25519_public_key_blob(&self.ca_public_key)?;
+        let sig_bytes = parse_ed25519_signature_blob(&self.signature)?;
+        let verifier = Ed25519Verifier::from_bytes(&ca_key_bytes)?;
+        verifier.verify(&self.signed_data, &sig_bytes)
+    }
+
+    fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64, RusshError> {
+        if *offset + 8 > data.len() {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "buffer too short for uint64",
+            ));
+        }
+        let val = u64::from_be_bytes(data[*offset..*offset + 8].try_into().unwrap());
+        *offset += 8;
+        Ok(val)
+    }
+
+    fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32, RusshError> {
+        if *offset + 4 > data.len() {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "buffer too short for uint32",
+            ));
+        }
+        let val = u32::from_be_bytes(data[*offset..*offset + 4].try_into().unwrap());
+        *offset += 4;
+        Ok(val)
+    }
+
+    /// Parse a buffer containing a sequence of SSH strings into a `Vec<String>`.
+    fn parse_string_list(buf: &[u8]) -> Result<Vec<String>, RusshError> {
+        let mut list = Vec::new();
+        let mut off = 0;
+        while off < buf.len() {
+            let s = decode_ssh_string(buf, &mut off)?;
+            list.push(String::from_utf8(s).map_err(|_| {
+                RusshError::new(RusshErrorCategory::Auth, "principal is not valid UTF-8")
+            })?);
+        }
+        Ok(list)
+    }
+
+    /// Parse a buffer containing name+data string pairs.
+    fn parse_string_pairs(buf: &[u8]) -> Result<Vec<(String, Vec<u8>)>, RusshError> {
+        let mut pairs = Vec::new();
+        let mut off = 0;
+        while off < buf.len() {
+            let name_bytes = decode_ssh_string(buf, &mut off)?;
+            let name = String::from_utf8(name_bytes).map_err(|_| {
+                RusshError::new(
+                    RusshErrorCategory::Auth,
+                    "cert option name is not valid UTF-8",
+                )
+            })?;
+            let data = decode_ssh_string(buf, &mut off)?;
+            pairs.push((name, data));
+        }
+        Ok(pairs)
+    }
+}
+
+/// Certificate validator for principal, validity-window, and CA-signature checks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CertificateValidator {
     pub required_principal: Option<String>,
+    /// Trusted CA public key blobs (`string "ssh-ed25519" || string 32_bytes`).
+    /// If empty, any CA is accepted (signature is still verified).
+    pub trusted_ca_keys: Vec<Vec<u8>>,
 }
 
 impl CertificateValidator {
@@ -922,6 +1126,7 @@ impl CertificateValidator {
     pub fn permissive() -> Self {
         Self {
             required_principal: None,
+            trusted_ca_keys: Vec::new(),
         }
     }
 
@@ -929,9 +1134,21 @@ impl CertificateValidator {
     pub fn require_principal(principal: impl Into<String>) -> Self {
         Self {
             required_principal: Some(principal.into()),
+            trusted_ca_keys: Vec::new(),
         }
     }
 
+    /// Add a trusted CA public key blob to this validator.
+    #[must_use]
+    pub fn trust_ca_key(mut self, ca_blob: Vec<u8>) -> Self {
+        self.trusted_ca_keys.push(ca_blob);
+        self
+    }
+
+    /// Validate policy only (validity window + principal).
+    ///
+    /// Does **not** verify the CA signature. Use [`validate_cert`](Self::validate_cert)
+    /// for full validation including the cryptographic signature check.
     pub fn validate(&self, cert: &OpenSshCertificate, now: SystemTime) -> Result<(), RusshError> {
         let now_unix = now
             .duration_since(UNIX_EPOCH)
@@ -962,6 +1179,33 @@ impl CertificateValidator {
 
         Ok(())
     }
+
+    /// Full certificate validation: CA signature + trusted-CA-key check + policy.
+    pub fn validate_cert(
+        &self,
+        cert: &OpenSshCertificate,
+        now: SystemTime,
+    ) -> Result<(), RusshError> {
+        // 1. Verify cryptographic CA signature.
+        cert.verify_ca_signature()?;
+
+        // 2. Check that the signing CA key is in our trusted set (if any).
+        if !self.trusted_ca_keys.is_empty() {
+            let trusted = self
+                .trusted_ca_keys
+                .iter()
+                .any(|ca| ca.as_slice() == cert.ca_public_key.as_slice());
+            if !trusted {
+                return Err(RusshError::new(
+                    RusshErrorCategory::Auth,
+                    "certificate was not signed by a trusted CA",
+                ));
+            }
+        }
+
+        // 3. Policy checks (time window + principal).
+        self.validate(cert, now)
+    }
 }
 
 /// Minimal policy engine for first-pass method admission.
@@ -974,6 +1218,12 @@ impl AuthEngine {
     #[must_use]
     pub fn new(policy: ServerAuthPolicy) -> Self {
         Self { policy }
+    }
+
+    /// Access the certificate validator configured in the policy (if any).
+    #[must_use]
+    pub fn certificate_validator(&self) -> Option<&CertificateValidator> {
+        self.policy.certificate_validator.as_ref()
     }
 
     #[must_use]
@@ -1050,6 +1300,12 @@ impl AuthSession {
     #[must_use]
     pub fn allowed_methods(&self) -> Vec<AuthMethod> {
         self.policy.allowed_methods()
+    }
+
+    /// Access the certificate validator from the policy, if configured.
+    #[must_use]
+    pub fn certificate_validator(&self) -> Option<&CertificateValidator> {
+        self.policy.certificate_validator.as_ref()
     }
 
     #[must_use]
@@ -1209,6 +1465,25 @@ pub fn verify_publickey_auth_signature(
     let payload =
         build_userauth_signing_payload(session_id, user, service, algorithm, public_key_blob);
     let verifier = Ed25519Verifier::from_bytes(&key_bytes)?;
+    verifier.verify(&payload, &sig_bytes)
+}
+
+/// Verify the user signature in a certificate-based publickey auth request.
+///
+/// The signing payload is built with `algorithm` and `cert_blob` as the public key blob,
+/// but the signature is verified using the embedded Ed25519 key inside the certificate.
+pub fn verify_cert_auth_signature(
+    session_id: &[u8],
+    user: &str,
+    service: &str,
+    algorithm: &str,
+    cert_blob: &[u8],
+    embedded_pubkey: &[u8; 32],
+    signature_blob: &[u8],
+) -> Result<(), RusshError> {
+    let sig_bytes = parse_ed25519_signature_blob(signature_blob)?;
+    let payload = build_userauth_signing_payload(session_id, user, service, algorithm, cert_blob);
+    let verifier = Ed25519Verifier::from_bytes(embedded_pubkey)?;
     verifier.verify(&payload, &sig_bytes)
 }
 
@@ -1483,10 +1758,19 @@ mod tests {
     #[test]
     fn certificate_validator_checks_principal_and_time() {
         let cert = OpenSshCertificate {
+            nonce: vec![],
+            public_key: vec![0u8; 32],
+            serial: 1,
+            cert_type: OpenSshCertificate::CERT_TYPE_USER,
             key_id: "id-1".to_string(),
             principals: vec!["alice".to_string()],
             valid_after_unix: 100,
             valid_before_unix: 200,
+            critical_options: vec![],
+            extensions: vec![],
+            ca_public_key: vec![],
+            signature: vec![],
+            signed_data: vec![],
         };
 
         let validator = CertificateValidator::require_principal("alice");
@@ -1797,5 +2081,150 @@ mod tests {
         let provider = FileIdentityProvider::with_default_paths();
         // should not panic even if ~/.ssh/ doesn't exist
         let _ = provider.identities_for_user("alice");
+    }
+
+    /// Build a minimal but valid `ssh-ed25519-cert-v01@openssh.com` blob signed
+    /// by `ca_signer`, with the given parameters.
+    #[cfg(test)]
+    fn build_test_cert(
+        user_pub_key: &[u8; 32],
+        ca_signer: &russh_crypto::Ed25519Signer,
+        key_id: &str,
+        principals: &[&str],
+        valid_after: u64,
+        valid_before: u64,
+    ) -> Vec<u8> {
+        use russh_crypto::{Signer, encode_ssh_string};
+
+        let mut blob = Vec::new();
+
+        // key_type
+        blob.extend_from_slice(&encode_ssh_string(b"ssh-ed25519-cert-v01@openssh.com"));
+
+        // nonce (32 zero bytes)
+        blob.extend_from_slice(&encode_ssh_string(&[0u8; 32]));
+
+        // ed25519 public key (32 bytes)
+        blob.extend_from_slice(&encode_ssh_string(user_pub_key.as_ref()));
+
+        // serial (uint64)
+        blob.extend_from_slice(&1u64.to_be_bytes());
+
+        // cert_type user=1 (uint32)
+        blob.extend_from_slice(&1u32.to_be_bytes());
+
+        // key_id
+        blob.extend_from_slice(&encode_ssh_string(key_id.as_bytes()));
+
+        // valid_principals buffer: each principal as an SSH string
+        let mut principals_buf = Vec::new();
+        for p in principals {
+            principals_buf.extend_from_slice(&encode_ssh_string(p.as_bytes()));
+        }
+        blob.extend_from_slice(&encode_ssh_string(&principals_buf));
+
+        // valid_after / valid_before (uint64)
+        blob.extend_from_slice(&valid_after.to_be_bytes());
+        blob.extend_from_slice(&valid_before.to_be_bytes());
+
+        // critical_options (empty buffer)
+        blob.extend_from_slice(&encode_ssh_string(&[]));
+
+        // extensions (empty buffer)
+        blob.extend_from_slice(&encode_ssh_string(&[]));
+
+        // reserved (empty string)
+        blob.extend_from_slice(&encode_ssh_string(&[]));
+
+        // signature_key = CA public key blob
+        blob.extend_from_slice(&encode_ssh_string(&ca_signer.public_key_blob()));
+
+        // signed_data ends here
+        let signed_data = blob.clone();
+
+        // Compute CA signature over signed_data
+        let sig_raw = ca_signer.sign(&signed_data).expect("sign should succeed");
+        let sig_64: [u8; 64] = sig_raw.try_into().unwrap();
+        let sig_blob = super::build_ed25519_signature_blob(&sig_64);
+        blob.extend_from_slice(&encode_ssh_string(&sig_blob));
+
+        blob
+    }
+
+    #[test]
+    fn openssh_cert_parse_and_verify_ca_signature() {
+        use russh_crypto::{Ed25519Signer, Signer};
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+
+        let ca = Ed25519Signer::from_seed(&[0xCAu8; 32]);
+        let user_key = Ed25519Signer::from_seed(&[0xBBu8; 32]);
+        let user_pub: [u8; 32] =
+            super::parse_ed25519_public_key_blob(&user_key.public_key_blob()).unwrap();
+
+        let blob = build_test_cert(&user_pub, &ca, "test-cert", &["alice"], 100, u64::MAX);
+
+        let cert = OpenSshCertificate::parse(&blob).expect("cert should parse");
+        assert_eq!(cert.key_id, "test-cert");
+        assert_eq!(cert.principals, ["alice"]);
+        assert_eq!(cert.cert_type, OpenSshCertificate::CERT_TYPE_USER);
+        cert.verify_ca_signature()
+            .expect("CA signature should verify");
+
+        // Validator: trust the CA key, require principal "alice"
+        let validator =
+            CertificateValidator::require_principal("alice").trust_ca_key(ca.public_key_blob());
+        let now = UNIX_EPOCH + Duration::from_secs(200);
+        validator
+            .validate_cert(&cert, now)
+            .expect("full validation should pass");
+    }
+
+    #[test]
+    fn openssh_cert_validator_rejects_unknown_ca() {
+        use russh_crypto::{Ed25519Signer, Signer};
+        use std::time::Duration;
+        use std::time::UNIX_EPOCH;
+
+        let ca = Ed25519Signer::from_seed(&[0xCAu8; 32]);
+        let other_ca = Ed25519Signer::from_seed(&[0xCCu8; 32]); // different CA
+        let user_key = Ed25519Signer::from_seed(&[0xBBu8; 32]);
+        let user_pub: [u8; 32] =
+            super::parse_ed25519_public_key_blob(&user_key.public_key_blob()).unwrap();
+
+        let blob = build_test_cert(&user_pub, &ca, "id", &["bob"], 0, u64::MAX);
+        let cert = OpenSshCertificate::parse(&blob).expect("parse");
+
+        // Validator only trusts the other CA
+        let validator = CertificateValidator::permissive().trust_ca_key(other_ca.public_key_blob());
+        let now = UNIX_EPOCH + Duration::from_secs(1);
+        let err = validator
+            .validate_cert(&cert, now)
+            .expect_err("unknown CA should fail");
+        assert!(
+            err.message().contains("trusted CA"),
+            "err={}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn openssh_cert_parse_rejects_tampered_data() {
+        use russh_crypto::{Ed25519Signer, Signer};
+
+        let ca = Ed25519Signer::from_seed(&[0xCAu8; 32]);
+        let user_key = Ed25519Signer::from_seed(&[0xBBu8; 32]);
+        let user_pub: [u8; 32] =
+            super::parse_ed25519_public_key_blob(&user_key.public_key_blob()).unwrap();
+
+        let mut blob = build_test_cert(&user_pub, &ca, "id", &["alice"], 0, u64::MAX);
+
+        // Flip a byte in the middle of the blob (inside the signed region)
+        let mid = blob.len() / 2;
+        blob[mid] ^= 0xFF;
+
+        let cert = OpenSshCertificate::parse(&blob).expect("should still parse");
+        cert.verify_ca_signature()
+            .expect_err("tampered cert should fail signature verification");
     }
 }

@@ -31,8 +31,8 @@ use std::future::ready;
 use std::time::Duration;
 
 use russh_auth::{
-    AuthMethod, AuthRequest, AuthResult, AuthSession, ServerAuthPolicy, UserAuthMessage,
-    UserAuthRequest, verify_publickey_auth_signature,
+    AuthMethod, AuthRequest, AuthResult, AuthSession, OpenSshCertificate, ServerAuthPolicy,
+    UserAuthMessage, UserAuthRequest, verify_cert_auth_signature, verify_publickey_auth_signature,
 };
 use russh_core::{AlgorithmSet, PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{
@@ -43,6 +43,7 @@ use russh_crypto::{
 
 const SSH_USERAUTH_SERVICE: &str = "ssh-userauth";
 const SSH_CONNECTION_SERVICE: &str = "ssh-connection";
+const CERT_ALGORITHM_ED25519: &str = "ssh-ed25519-cert-v01@openssh.com";
 
 /// Shared transport knobs with secure defaults.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +152,9 @@ pub struct ServerConfig {
     pub max_sessions_per_connection: u16,
     pub permit_password_auth: bool,
     pub host_key_seed: Option<[u8; 32]>,
+    /// Override the default auth policy (e.g. to configure a certificate validator).
+    /// When `None`, `ServerAuthPolicy::secure_defaults()` is used.
+    pub auth_policy: Option<ServerAuthPolicy>,
 }
 
 impl ServerConfig {
@@ -161,6 +165,7 @@ impl ServerConfig {
             max_sessions_per_connection: 64,
             permit_password_auth: true,
             host_key_seed: None,
+            auth_policy: None,
         }
     }
 }
@@ -1621,11 +1626,13 @@ impl ServerSession {
                     // Real ECDH path: store context and return server's KexInit.
                     // Use the raw client KEXINIT payload (original wire bytes) for the exchange
                     // hash, falling back to re-encoding only if raw bytes weren't pre-stored.
-                    let remote_kexinit_payload = self.raw_client_kexinit.take().unwrap_or_else(|| {
-                        TransportMessage::KexInit { proposal }.to_frame()
-                            .map(|f| f.payload)
-                            .unwrap_or_default()
-                    });
+                    let remote_kexinit_payload =
+                        self.raw_client_kexinit.take().unwrap_or_else(|| {
+                            TransportMessage::KexInit { proposal }
+                                .to_frame()
+                                .map(|f| f.payload)
+                                .unwrap_or_default()
+                        });
                     let server_kexinit_frame = TransportMessage::KexInit {
                         proposal: Box::new(local),
                     }
@@ -1935,11 +1942,17 @@ impl ServerSession {
         request: UserAuthRequest,
     ) -> Result<Option<UserAuthMessage>, RusshError> {
         let (user, auth_request) = match request {
-            UserAuthRequest::None { user: _, service: _ } => {
+            UserAuthRequest::None {
+                user: _,
+                service: _,
+            } => {
                 // RFC 4252 §5.2: respond with the allowed methods list.
                 let methods = self.allowed_userauth_methods();
                 self.bump_outgoing_sequence();
-                return Ok(Some(UserAuthMessage::Failure { methods, partial_success: false }));
+                return Ok(Some(UserAuthMessage::Failure {
+                    methods,
+                    partial_success: false,
+                }));
             }
             UserAuthRequest::PublicKey {
                 user,
@@ -1954,6 +1967,12 @@ impl ServerSession {
                         "USERAUTH request service must be ssh-connection",
                     ));
                 }
+
+                // Certificate-based public key auth.
+                if algorithm == CERT_ALGORITHM_ED25519 {
+                    return self.handle_cert_userauth(user, algorithm, public_key, signature);
+                }
+
                 if let Some(signature) = signature {
                     // Verify the signature before policy evaluation when session keys exist.
                     if let Some(session_keys) = &self.session_keys {
@@ -2094,6 +2113,119 @@ impl ServerSession {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Handle a certificate-based `publickey` userauth request.
+    ///
+    /// Steps:
+    /// 1. Parse the cert blob; verify the CA's Ed25519 signature over it.
+    /// 2. If a `CertificateValidator` is configured, apply policy (trusted CAs, time, principal).
+    /// 3. If the client provided a user signature, verify it using the cert's embedded public key.
+    /// 4. On success, build an `AuthRequest::PublicKey` referencing the embedded key and delegate
+    ///    to the normal auth session (which checks whether `publickey` is an allowed method).
+    fn handle_cert_userauth(
+        &mut self,
+        user: String,
+        algorithm: String,
+        cert_blob: Vec<u8>,
+        signature: Option<Vec<u8>>,
+    ) -> Result<Option<UserAuthMessage>, RusshError> {
+        let failure = |this: &mut Self| -> Result<Option<UserAuthMessage>, RusshError> {
+            let methods = this.allowed_userauth_methods();
+            this.bump_outgoing_sequence();
+            Ok(Some(UserAuthMessage::Failure {
+                methods,
+                partial_success: false,
+            }))
+        };
+
+        // Parse the certificate.
+        let cert = match OpenSshCertificate::parse(&cert_blob) {
+            Ok(c) => c,
+            Err(_) => return failure(self),
+        };
+
+        // Validate CA signature + optional policy.
+        let validation_result = if let Some(auth_session) = &self.auth_session {
+            if let Some(validator) = auth_session.certificate_validator() {
+                use std::time::SystemTime;
+                validator.validate_cert(&cert, SystemTime::now())
+            } else {
+                cert.verify_ca_signature()
+            }
+        } else {
+            cert.verify_ca_signature()
+        };
+        if validation_result.is_err() {
+            return failure(self);
+        }
+
+        // If the client did not include a signature this is a "query" (is cert acceptable?).
+        let Some(signature) = signature else {
+            self.bump_outgoing_sequence();
+            return Ok(Some(UserAuthMessage::PublicKeyOk {
+                algorithm,
+                public_key: cert_blob,
+            }));
+        };
+
+        // Verify the user's signature over the auth payload using the cert's embedded key.
+        if let Some(session_keys) = &self.session_keys {
+            let session_id = session_keys.session_id.clone();
+            let embedded: &[u8; 32] = cert.public_key.as_slice().try_into().map_err(|_| {
+                RusshError::new(
+                    RusshErrorCategory::Auth,
+                    "cert embedded key is not 32 bytes",
+                )
+            })?;
+            if verify_cert_auth_signature(
+                &session_id,
+                &user,
+                SSH_CONNECTION_SERVICE,
+                &algorithm,
+                &cert_blob,
+                embedded,
+                &signature,
+            )
+            .is_err()
+            {
+                return failure(self);
+            }
+        }
+
+        // Delegate to auth session (checks method is allowed).
+        let auth_request = AuthRequest::PublicKey {
+            user: user.clone(),
+            public_key: cert_blob,
+            signature,
+        };
+
+        let auth_session = self.auth_session.as_mut().ok_or_else(|| {
+            RusshError::new(
+                RusshErrorCategory::Auth,
+                "server USERAUTH policy is not configured",
+            )
+        })?;
+        let (result, _event) = auth_session.evaluate_with_event(&auth_request);
+        match result {
+            AuthResult::Accepted => {
+                self.authenticated_user = Some(user);
+                self.bump_outgoing_sequence();
+                Ok(Some(UserAuthMessage::Success))
+            }
+            AuthResult::PartiallyAccepted { next_methods } => {
+                self.bump_outgoing_sequence();
+                Ok(Some(UserAuthMessage::Failure {
+                    methods: next_methods
+                        .into_iter()
+                        .map(AuthMethod::as_ssh_name)
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                    partial_success: true,
+                }))
+            }
+            AuthResult::Rejected { .. } => failure(self),
+        }
     }
 
     /// Return derived session keys if key exchange has completed.

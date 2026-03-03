@@ -108,9 +108,7 @@ impl AlgorithmSet {
                 "rsa-sha2-256".to_string(),
                 "rsa-sha2-512".to_string(),
             ],
-            ciphers: vec![
-                "aes256-gcm@openssh.com".to_string(),
-            ],
+            ciphers: vec!["aes256-gcm@openssh.com".to_string()],
             macs: vec!["hmac-sha2-256-etm@openssh.com".to_string()],
         }
     }

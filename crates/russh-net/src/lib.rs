@@ -32,20 +32,23 @@
 //! # Ok(()) }
 //! ```
 
+mod agent;
+pub use agent::SshAgentClient;
+
 use std::path::{Path, PathBuf};
 
 use russh_auth::{
-    ServerAuthPolicy, UserAuthMessage, UserAuthRequest, build_ed25519_signature_blob,
+    AgentClient, ServerAuthPolicy, UserAuthMessage, UserAuthRequest, build_ed25519_signature_blob,
     build_userauth_signing_payload,
 };
-use russh_channel::{ChannelKind, ChannelManager, ChannelMessage, ChannelRequest};
+use russh_channel::{ChannelKind, ChannelManager, ChannelMessage, ChannelRequest, ForwardHandle};
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{AeadCipher, Aes256GcmCipher, Signer};
 use russh_scp::build_scp_file_upload;
 use russh_sftp::{SftpFileServer, SftpFramer, SftpWirePacket};
 use russh_transport::{
-    ClientConfig, ClientSession, NegotiatedAlgorithms, ServerConfig, ServerSession,
-    SessionKeys, TransportMessage,
+    ClientConfig, ClientSession, NegotiatedAlgorithms, ServerConfig, ServerSession, SessionKeys,
+    TransportMessage,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -53,7 +56,20 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 /// Re-exported for callers that want to use public-key auth without depending on `russh-crypto` directly.
 pub use russh_crypto::Ed25519Signer;
 
-const OUR_BANNER: &str = "SSH-2.0-RuSSH_0.3";
+const OUR_BANNER: &str = "SSH-2.0-RuSSH_0.4";
+
+// ── Stream type alias ────────────────────────────────────────────────────────
+
+/// Supertrait combining async read and write so it can be used as a trait object.
+pub trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite> AsyncReadWrite for T {}
+
+/// Any async readable+writable stream that can carry SSH packets.
+///
+/// Used to make [`SshClientConnection`] stream-agnostic so that the same type
+/// works over a plain TCP socket, a tokio duplex pipe (for ProxyJump), or any
+/// other async I/O.
+pub type AnyStream = Box<dyn AsyncReadWrite + Unpin + Send>;
 
 // ── io helper ────────────────────────────────────────────────────────────────
 
@@ -89,7 +105,10 @@ impl DirectionalCipher {
             if let Ok(cipher) = Aes256GcmCipher::new(key) {
                 let mut nonce = [0u8; 12];
                 nonce.copy_from_slice(&iv[..12]);
-                return Self::Aes256Gcm { cipher: Box::new(cipher), nonce };
+                return Self::Aes256Gcm {
+                    cipher: Box::new(cipher),
+                    nonce,
+                };
             }
         }
         Self::None
@@ -226,11 +245,14 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
 
                 // Read ciphertext + 16-byte tag together.
                 let mut ct_and_tag = vec![0u8; pkt_len + 16];
-                self.inner.read_exact(&mut ct_and_tag).await.map_err(io_err)?;
+                self.inner
+                    .read_exact(&mut ct_and_tag)
+                    .await
+                    .map_err(io_err)?;
 
-                let plaintext = cipher.open(nonce, &len_buf, &ct_and_tag).map_err(|e| {
-                    RusshError::new(RusshErrorCategory::Crypto, e.to_string())
-                })?;
+                let plaintext = cipher
+                    .open(nonce, &len_buf, &ct_and_tag)
+                    .map_err(|e| RusshError::new(RusshErrorCategory::Crypto, e.to_string()))?;
                 DirectionalCipher::increment_nonce(nonce);
 
                 if plaintext.is_empty() {
@@ -260,7 +282,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                 let payload = &frame.payload;
                 let body_len = 1 + payload.len(); // padding_len byte + payload
                 let remainder = body_len % BLOCK;
-                let mut padding_len = if remainder == 0 { BLOCK } else { BLOCK - remainder };
+                let mut padding_len = if remainder == 0 {
+                    BLOCK
+                } else {
+                    BLOCK - remainder
+                };
                 if padding_len < 4 {
                     padding_len += BLOCK;
                 }
@@ -277,7 +303,10 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
 
                 // Wire: [4-byte length (AAD)] [ciphertext] [16-byte tag]
                 self.inner.write_all(&packet_length).await.map_err(io_err)?;
-                self.inner.write_all(&ciphertext_and_tag).await.map_err(io_err)
+                self.inner
+                    .write_all(&ciphertext_and_tag)
+                    .await
+                    .map_err(io_err)
             }
         }
     }
@@ -304,7 +333,7 @@ pub struct ExecResult {
 ///
 /// All operations are synchronous request-response pairs.
 pub struct SftpSession<'a> {
-    stream: &'a mut PacketStream<TcpStream>,
+    stream: &'a mut PacketStream<AnyStream>,
     /// Server's channel ID (used as `recipient_channel` when we send).
     remote_channel: u32,
     next_request_id: u32,
@@ -313,7 +342,7 @@ pub struct SftpSession<'a> {
 
 impl<'a> SftpSession<'a> {
     fn new(
-        stream: &'a mut PacketStream<TcpStream>,
+        stream: &'a mut PacketStream<AnyStream>,
         remote_channel: u32,
         _local_channel: u32,
     ) -> Self {
@@ -351,11 +380,20 @@ impl<'a> SftpSession<'a> {
                 Some(2) | Some(4) => continue,
                 Some(80) => {
                     let want_reply = if frame.payload.len() >= 5 {
-                        let nlen = u32::from_be_bytes([frame.payload[1], frame.payload[2], frame.payload[3], frame.payload[4]]) as usize;
+                        let nlen = u32::from_be_bytes([
+                            frame.payload[1],
+                            frame.payload[2],
+                            frame.payload[3],
+                            frame.payload[4],
+                        ]) as usize;
                         frame.payload.get(5 + nlen).copied().unwrap_or(0) != 0
-                    } else { false };
+                    } else {
+                        false
+                    };
                     if want_reply {
-                        self.stream.write_packet(&PacketFrame::new(vec![82])).await?;
+                        self.stream
+                            .write_packet(&PacketFrame::new(vec![82]))
+                            .await?;
                     }
                     continue;
                 }
@@ -502,7 +540,7 @@ impl<'a> SftpSession<'a> {
 ///
 /// Obtained via [`SshClient::connect`].
 pub struct SshClientConnection {
-    stream: PacketStream<TcpStream>,
+    stream: PacketStream<AnyStream>,
     session: ClientSession,
     channel_manager: ChannelManager,
 }
@@ -520,15 +558,19 @@ impl SshClientConnection {
                     // SSH_MSG_GLOBAL_REQUEST
                     let want_reply = if frame.payload.len() >= 5 {
                         let nlen = u32::from_be_bytes([
-                            frame.payload[1], frame.payload[2],
-                            frame.payload[3], frame.payload[4],
+                            frame.payload[1],
+                            frame.payload[2],
+                            frame.payload[3],
+                            frame.payload[4],
                         ]) as usize;
                         frame.payload.get(5 + nlen).copied().unwrap_or(0) != 0
                     } else {
                         false
                     };
                     if want_reply {
-                        self.stream.write_packet(&PacketFrame::new(vec![82])).await?;
+                        self.stream
+                            .write_packet(&PacketFrame::new(vec![82]))
+                            .await?;
                     }
                 }
                 _ => return Ok(frame),
@@ -543,7 +585,18 @@ impl SshClientConnection {
         config: ClientConfig,
     ) -> Result<Self, RusshError> {
         let tcp = TcpStream::connect(addr).await.map_err(io_err)?;
-        let mut stream = PacketStream::new(tcp);
+        Self::connect_via_stream(Box::new(tcp), config).await
+    }
+
+    /// Perform SSH handshake over an already-open async stream.
+    ///
+    /// This is the common implementation shared by [`connect`] (TCP) and
+    /// [`connect_via_jump`] (ProxyJump channel bridge).
+    pub async fn connect_via_stream(
+        stream: AnyStream,
+        config: ClientConfig,
+    ) -> Result<Self, RusshError> {
+        let mut stream = PacketStream::new(stream);
 
         // ── Banner exchange ──
         stream.write_banner_line(OUR_BANNER).await?;
@@ -694,6 +747,149 @@ impl SshClientConnection {
                 }
             }
         }
+    }
+
+    /// Authenticate using an OpenSSH certificate.
+    ///
+    /// `cert_blob` is the raw certificate blob (as returned by `ssh-keygen -s` or
+    /// `OpenSshCertificate::to_bytes`).  `signer` holds the private key that corresponds
+    /// to the public key embedded in the certificate.
+    pub async fn authenticate_pubkey_with_cert(
+        &mut self,
+        cert_blob: Vec<u8>,
+        signer: &Ed25519Signer,
+    ) -> Result<(), RusshError> {
+        let user = self.session.config.user.clone();
+        let session_id = self
+            .session
+            .session_keys()
+            .ok_or_else(|| protocol_err("no session keys for cert auth"))?
+            .session_id
+            .clone();
+
+        const CERT_ALG: &str = "ssh-ed25519-cert-v01@openssh.com";
+        let signing_payload = build_userauth_signing_payload(
+            &session_id,
+            &user,
+            "ssh-connection",
+            CERT_ALG,
+            &cert_blob,
+        );
+        let raw_sig = signer.sign(&signing_payload)?;
+        let signature = build_ed25519_signature_blob(
+            raw_sig
+                .as_slice()
+                .try_into()
+                .map_err(|_| protocol_err("unexpected signature length"))?,
+        );
+
+        let request = UserAuthRequest::PublicKey {
+            user,
+            service: "ssh-connection".to_owned(),
+            algorithm: CERT_ALG.to_owned(),
+            public_key: cert_blob,
+            signature: Some(signature),
+        };
+        let frame = self.session.send_userauth_request(request)?;
+        self.stream.write_packet(&frame).await?;
+
+        loop {
+            let response_frame = self.stream.read_packet().await?;
+            let msg = UserAuthMessage::from_frame(&response_frame)?;
+            self.session.receive_userauth_message(msg.clone())?;
+            match msg {
+                UserAuthMessage::Success => return Ok(()),
+                UserAuthMessage::Failure { .. } => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Auth,
+                        "certificate authentication rejected",
+                    ));
+                }
+                UserAuthMessage::Banner { .. } | UserAuthMessage::PublicKeyOk { .. } => {}
+                _ => {
+                    return Err(protocol_err("unexpected auth response message"));
+                }
+            }
+        }
+    }
+
+    /// Authenticate using keys held by an SSH agent.
+    ///
+    /// Queries the agent for identities, tries each key via publickey query,
+    /// and signs with the first key that the server accepts.
+    pub async fn authenticate_via_agent(
+        &mut self,
+        agent: &SshAgentClient,
+    ) -> Result<(), RusshError> {
+        let user = self.session.config.user.clone();
+        let session_id = self
+            .session
+            .session_keys()
+            .ok_or_else(|| protocol_err("no session keys for agent auth"))?
+            .session_id
+            .clone();
+
+        let identities = agent.list_identities().map_err(|e| {
+            RusshError::new(
+                RusshErrorCategory::Auth,
+                format!("agent list_identities failed: {e}"),
+            )
+        })?;
+
+        if identities.is_empty() {
+            return Err(RusshError::new(
+                RusshErrorCategory::Auth,
+                "ssh-agent holds no identities",
+            ));
+        }
+
+        for (key_blob, _comment) in identities {
+            const ALG: &str = "ssh-ed25519";
+            let payload = build_userauth_signing_payload(
+                &session_id,
+                &user,
+                "ssh-connection",
+                ALG,
+                &key_blob,
+            );
+            let sig_blob = match agent.sign(&key_blob, &payload) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let request = UserAuthRequest::PublicKey {
+                user: user.clone(),
+                service: "ssh-connection".to_owned(),
+                algorithm: ALG.to_owned(),
+                public_key: key_blob,
+                signature: Some(sig_blob),
+            };
+            let frame = self.session.send_userauth_request(request)?;
+            self.stream.write_packet(&frame).await?;
+
+            let mut success = false;
+            loop {
+                let response_frame = self.stream.read_packet().await?;
+                let msg = UserAuthMessage::from_frame(&response_frame)?;
+                self.session.receive_userauth_message(msg.clone())?;
+                match msg {
+                    UserAuthMessage::Success => {
+                        success = true;
+                        break;
+                    }
+                    UserAuthMessage::Failure { .. } => break,
+                    UserAuthMessage::Banner { .. } | UserAuthMessage::PublicKeyOk { .. } => {}
+                    _ => return Err(protocol_err("unexpected auth response message")),
+                }
+            }
+            if success {
+                return Ok(());
+            }
+        }
+        Err(RusshError::new(
+            RusshErrorCategory::Auth,
+            "agent authentication: all keys rejected",
+        ))
     }
 
     /// Open a session channel, send `exec <cmd>`, and collect output.
@@ -951,6 +1147,197 @@ impl SshClient {
     ) -> Result<SshClientConnection, RusshError> {
         SshClientConnection::connect(addr, config).await
     }
+
+    /// Connect to `target` via a ProxyJump host.
+    ///
+    /// 1. Opens a TCP connection to `jump_addr` and performs full KEX + auth using
+    ///    `jump_auth`.
+    /// 2. Opens a `direct-tcpip` channel through the jump host to `target_host:target_port`.
+    /// 3. Runs full KEX + auth over that channel using `target_cfg`.
+    ///
+    /// The jump connection is kept alive by a background task as long as the returned
+    /// `SshClientConnection` is in use.
+    ///
+    /// # Arguments
+    ///
+    /// * `jump_addr` — TCP address of the jump host (e.g. `"jump.example.com:22"`).
+    /// * `jump_cfg` — `ClientConfig` for authenticating to the jump host.
+    /// * `jump_auth` — a callback that authenticates the jump connection.
+    /// * `target_host` — hostname/IP that the jump host should forward to.
+    /// * `target_port` — port on the target host.
+    /// * `target_cfg` — `ClientConfig` for the inner (target) SSH session.
+    pub async fn connect_via_jump<F>(
+        jump_addr: impl ToSocketAddrs,
+        jump_cfg: ClientConfig,
+        jump_auth: F,
+        target_host: impl Into<String>,
+        target_port: u16,
+        target_cfg: ClientConfig,
+    ) -> Result<SshClientConnection, RusshError>
+    where
+        F: for<'a> FnOnce(
+            &'a mut SshClientConnection,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), RusshError>> + Send + 'a>,
+        >,
+    {
+        // ── Step 1: connect to jump host ────────────────────────────────────
+        let mut jump = SshClientConnection::connect(jump_addr, jump_cfg).await?;
+        jump_auth(&mut jump).await?;
+
+        let target_host: String = target_host.into();
+
+        // ── Step 2: open a direct-tcpip channel ─────────────────────────────
+        let extra_data = ForwardHandle::build_direct_tcpip_open_extra(
+            &target_host,
+            target_port as u32,
+            "127.0.0.1",
+            0,
+        );
+        let (local_id, mut open_msg) =
+            jump.channel_manager.open_channel(ChannelKind::DirectTcpIp {
+                host: target_host,
+                port: target_port,
+            });
+
+        // Inject the extra_data into the open message.
+        if let ChannelMessage::Open {
+            extra_data: ref mut ed,
+            ..
+        } = open_msg
+        {
+            *ed = extra_data;
+        }
+
+        jump.stream.write_packet(&open_msg.to_frame()?).await?;
+
+        // Wait for CHANNEL_OPEN_CONFIRMATION.
+        let remote_id = loop {
+            let frame = jump.stream.read_packet().await?;
+            // Skip SSH_MSG_IGNORE(2), SSH_MSG_DEBUG(4), SSH_MSG_GLOBAL_REQUEST(80).
+            match frame.payload.first().copied() {
+                Some(2) | Some(4) => continue,
+                Some(80) => {
+                    let want_reply = frame
+                        .payload
+                        .get(
+                            5 + {
+                                if frame.payload.len() >= 5 {
+                                    u32::from_be_bytes([
+                                        frame.payload[1],
+                                        frame.payload[2],
+                                        frame.payload[3],
+                                        frame.payload[4],
+                                    ]) as usize
+                                } else {
+                                    0
+                                }
+                            },
+                        )
+                        .copied()
+                        .unwrap_or(0)
+                        != 0;
+                    if want_reply {
+                        jump.stream
+                            .write_packet(&PacketFrame::new(vec![82]))
+                            .await?;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let ch = ChannelMessage::from_bytes(&frame.payload)?;
+            match &ch {
+                ChannelMessage::OpenConfirmation {
+                    recipient_channel,
+                    sender_channel,
+                    ..
+                } if *recipient_channel == local_id => {
+                    let rid = *sender_channel;
+                    jump.channel_manager.accept_confirmation(local_id, &ch)?;
+                    break rid;
+                }
+                ChannelMessage::OpenFailure { description, .. } => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Channel,
+                        format!("direct-tcpip channel open refused: {description}"),
+                    ));
+                }
+                _ => {}
+            }
+        };
+
+        // ── Step 3: duplex bridge ────────────────────────────────────────────
+        let (inner_half, bridge_half) = tokio::io::duplex(1 << 17); // 128 KiB buffer
+
+        // Spawn bridge task: bidirectional copy between the jump channel and bridge_half.
+        tokio::spawn(channel_bridge(jump, local_id, remote_id, bridge_half));
+
+        // ── Step 4: inner SSH session over the bridge ────────────────────────
+        let target: AnyStream = Box::new(inner_half);
+        SshClientConnection::connect_via_stream(target, target_cfg).await
+    }
+}
+
+// ── ProxyJump bridge ─────────────────────────────────────────────────────────
+
+/// Background task that bridges a `direct-tcpip` SSH channel and a tokio duplex stream.
+///
+/// Data from `bridge` is framed as `SSH_MSG_CHANNEL_DATA` and sent to the jump host.
+/// `SSH_MSG_CHANNEL_DATA` packets from the jump host are written to `bridge`.
+async fn channel_bridge(
+    mut jump: SshClientConnection,
+    local_id: u32,
+    remote_id: u32,
+    bridge: tokio::io::DuplexStream,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut bridge_rx, mut bridge_tx) = tokio::io::split(bridge);
+    let mut read_buf = vec![0u8; 32768];
+
+    loop {
+        tokio::select! {
+            // Data from bridge → channel_data to jump host
+            n = bridge_rx.read(&mut read_buf) => {
+                let n = match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let msg = ChannelMessage::Data {
+                    recipient_channel: remote_id,
+                    data: read_buf[..n].to_vec(),
+                };
+                let Ok(frame) = msg.to_frame() else { break };
+                if jump.stream.write_packet(&frame).await.is_err() {
+                    break;
+                }
+            }
+            // Packets from jump host → write channel_data to bridge
+            frame = jump.stream.read_packet() => {
+                let frame = match frame {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                match ChannelMessage::from_bytes(&frame.payload) {
+                    Ok(ChannelMessage::Data { recipient_channel, data })
+                        if recipient_channel == local_id =>
+                    {
+                        if bridge_tx.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ChannelMessage::Eof { recipient_channel, .. })
+                    | Ok(ChannelMessage::Close { recipient_channel, .. })
+                        if recipient_channel == local_id =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 // ── SessionHandler ───────────────────────────────────────────────────────────
@@ -1011,14 +1398,14 @@ impl SessionHandler for DefaultSessionHandler {
 
 /// A server-side connection accepted from [`SshServer`].
 pub struct SshServerConnection {
-    stream: PacketStream<TcpStream>,
+    stream: PacketStream<AnyStream>,
     config: ServerConfig,
 }
 
 impl SshServerConnection {
     fn new(tcp: TcpStream, config: ServerConfig) -> Self {
         Self {
-            stream: PacketStream::new(tcp),
+            stream: PacketStream::new(Box::new(tcp)),
             config,
         }
     }
@@ -1069,14 +1456,10 @@ impl SshServerConnection {
         }
 
         // Send EXT_INFO if we advertised ext-info-s (OpenSSH client expects it, encrypted).
-        let sends_ext_info = session
-            .negotiated()
-            .is_some_and(|n| n.ext_info_s);
+        let sends_ext_info = session.negotiated().is_some_and(|n| n.ext_info_s);
         if sends_ext_info {
             let ext_info = TransportMessage::ExtInfo {
-                extensions: vec![
-                    ("server-sig-algs".to_owned(), "ssh-ed25519".to_owned()),
-                ],
+                extensions: vec![("server-sig-algs".to_owned(), "ssh-ed25519".to_owned())],
             };
             self.stream.write_packet(&ext_info.to_frame()?).await?;
         }
@@ -1105,11 +1488,18 @@ impl SshServerConnection {
             }
         };
         if let Some(service_accept) = session.receive_message(service_req_msg)? {
-            self.stream.write_packet(&service_accept.to_frame()?).await?;
+            self.stream
+                .write_packet(&service_accept.to_frame()?)
+                .await?;
         }
 
         // ── Auth ──
-        session.activate_userauth(ServerAuthPolicy::secure_defaults());
+        let auth_policy = self
+            .config
+            .auth_policy
+            .clone()
+            .unwrap_or_else(ServerAuthPolicy::secure_defaults);
+        session.activate_userauth(auth_policy);
         loop {
             let auth_frame = self.stream.read_packet().await?;
             let auth_msg = UserAuthMessage::from_frame(&auth_frame)?;
@@ -1215,9 +1605,7 @@ impl SshServerConnection {
                                         recipient_channel: client_ch,
                                         data: output,
                                     };
-                                    self.stream
-                                        .write_packet(&data_msg.to_frame()?)
-                                        .await?;
+                                    self.stream.write_packet(&data_msg.to_frame()?).await?;
                                 }
                                 let eof = ChannelMessage::Eof {
                                     recipient_channel: client_ch,
@@ -1228,9 +1616,7 @@ impl SshServerConnection {
                                     want_reply: false,
                                     request: ChannelRequest::ExitStatus { exit_status: 0 },
                                 };
-                                self.stream
-                                    .write_packet(&exit_status.to_frame()?)
-                                    .await?;
+                                self.stream.write_packet(&exit_status.to_frame()?).await?;
                                 let close = ChannelMessage::Close {
                                     recipient_channel: client_ch,
                                 };
@@ -1300,12 +1686,14 @@ impl SshServerConnection {
 
                 ChannelMessage::Eof { recipient_channel } => {
                     // Client is done sending; send EOF + CLOSE back to unblock the client.
-                    let _ = self.stream.write_packet(
-                        &ChannelMessage::Eof { recipient_channel }.to_frame()?
-                    ).await;
-                    let _ = self.stream.write_packet(
-                        &ChannelMessage::Close { recipient_channel }.to_frame()?
-                    ).await;
+                    let _ = self
+                        .stream
+                        .write_packet(&ChannelMessage::Eof { recipient_channel }.to_frame()?)
+                        .await;
+                    let _ = self
+                        .stream
+                        .write_packet(&ChannelMessage::Close { recipient_channel }.to_frame()?)
+                        .await;
                     server_channels.remove(&recipient_channel);
                 }
 

@@ -104,6 +104,15 @@ impl ConfigFile {
                 Directive::Include(path) => {
                     normalized.insert("Include".to_string(), path.clone());
                 }
+                Directive::ProxyJump(v) => {
+                    normalized.insert("ProxyJump".to_string(), v.clone());
+                }
+                Directive::ControlMaster(v) => {
+                    normalized.insert("ControlMaster".to_string(), v.clone());
+                }
+                Directive::ControlPath(v) => {
+                    normalized.insert("ControlPath".to_string(), v.clone());
+                }
                 Directive::Unknown(unknown) => {
                     normalized.insert(
                         format!("Unknown:{}", unknown.keyword),
@@ -139,6 +148,9 @@ pub enum Directive {
     Macs(Vec<String>),
     ServerAliveInterval(u64),
     Include(String),
+    ProxyJump(String),
+    ControlMaster(String),
+    ControlPath(String),
     Unknown(UnknownDirective),
 }
 
@@ -169,6 +181,9 @@ pub struct ResolvedConfig {
     pub ciphers: Option<Vec<String>>,
     pub macs: Option<Vec<String>>,
     pub server_alive_interval: Option<u64>,
+    pub proxy_jump: Option<String>,
+    pub control_master: Option<String>,
+    pub control_path: Option<String>,
     pub extra: std::collections::BTreeMap<String, String>,
 }
 
@@ -238,6 +253,11 @@ pub fn parse_config(input: &str) -> Result<ConfigFile, RusshError> {
                 "ServerAliveInterval",
             )?),
             "include" => Directive::Include(join_args(args, line_number, "Include")?),
+            "proxyjump" => Directive::ProxyJump(join_args(args, line_number, "ProxyJump")?),
+            "controlmaster" => {
+                Directive::ControlMaster(join_args(args, line_number, "ControlMaster")?)
+            }
+            "controlpath" => Directive::ControlPath(join_args(args, line_number, "ControlPath")?),
             _ => {
                 file.warnings.push(ConfigWarning {
                     line: line_number,
@@ -448,6 +468,15 @@ fn apply_directive_first_match(
         Directive::ServerAliveInterval(v) if resolved.server_alive_interval.is_none() => {
             resolved.server_alive_interval = Some(*v);
         }
+        Directive::ProxyJump(v) if resolved.proxy_jump.is_none() => {
+            resolved.proxy_jump = Some(expand_tokens(v, hostname, &user));
+        }
+        Directive::ControlMaster(v) if resolved.control_master.is_none() => {
+            resolved.control_master = Some(v.clone());
+        }
+        Directive::ControlPath(v) if resolved.control_path.is_none() => {
+            resolved.control_path = Some(expand_tilde(&expand_tokens(v, hostname, &user), &home));
+        }
         Directive::Unknown(u) => {
             resolved
                 .extra
@@ -649,6 +678,73 @@ Host myhost
         assert_eq!(
             resolved.hostname.as_deref(),
             Some("myhost.internal.example.com")
+        );
+    }
+
+    #[test]
+    fn parse_and_resolve_proxyjump() {
+        let config = parse_config(
+            "
+Host target
+  ProxyJump bastion.example.com
+  User alice
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("target");
+        assert_eq!(resolved.proxy_jump.as_deref(), Some("bastion.example.com"));
+    }
+
+    #[test]
+    fn parse_and_resolve_control_master() {
+        let config = parse_config(
+            "
+Host *
+  ControlMaster auto
+  ControlPath /tmp/ssh-%h-%u.sock
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("myhost");
+        assert_eq!(resolved.control_master.as_deref(), Some("auto"));
+        let cp = resolved.control_path.as_deref().unwrap_or("");
+        assert!(cp.contains("myhost"), "ControlPath should expand %h");
+    }
+
+    #[test]
+    fn control_path_tilde_and_tokens() {
+        let config = parse_config(
+            "
+Host dev
+  ControlPath ~/.ssh/cm_%h.sock
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("dev");
+        let cp = resolved.control_path.as_deref().unwrap_or("");
+        assert!(!cp.starts_with('~'), "tilde should be expanded");
+        assert!(
+            cp.ends_with("cm_dev.sock"),
+            "token %h should expand to hostname"
+        );
+    }
+
+    #[test]
+    fn proxyjump_none_value_accepted() {
+        let config = parse_config(
+            "
+Host direct
+  ProxyJump none
+",
+        )
+        .expect("parse should succeed");
+
+        assert_eq!(
+            config.resolve_for_host("direct").proxy_jump.as_deref(),
+            Some("none")
         );
     }
 }

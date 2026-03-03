@@ -1149,7 +1149,7 @@ impl SftpFileServer {
             match component {
                 Component::Normal(part) => sanitized.push(part),
                 Component::CurDir => {}
-                Component::RootDir => {}  // treat as chroot — root is already self.root
+                Component::RootDir => {} // treat as chroot — root is already self.root
                 Component::ParentDir | Component::Prefix(_) => {
                     return Err(RusshError::new(
                         RusshErrorCategory::Protocol,

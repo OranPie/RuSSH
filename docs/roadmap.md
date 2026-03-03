@@ -45,11 +45,22 @@ All tests pass (zero unsafe blocks).
 - Validate full handshake, auth, and channel I/O against OpenSSH 9.x
 - SFTP subsystem interop with `sftp` client
 
-## v0.4 — Advanced features
-- OpenSSH certificate format (ssh-ed25519-cert-v01@openssh.com) validation
-- Agent forwarding protocol bridge (`SSH_AUTH_SOCK`)
-- ProxyJump / `nc`-mode tunneling (`-W` / `-J`)
-- Connection multiplexing (`ControlMaster` / `ControlPath`)
+## v0.4 ✅ (current)
+Advanced SSH features:
+- **OpenSSH certificate support** — `ssh-ed25519-cert-v01@openssh.com` wire parsing,
+  CA signature verification, server-side cert auth (`CertificateValidator`), client-side
+  `authenticate_pubkey_with_cert()`. Two integration tests: RuSSH cert client → sshd,
+  OpenSSH cert client → RuSSH server.
+- **SSH Agent Protocol** — `SshAgentClient` over `SSH_AUTH_SOCK` Unix socket; implements
+  `list_identities()` and `sign()` (SSH-AGENT protocol). `authenticate_via_agent()` on
+  `SshClientConnection`. Integration test against real OpenSSH `ssh-agent`.
+- **ProxyJump** — `SshClient::connect_via_jump()` opens a `direct-tcpip` channel to a
+  target through a jump host; inner SSH session runs over a `tokio::io::duplex` bridge.
+  `SshClientConnection` refactored to use boxed `AnyStream` for stream-type agnosticism.
+  Integration test through two real `sshd` instances.
+- **ControlMaster config directives** — `ProxyJump`, `ControlMaster`, and `ControlPath`
+  added to `russh-config`; token expansion (`%h`/`%u`/`%%`) and tilde expansion applied
+  to `ControlPath`. Four new unit tests. Mux-socket protocol defers to v0.5.
 
 ## v0.5 — Hardening and performance
 - Corpus-based fuzz campaigns; coverage-guided CI
