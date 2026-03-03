@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RuSSH Web Terminal</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #e0e0e0; font-family: system-ui, sans-serif; }
+  #login {
+    max-width: 380px; margin: 60px auto; padding: 32px;
+    background: #16213e; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.5);
+  }
+  #login h1 { font-size: 1.4rem; margin-bottom: 20px; color: #0f3460; text-align: center; }
+  #login h1 span { color: #e94560; }
+  #login label { display: block; margin-bottom: 4px; font-size: .85rem; color: #a0a0c0; }
+  #login input {
+    width: 100%; padding: 8px 12px; margin-bottom: 14px; border: 1px solid #333;
+    border-radius: 6px; background: #0f3460; color: #e0e0e0; font-size: .95rem;
+  }
+  #login input:focus { outline: none; border-color: #e94560; }
+  #login button {
+    width: 100%; padding: 10px; background: #e94560; color: #fff;
+    border: none; border-radius: 6px; font-size: 1rem; cursor: pointer;
+  }
+  #login button:hover { background: #c93650; }
+  #login .error { color: #e94560; font-size: .85rem; margin-bottom: 10px; }
+  #terminal-container {
+    display: none; width: 100vw; height: 100vh; padding: 4px; background: #000;
+  }
+  #terminal-container .xterm { height: 100%; }
+  #status {
+    position: fixed; bottom: 8px; right: 12px; font-size: .75rem; color: #555;
+  }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <h1>🔐 <span>RuSSH</span> Web Terminal</h1>
+  <div class="error" id="error"></div>
+  <label for="host">Host</label>
+  <input id="host" type="text" placeholder="192.168.1.1" autofocus>
+  <label for="port">Port</label>
+  <input id="port" type="number" value="22" min="1" max="65535">
+  <label for="user">Username</label>
+  <input id="user" type="text" placeholder="root">
+  <label for="password">Password</label>
+  <input id="password" type="password" placeholder="••••••••">
+  <button id="connectBtn" onclick="doConnect()">Connect</button>
+</div>
+
+<div id="terminal-container">
+  <div id="terminal"></div>
+</div>
+<div id="status"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script>
+let ws, term, fitAddon;
+
+function doConnect() {
+  const host = document.getElementById('host').value.trim();
+  const port = parseInt(document.getElementById('port').value) || 22;
+  const user = document.getElementById('user').value.trim();
+  const password = document.getElementById('password').value;
+  const errEl = document.getElementById('error');
+  errEl.textContent = '';
+
+  if (!host || !user) {
+    errEl.textContent = 'Host and username are required.';
+    return;
+  }
+
+  document.getElementById('connectBtn').disabled = true;
+  document.getElementById('connectBtn').textContent = 'Connecting…';
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ host, port, user, password }));
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'connected') {
+        openTerminal();
+      } else if (msg.type === 'error') {
+        errEl.textContent = msg.message;
+        document.getElementById('connectBtn').disabled = false;
+        document.getElementById('connectBtn').textContent = 'Connect';
+      }
+    } else {
+      // Binary: terminal data from server.
+      if (term) {
+        term.write(new Uint8Array(ev.data));
+      }
+    }
+  };
+
+  ws.onclose = () => {
+    if (term) {
+      term.write('\r\n\x1b[31m[Connection closed]\x1b[0m\r\n');
+    }
+    document.getElementById('status').textContent = 'Disconnected';
+  };
+
+  ws.onerror = () => {
+    errEl.textContent = 'WebSocket connection failed.';
+    document.getElementById('connectBtn').disabled = false;
+    document.getElementById('connectBtn').textContent = 'Connect';
+  };
+}
+
+function openTerminal() {
+  document.getElementById('login').style.display = 'none';
+  const container = document.getElementById('terminal-container');
+  container.style.display = 'block';
+
+  term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
+    theme: { background: '#1a1a2e', foreground: '#e0e0e0', cursor: '#e94560' },
+  });
+  fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal'));
+  fitAddon.fit();
+  term.focus();
+
+  term.onData((data) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(new TextEncoder().encode(data));
+    }
+  });
+
+  window.addEventListener('resize', () => fitAddon.fit());
+  document.getElementById('status').textContent = 'Connected';
+}
+</script>
+</body>
+</html>

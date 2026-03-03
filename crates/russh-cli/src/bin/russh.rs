@@ -20,6 +20,7 @@ use std::{
 use crossterm::terminal;
 use russh_crypto::Ed25519Signer;
 use russh_net::{SshClient, SshClientConnection};
+use russh_observability::{Severity, StderrLogger, VerboseLevel};
 use russh_transport::ClientConfig;
 
 fn usage() -> ! {
@@ -32,6 +33,8 @@ fn usage() -> ! {
          \x20 -i IDENTITY      Path to Ed25519 private key (default: ~/.ssh/id_ed25519)\n\
          \x20 -J JUMP          ProxyJump: [user@]host[:port]\n\
          \x20 -o KEY=VALUE     OpenSSH option (e.g. StrictHostKeyChecking=no)\n\
+         \x20 -v               Increase verbosity (-vv, -vvv for more)\n\
+         \x20 -q, --quiet      Suppress all diagnostic output\n\
          \x20 -h, --help       Print this help"
     );
     process::exit(1);
@@ -46,6 +49,8 @@ struct Args {
     strict_host_key_checking: bool,
     tofu: bool,
     command: Vec<String>,
+    verbose: u8,
+    quiet: bool,
 }
 
 fn parse_args() -> Args {
@@ -58,6 +63,8 @@ fn parse_args() -> Args {
     let mut strict = true;
     let mut tofu = true;
     let mut command: Vec<String> = Vec::new();
+    let mut verbose: u8 = 0;
+    let mut quiet = false;
     let mut collecting_cmd = false;
 
     let mut i = 0;
@@ -112,6 +119,10 @@ fn parse_args() -> Args {
                     tofu = false;
                 }
             }
+            "-v" => verbose += 1,
+            "-vv" => verbose += 2,
+            "-vvv" => verbose += 3,
+            "-q" | "--quiet" => quiet = true,
             _ => {}
         }
         i += 1;
@@ -139,6 +150,8 @@ fn parse_args() -> Args {
         strict_host_key_checking: strict,
         tofu,
         command,
+        verbose,
+        quiet,
     }
 }
 
@@ -175,6 +188,8 @@ fn load_seed(path: &std::path::Path) -> [u8; 32] {
 #[tokio::main]
 async fn main() {
     let args = parse_args();
+    let log_level = VerboseLevel::from_flags(args.verbose, args.quiet);
+    let log = StderrLogger::new(log_level, "russh");
     let identity_path = resolve_identity(args.identity.as_ref());
 
     let mut cfg = ClientConfig::secure_defaults(&args.user);
@@ -226,6 +241,11 @@ async fn main() {
             })
     };
 
+    log.log(
+        Severity::Info,
+        &format!("connected to {}:{}", args.host, args.port),
+    );
+
     // TOFU / known-hosts check.
     if args.tofu {
         if let Some(key_blob) = conn.server_host_key_blob() {
@@ -236,6 +256,7 @@ async fn main() {
                 },
             );
         }
+        log.log(Severity::Debug, "host key verified");
     }
 
     // Authenticate: try pubkey first, fall back to password.
@@ -258,8 +279,11 @@ async fn main() {
             });
     }
 
+    log.log(Severity::Info, "authenticated");
+
     if args.command.is_empty() {
         // Interactive shell mode.
+        log.log(Severity::Debug, "opening interactive shell");
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
         let (_local_id, remote_id) = conn
@@ -288,6 +312,7 @@ async fn main() {
     }
 
     let cmd = args.command.join(" ");
+    log.log(Severity::Debug, &format!("exec: {cmd}"));
     let result = conn.exec(&cmd).await.unwrap_or_else(|e| {
         eprintln!("russh: exec failed: {e}");
         process::exit(255);

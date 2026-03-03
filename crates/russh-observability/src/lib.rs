@@ -296,11 +296,157 @@ mod metrics_tests {
     }
 }
 
+/// Verbosity level for the stderr logger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum VerboseLevel {
+    /// No output at all.
+    Quiet = 0,
+    /// Errors and warnings only (default).
+    Normal = 1,
+    /// Includes info-level events (`-v`).
+    Verbose = 2,
+    /// Includes debug-level events (`-vv`).
+    Debug = 3,
+    /// Everything (`-vvv`).
+    Trace = 4,
+}
+
+impl VerboseLevel {
+    /// Build a `VerboseLevel` from the number of `-v` flags and a quiet flag.
+    #[must_use]
+    pub fn from_flags(verbose_count: u8, quiet: bool) -> Self {
+        if quiet {
+            return Self::Quiet;
+        }
+        match verbose_count {
+            0 => Self::Normal,
+            1 => Self::Verbose,
+            2 => Self::Debug,
+            _ => Self::Trace,
+        }
+    }
+}
+
+/// Severity attached to each emitted event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Severity {
+    Trace = 0,
+    Debug = 1,
+    Info = 2,
+    Warn = 3,
+    Error = 4,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Trace => write!(f, "TRACE"),
+            Self::Debug => write!(f, "DEBUG"),
+            Self::Info => write!(f, " INFO"),
+            Self::Warn => write!(f, " WARN"),
+            Self::Error => write!(f, "ERROR"),
+        }
+    }
+}
+
+fn event_severity(event: &TelemetryEvent) -> Severity {
+    match event {
+        TelemetryEvent::Transport(t) => match t {
+            TransportEvent::VersionExchange | TransportEvent::AlgorithmNegotiated => {
+                Severity::Debug
+            }
+            TransportEvent::Rekey | TransportEvent::Disconnect => Severity::Info,
+        },
+        TelemetryEvent::Auth(a) => match a {
+            AuthEvent::MethodAttempt { .. } => Severity::Debug,
+            AuthEvent::Success => Severity::Info,
+            AuthEvent::Failure { .. } => Severity::Warn,
+        },
+        TelemetryEvent::Channel(c) => match c {
+            ChannelEvent::Open | ChannelEvent::Close => Severity::Debug,
+            ChannelEvent::ForwardEnabled | ChannelEvent::ForwardDisabled => Severity::Info,
+        },
+    }
+}
+
+fn severity_passes(severity: Severity, level: VerboseLevel) -> bool {
+    match level {
+        VerboseLevel::Quiet => false,
+        VerboseLevel::Normal => severity >= Severity::Warn,
+        VerboseLevel::Verbose => severity >= Severity::Info,
+        VerboseLevel::Debug => severity >= Severity::Debug,
+        VerboseLevel::Trace => true,
+    }
+}
+
+/// Format a [`TelemetryEvent`] into a human-readable log message.
+fn format_event(event: &TelemetryEvent) -> String {
+    match event {
+        TelemetryEvent::Transport(t) => match t {
+            TransportEvent::VersionExchange => "transport: version exchange complete".into(),
+            TransportEvent::AlgorithmNegotiated => "transport: algorithms negotiated".into(),
+            TransportEvent::Rekey => "transport: rekey".into(),
+            TransportEvent::Disconnect => "transport: disconnected".into(),
+        },
+        TelemetryEvent::Auth(a) => match a {
+            AuthEvent::MethodAttempt { method } => format!("auth: trying {method}"),
+            AuthEvent::Success => "auth: success".into(),
+            AuthEvent::Failure { reason } => format!("auth: failed — {reason}"),
+        },
+        TelemetryEvent::Channel(c) => match c {
+            ChannelEvent::Open => "channel: opened".into(),
+            ChannelEvent::Close => "channel: closed".into(),
+            ChannelEvent::ForwardEnabled => "channel: forwarding enabled".into(),
+            ChannelEvent::ForwardDisabled => "channel: forwarding disabled".into(),
+        },
+    }
+}
+
+/// Simple stderr logger that respects [`VerboseLevel`].
+///
+/// Writes timestamped, severity-tagged lines to stderr.
+/// Suitable for CLI binaries — not for library use (use [`TracingEventSink`]
+/// or your own `EventSink` instead).
+pub struct StderrLogger {
+    level: VerboseLevel,
+    prefix: String,
+}
+
+impl StderrLogger {
+    /// Create a logger with the given verbosity and a program-name prefix.
+    #[must_use]
+    pub fn new(level: VerboseLevel, prefix: impl Into<String>) -> Self {
+        Self {
+            level,
+            prefix: prefix.into(),
+        }
+    }
+
+    /// Emit a free-form log line at the given severity.
+    pub fn log(&self, severity: Severity, msg: &str) {
+        if severity_passes(severity, self.level) {
+            eprintln!("{}: [{severity}] {msg}", self.prefix);
+        }
+    }
+}
+
+impl EventSink for StderrLogger {
+    fn emit(&self, event: &TelemetryEvent) {
+        let severity = event_severity(event);
+        if severity_passes(severity, self.level) {
+            let msg = format_event(event);
+            eprintln!("{}: [{severity}] {msg}", self.prefix);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use super::EventSink;
     use super::{MemorySink, NoopMetrics, Observability, TelemetryEvent, TransportEvent};
+    use super::{Severity, StderrLogger, VerboseLevel, event_severity, severity_passes};
 
     #[test]
     fn memory_sink_records_events() {
@@ -311,5 +457,44 @@ mod tests {
 
         let events = sink.events();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn verbose_level_from_flags() {
+        assert_eq!(VerboseLevel::from_flags(0, true), VerboseLevel::Quiet);
+        assert_eq!(VerboseLevel::from_flags(0, false), VerboseLevel::Normal);
+        assert_eq!(VerboseLevel::from_flags(1, false), VerboseLevel::Verbose);
+        assert_eq!(VerboseLevel::from_flags(2, false), VerboseLevel::Debug);
+        assert_eq!(VerboseLevel::from_flags(3, false), VerboseLevel::Trace);
+        assert_eq!(VerboseLevel::from_flags(99, false), VerboseLevel::Trace);
+    }
+
+    #[test]
+    fn severity_filtering() {
+        assert!(!severity_passes(Severity::Info, VerboseLevel::Quiet));
+        assert!(!severity_passes(Severity::Info, VerboseLevel::Normal));
+        assert!(severity_passes(Severity::Warn, VerboseLevel::Normal));
+        assert!(severity_passes(Severity::Info, VerboseLevel::Verbose));
+        assert!(severity_passes(Severity::Debug, VerboseLevel::Debug));
+        assert!(severity_passes(Severity::Trace, VerboseLevel::Trace));
+    }
+
+    #[test]
+    fn event_severity_levels() {
+        let version = TelemetryEvent::Transport(TransportEvent::VersionExchange);
+        assert_eq!(event_severity(&version), Severity::Debug);
+
+        let disconnect = TelemetryEvent::Transport(TransportEvent::Disconnect);
+        assert_eq!(event_severity(&disconnect), Severity::Info);
+
+        let auth_fail = TelemetryEvent::Auth(super::AuthEvent::Failure { reason: "x".into() });
+        assert_eq!(event_severity(&auth_fail), Severity::Warn);
+    }
+
+    #[test]
+    fn stderr_logger_does_not_panic() {
+        let logger = StderrLogger::new(VerboseLevel::Trace, "test");
+        logger.log(Severity::Info, "hello");
+        logger.emit(&TelemetryEvent::Transport(TransportEvent::Rekey));
     }
 }
