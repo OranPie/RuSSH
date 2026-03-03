@@ -2025,11 +2025,25 @@ impl ServerSession {
                         },
                     )
                 } else {
-                    self.bump_outgoing_sequence();
-                    return Ok(Some(UserAuthMessage::PublicKeyOk {
-                        algorithm,
-                        public_key,
-                    }));
+                    // Probe: only confirm key acceptability if it's in authorized_keys.
+                    let key_authorized = self
+                        .auth_session
+                        .as_ref()
+                        .is_none_or(|s| s.check_authorized_key(&user, &public_key));
+                    if key_authorized {
+                        self.bump_outgoing_sequence();
+                        return Ok(Some(UserAuthMessage::PublicKeyOk {
+                            algorithm,
+                            public_key,
+                        }));
+                    } else {
+                        let methods = self.allowed_userauth_methods();
+                        self.bump_outgoing_sequence();
+                        return Ok(Some(UserAuthMessage::Failure {
+                            methods,
+                            partial_success: false,
+                        }));
+                    }
                 }
             }
             UserAuthRequest::Password {

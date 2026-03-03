@@ -632,17 +632,27 @@ impl MemoryAuthorizedKeys {
 
     /// Returns `true` if `key` is an authorized key blob for `user`.
     ///
+    /// A wildcard entry stored under `"*"` matches any user.
+    ///
     /// # Constant-time note
     ///
     /// Key blob comparison uses [`russh_crypto::constant_time_eq`] (`subtle::ConstantTimeEq`)
     /// to prevent timing side-channels.
     #[must_use]
     pub fn is_authorized(&self, user: &str, key: &[u8]) -> bool {
-        self.entries.get(user).is_some_and(|entries| {
+        let check = |entries: &Vec<AuthorizedKeyEntry>| {
             entries
                 .iter()
                 .any(|entry| constant_time_eq(&entry.key, key))
-        })
+        };
+        if self.entries.get(user).is_some_and(check) {
+            return true;
+        }
+        // Also check wildcard entries (e.g. loaded with user="*" for any user).
+        if user != "*" && self.entries.get("*").is_some_and(check) {
+            return true;
+        }
+        false
     }
 }
 
