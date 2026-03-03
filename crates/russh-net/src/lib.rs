@@ -36,6 +36,7 @@ mod agent;
 pub use agent::SshAgentClient;
 
 use std::path::{Path, PathBuf};
+use tracing::{debug, info, trace, warn};
 
 use russh_auth::{
     AgentClient, ServerAuthPolicy, UserAuthMessage, UserAuthRequest, build_ed25519_signature_blob,
@@ -1568,9 +1569,11 @@ impl SshServerConnection {
         session.set_local_version(OUR_BANNER);
 
         // ── Banner exchange ──
+        debug!("starting banner exchange");
         self.stream.write_banner_line(OUR_BANNER).await?;
         let client_banner = self.stream.read_banner_line().await?;
         session.accept_banner(&client_banner)?;
+        debug!(client_version = %client_banner, "banner exchanged");
 
         // Advance state machine to AlgorithmsNegotiated so receive_message
         // can accept KexInit.  The actual negotiation happens inside receive_message.
@@ -1578,6 +1581,7 @@ impl SshServerConnection {
         session.negotiate_with_client(&AlgorithmSet::secure_defaults())?;
 
         // ── KEXINIT from client ──
+        debug!("waiting for client KEXINIT");
         let client_kexinit_frame = self.stream.read_packet().await?;
         // Store raw payload BEFORE parsing so the exchange hash uses original bytes.
         session.store_client_kexinit_payload(client_kexinit_frame.payload.clone());
@@ -1587,8 +1591,10 @@ impl SshServerConnection {
             let reply_frame = reply.to_frame()?;
             self.stream.write_packet(&reply_frame).await?;
         }
+        debug!("KEXINIT exchanged");
 
         // ── ECDH_INIT from client ──
+        debug!("waiting for ECDH init");
         let ecdh_init_frame = self.stream.read_packet().await?;
         let ecdh_init_msg = TransportMessage::from_frame(&ecdh_init_frame)?;
         // Returns KexEcdhReply.
@@ -1606,6 +1612,7 @@ impl SshServerConnection {
             let neg = neg.clone();
             self.stream.enable_server_tx_encryption(&keys, &neg);
         }
+        debug!(cipher = ?session.negotiated().map(|n| &n.cipher_client_to_server), "KEX complete, TX encrypted");
 
         // Send EXT_INFO if we advertised ext-info-s (OpenSSH client expects it, encrypted).
         let sends_ext_info = session.negotiated().is_some_and(|n| n.ext_info_s);
@@ -1617,6 +1624,7 @@ impl SshServerConnection {
         }
 
         // ── NEWKEYS from client ──
+        debug!("waiting for client NEWKEYS");
         let client_newkeys_frame = self.stream.read_packet().await?;
         let client_newkeys_msg = TransportMessage::from_frame(&client_newkeys_frame)?;
         session.receive_message(client_newkeys_msg)?;
@@ -1627,11 +1635,13 @@ impl SshServerConnection {
             let neg = neg.clone();
             self.stream.enable_server_rx_encryption(&keys, &neg);
         }
+        debug!("RX decryption enabled");
 
         // ── SERVICE_REQUEST ──
         // Skip transport-layer housekeeping messages that may arrive before SERVICE_REQUEST.
         // Clients (especially PuTTY) may send EXT_INFO, IGNORE (2), DEBUG (4),
         // GLOBAL_REQUEST (80), or other unknown types before the service request.
+        debug!("waiting for SERVICE_REQUEST");
         let service_req_msg = loop {
             let frame = self.stream.read_packet().await?;
             let msg = TransportMessage::from_frame(&frame)?;
@@ -1640,8 +1650,8 @@ impl SshServerConnection {
                 | TransportMessage::Ignore { .. } => {
                     session.receive_message(msg)?;
                 }
-                TransportMessage::Unknown { .. } => {
-                    // silently ignore unrecognised transport messages
+                TransportMessage::Unknown { message_type, .. } => {
+                    debug!(msg_type = message_type, "skipping unknown transport message before SERVICE_REQUEST");
                 }
                 _ => break msg,
             }
@@ -1651,6 +1661,7 @@ impl SshServerConnection {
                 .write_packet(&service_accept.to_frame()?)
                 .await?;
         }
+        debug!("service accepted");
 
         // ── Auth ──
         let auth_policy = self
@@ -1659,26 +1670,39 @@ impl SshServerConnection {
             .clone()
             .unwrap_or_else(ServerAuthPolicy::secure_defaults);
         session.activate_userauth(auth_policy);
+        info!("starting authentication");
         loop {
             let auth_frame = self.stream.read_packet().await?;
             // Skip transport-layer housekeeping messages (IGNORE=2, DEBUG=4, etc.)
             // that PuTTY and other clients may send during the auth phase.
             let msg_type = auth_frame.message_type().unwrap_or(0);
             if msg_type < 50 || msg_type == 80 {
+                trace!(msg_type, "skipping transport msg during auth");
                 // GLOBAL_REQUEST (80) and all transport-layer messages are silently skipped.
                 continue;
             }
             let auth_msg = UserAuthMessage::from_frame(&auth_frame)?;
+            debug!(auth_msg_type = msg_type, "received auth message");
             let reply = session.receive_userauth_message(auth_msg)?;
             if let Some(reply) = reply {
+                let reply_type = match &reply {
+                    UserAuthMessage::Success => "success",
+                    UserAuthMessage::Failure { .. } => "failure",
+                    UserAuthMessage::PublicKeyOk { .. } => "pk-ok",
+                    UserAuthMessage::Banner { .. } => "banner",
+                    _ => "other",
+                };
+                debug!(reply_type, "sending auth reply");
                 self.stream.write_packet(&reply.to_frame()?).await?;
-                if session.authenticated_user().is_some() {
+                if let Some(user) = session.authenticated_user() {
+                    info!(user = %user, "authentication successful");
                     break;
                 }
             }
         }
 
         // ── Channel loop ──
+        info!("entering channel loop");
         self.run_channels(&mut session, &handler).await
     }
 
@@ -1707,7 +1731,10 @@ impl SshServerConnection {
             // Skip non-channel messages (e.g. GLOBAL_REQUEST, IGNORE, DEBUG).
             let msg = match ChannelMessage::from_bytes(&frame.payload) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) => {
+                    debug!(error = %e, "failed to parse channel message, skipping");
+                    continue;
+                }
             };
             match msg {
                 ChannelMessage::Open {
@@ -1718,6 +1745,7 @@ impl SshServerConnection {
                 } => {
                     let our_id = next_server_id;
                     next_server_id += 1;
+                    debug!(client_ch, our_id, "channel opened");
                     server_channels.insert(
                         client_ch,
                         ServerChannelState {
@@ -1727,6 +1755,8 @@ impl SshServerConnection {
                             sftp_framer: SftpFramer::new(),
                             pty_requested: false,
                             pty_size: None,
+                            pty_term: None,
+                            env: Vec::new(),
                         },
                     );
                     let confirm = ChannelMessage::OpenConfirmation {
@@ -1750,6 +1780,7 @@ impl SshServerConnection {
                     let client_ch = recipient_channel;
                     match request {
                         ChannelRequest::Exec { command } => {
+                            info!(command = %command, "exec request");
                             if want_reply {
                                 let ok = ChannelMessage::Success {
                                     recipient_channel: client_ch,
@@ -1793,6 +1824,7 @@ impl SshServerConnection {
                         }
 
                         ChannelRequest::SubSystem { name } if name == "sftp" => {
+                            info!("SFTP subsystem requested");
                             if want_reply {
                                 if let Some(root) = handler.sftp_root() {
                                     state.is_sftp = true;
@@ -1810,12 +1842,26 @@ impl SshServerConnection {
                             }
                         }
 
+                        ChannelRequest::Env { name, value } => {
+                            debug!(env_name = %name, "client sent env var");
+                            state.env.push((name, value));
+                            if want_reply {
+                                let ok = ChannelMessage::Success {
+                                    recipient_channel: client_ch,
+                                };
+                                self.stream.write_packet(&ok.to_frame()?).await?;
+                            }
+                        }
+
                         ChannelRequest::PtyReq {
+                            term,
                             width_chars,
                             height_rows,
                             ..
                         } => {
+                            info!(term = %term, cols = width_chars, rows = height_rows, "PTY requested");
                             state.pty_requested = true;
+                            state.pty_term = Some(term);
                             state.pty_size = Some((
                                 u16::try_from(width_chars).unwrap_or(80),
                                 u16::try_from(height_rows).unwrap_or(24),
@@ -1829,6 +1875,7 @@ impl SshServerConnection {
                         }
 
                         ChannelRequest::Shell => {
+                            info!("shell request");
                             if let Some(shell) = handler.shell_command() {
                                 if want_reply {
                                     let ok = ChannelMessage::Success {
@@ -1837,8 +1884,24 @@ impl SshServerConnection {
                                     self.stream.write_packet(&ok.to_frame()?).await?;
                                 }
                                 let pty_size = state.pty_size;
-                                self.run_shell_channel(client_ch, &shell, pty_size).await?;
-                            } else if want_reply {
+                                let pty_term = state.pty_term.clone();
+                                let env = state.env.clone();
+                                info!(shell = %shell, pty = pty_size.is_some(), "spawning shell");
+                                self.run_shell_channel(client_ch, &shell, pty_size, pty_term, env).await?;
+                            } else {
+                                warn!("shell request denied (no shell configured)");
+                                if want_reply {
+                                    let fail = ChannelMessage::Failure {
+                                        recipient_channel: client_ch,
+                                    };
+                                    self.stream.write_packet(&fail.to_frame()?).await?;
+                                }
+                            }
+                        }
+
+                        ChannelRequest::Unknown { ref request_type, .. } => {
+                            debug!(request_type = %request_type, "unknown channel request");
+                            if want_reply {
                                 let fail = ChannelMessage::Failure {
                                     recipient_channel: client_ch,
                                 };
@@ -1965,15 +2028,21 @@ impl SshServerConnection {
         client_ch: u32,
         shell_exe: &str,
         pty_size: Option<(u16, u16)>,
+        pty_term: Option<String>,
+        env: Vec<(String, String)>,
     ) -> Result<(), RusshError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::process::Command;
 
         if let Some((cols, rows)) = pty_size {
-            self.run_shell_pty(client_ch, shell_exe, cols, rows).await
+            self.run_shell_pty(client_ch, shell_exe, cols, rows, pty_term, env).await
         } else {
             // No PTY: pipe-only mode for non-interactive exec.
-            let mut child = Command::new(shell_exe)
+            let mut cmd = Command::new(shell_exe);
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+            let mut child = cmd
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -2037,6 +2106,7 @@ impl SshServerConnection {
                 .await
                 .map(|s| s.code().unwrap_or(0) as u32)
                 .unwrap_or(0);
+            info!(exit_code, "shell (no-pty) exited");
             let _ = self.stream.write_packet(&ChannelMessage::Request {
                 recipient_channel: client_ch,
                 want_reply: false,
@@ -2054,6 +2124,8 @@ impl SshServerConnection {
         shell_exe: &str,
         cols: u16,
         rows: u16,
+        pty_term: Option<String>,
+        env: Vec<(String, String)>,
     ) -> Result<(), RusshError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2064,10 +2136,21 @@ impl SshServerConnection {
         let pts = pty
             .pts()
             .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
-        let mut child = pty_process::Command::new(shell_exe)
+
+        let mut cmd = pty_process::Command::new(shell_exe);
+        // Set TERM from the pty-req term field, defaulting to "xterm-256color".
+        let term = pty_term.as_deref().unwrap_or("xterm-256color");
+        cmd.env("TERM", term);
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+        debug!(shell = %shell_exe, term, cols, rows, "spawning PTY shell");
+        let mut child = cmd
             .spawn(&pts)
             .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
 
+        // `pty` must not be split until after spawn() since `pts` borrows from it.
+        // Re-create to own: use the already-moved pty.
         let (mut pty_read, mut pty_write) = tokio::io::split(pty);
         let mut pty_buf = vec![0u8; 4096];
 
@@ -2079,9 +2162,21 @@ impl SshServerConnection {
                         Err(_) => break,
                         Ok(frame) => match ChannelMessage::from_bytes(&frame.payload) {
                             Ok(ChannelMessage::Data { data, .. }) => {
+                                trace!(bytes = data.len(), "client→PTY");
                                 if pty_write.write_all(&data).await.is_err() {
                                     break;
                                 }
+                            }
+                            Ok(ChannelMessage::Request { request: ChannelRequest::WindowChange { width_chars, height_rows, .. }, .. }) => {
+                                let new_cols = u16::try_from(width_chars).unwrap_or(80);
+                                let new_rows = u16::try_from(height_rows).unwrap_or(24);
+                                debug!(cols = new_cols, rows = new_rows, "PTY resize");
+                                // Unsplit to resize, then re-split.
+                                let pty_whole = pty_read.unsplit(pty_write);
+                                let _ = pty_whole.resize(pty_process::Size::new(new_rows, new_cols));
+                                let (r, w) = tokio::io::split(pty_whole);
+                                pty_read = r;
+                                pty_write = w;
                             }
                             Ok(ChannelMessage::Eof { .. }) | Ok(ChannelMessage::Close { .. }) => break,
                             _ => {}
@@ -2094,6 +2189,7 @@ impl SshServerConnection {
                         Ok(0) | Err(_) => break,
                         Ok(n) => n,
                     };
+                    trace!(bytes = n, "PTY→client");
                     let msg = ChannelMessage::Data {
                         recipient_channel: client_ch,
                         data: pty_buf[..n].to_vec(),
@@ -2106,6 +2202,7 @@ impl SshServerConnection {
         }
 
         let exit_code = child.wait().await.map(|s| s.code().unwrap_or(0) as u32).unwrap_or(0);
+        info!(exit_code, "PTY shell exited");
         let _ = self.stream.write_packet(&ChannelMessage::Request {
             recipient_channel: client_ch,
             want_reply: false,
@@ -2130,6 +2227,10 @@ struct ServerChannelState {
     pty_requested: bool,
     /// PTY terminal dimensions (cols, rows) if pty-req was received.
     pty_size: Option<(u16, u16)>,
+    /// Terminal type from pty-req (e.g. "xterm-256color").
+    pty_term: Option<String>,
+    /// Environment variables sent by the client via env channel requests.
+    env: Vec<(String, String)>,
 }
 
 // ── SshServer ────────────────────────────────────────────────────────────────

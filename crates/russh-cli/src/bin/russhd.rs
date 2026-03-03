@@ -217,6 +217,20 @@ async fn main() {
     let args = parse_args();
     let log_level = VerboseLevel::from_flags(args.verbose, args.quiet);
     let log = StderrLogger::new(log_level, "russhd");
+
+    // Initialize tracing subscriber so russh-net tracing macros emit to stderr.
+    let tracing_level = match log_level {
+        VerboseLevel::Quiet  => tracing::Level::ERROR,
+        VerboseLevel::Normal => tracing::Level::WARN,
+        VerboseLevel::Verbose => tracing::Level::INFO,
+        VerboseLevel::Debug  => tracing::Level::DEBUG,
+        VerboseLevel::Trace  => tracing::Level::TRACE,
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(tracing_level)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
     let seed = resolve_host_key(args.host_key.as_ref());
     let auth_keys = load_authorized_keys(args.authorized_keys.as_ref());
 

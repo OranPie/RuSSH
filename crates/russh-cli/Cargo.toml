@@ -19,6 +19,8 @@ russh-transport = { path = "../russh-transport" }
 russh-auth   = { path = "../russh-auth" }
 russh-observability = { path = "../russh-observability" }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 crossterm = "0.28"
 
 [[bin]]
