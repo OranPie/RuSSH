@@ -12,11 +12,11 @@
 //!   --help        Print this help
 //!
 //! The server executes `exec` requests via `sh -c` and supports interactive
-//! shell sessions.  Only keys listed in the authorized_keys file are accepted.
+//! shell sessions.  Pubkey auth uses the authorized_keys file (when present).
 
 use std::{path::PathBuf, process, sync::Arc};
 
-use russh_auth::{AuthMethod, MemoryAuthorizedKeys, ServerAuthPolicy};
+use russh_auth::{MemoryAuthorizedKeys, ServerAuthPolicy};
 use russh_crypto::{Ed25519Signer, OsRng, RandomSource, Signer};
 use russh_net::{SessionHandler, SshServer};
 use russh_observability::{Severity, StderrLogger, VerboseLevel};
@@ -223,15 +223,11 @@ async fn main() {
     let mut cfg = ServerConfig::secure_defaults();
     cfg.host_key_seed = Some(seed);
 
-    // Build auth policy: pubkey-only when authorized_keys is present.
+    // Build auth policy: allow all methods; if authorized_keys is present,
+    // use it to verify pubkey auth.  Password auth stays available via
+    // keyboard-interactive so PuTTY and other clients can still connect.
     if let Some(keys) = auth_keys {
         let mut policy = ServerAuthPolicy::secure_defaults();
-        policy
-            .set_allowed_methods([AuthMethod::PublicKey])
-            .unwrap_or_else(|e| {
-                eprintln!("russhd: auth policy error: {e}");
-                process::exit(1);
-            });
         policy.set_authorized_keys(keys);
         cfg.auth_policy = Some(policy);
     }
