@@ -600,8 +600,10 @@ impl SshClientConnection {
         let mut stream = PacketStream::new(stream);
 
         // ── Banner exchange ──
+        debug!("sending banner");
         stream.write_banner_line(OUR_BANNER).await?;
         let remote_banner = stream.read_banner_line().await?;
+        info!(server_version = %remote_banner, "banner exchanged");
 
         let mut session = ClientSession::new(config);
         session.set_local_version(OUR_BANNER);
@@ -609,6 +611,7 @@ impl SshClientConnection {
         session.handshake(&remote_banner).await?;
 
         // ── KEXINIT ──
+        debug!("sending KEXINIT");
         let kexinit_frame = session.send_kexinit()?;
         stream.write_packet(&kexinit_frame).await?;
 
@@ -618,8 +621,10 @@ impl SshClientConnection {
         let server_kexinit_msg = TransportMessage::from_frame(&server_kexinit_frame)?;
         session.store_server_kexinit_payload(server_kexinit_payload)?;
         session.receive_message(server_kexinit_msg)?;
+        debug!("KEXINIT exchanged");
 
         // ── ECDH key exchange ──
+        debug!("sending ECDH init");
         let ecdh_init_frame = session.send_kex_ecdh_init()?;
         stream.write_packet(&ecdh_init_frame).await?;
 
@@ -628,10 +633,12 @@ impl SshClientConnection {
         let (newkeys_frame, _keys) =
             session.receive_kex_ecdh_reply_and_send_newkeys(&ecdh_reply_msg)?;
         stream.write_packet(&newkeys_frame).await?;
+        debug!(cipher = ?session.negotiated().map(|n| &n.cipher_client_to_server), "KEX complete, sending NEWKEYS");
 
         // ── NewKeys ── read and discard; state is already Established after
         // receive_kex_ecdh_reply_and_send_newkeys.
         let _server_newkeys_frame = stream.read_packet().await?;
+        debug!("received server NEWKEYS");
 
         // Enable AEAD encryption in both directions now that NEWKEYS is complete.
         if let (Some(keys), Some(neg)) = (session.session_keys(), session.negotiated()) {
@@ -639,8 +646,10 @@ impl SshClientConnection {
             let neg = neg.clone();
             stream.enable_client_encryption(&keys, &neg);
         }
+        debug!("encryption enabled");
 
         // ── Service request ──
+        debug!("requesting ssh-userauth service");
         let service_frame = session.send_service_request("ssh-userauth")?;
         stream.write_packet(&service_frame).await?;
         // Read responses; skip EXT_INFO (server may send it before service accept).
@@ -654,6 +663,7 @@ impl SshClientConnection {
             }
         };
         session.receive_message(service_accept_msg)?;
+        debug!("service accepted");
 
         Ok(Self {
             stream,
@@ -671,6 +681,7 @@ impl SshClientConnection {
     /// Authenticate with a password.  Returns `Ok(())` on success.
     pub async fn authenticate_password(&mut self, password: &str) -> Result<(), RusshError> {
         let user = self.session.config.user.clone();
+        debug!(user = %user, "authenticating with password");
         let request = UserAuthRequest::Password {
             user: user.clone(),
             service: "ssh-connection".to_owned(),
@@ -683,10 +694,15 @@ impl SshClientConnection {
         loop {
             let response_frame = self.stream.read_packet().await?;
             let msg = UserAuthMessage::from_frame(&response_frame)?;
+            debug!(msg_type = ?std::mem::discriminant(&msg), "auth response");
             self.session.receive_userauth_message(msg.clone())?;
             match msg {
-                UserAuthMessage::Success => return Ok(()),
+                UserAuthMessage::Success => {
+                    info!(user = %user, "password auth succeeded");
+                    return Ok(());
+                }
                 UserAuthMessage::Failure { .. } => {
+                    warn!(user = %user, "password auth failed");
                     return Err(RusshError::new(
                         RusshErrorCategory::Auth,
                         "password authentication rejected",
@@ -703,6 +719,7 @@ impl SshClientConnection {
     /// Authenticate with an Ed25519 private key.  Returns `Ok(())` on success.
     pub async fn authenticate_pubkey(&mut self, signer: &Ed25519Signer) -> Result<(), RusshError> {
         let user = self.session.config.user.clone();
+        debug!(user = %user, "authenticating with pubkey");
         let session_id = self
             .session
             .session_keys()
@@ -727,7 +744,7 @@ impl SshClientConnection {
         );
 
         let request = UserAuthRequest::PublicKey {
-            user,
+            user: user.clone(),
             service: "ssh-connection".to_owned(),
             algorithm: "ssh-ed25519".to_owned(),
             public_key: public_key_blob,
@@ -739,10 +756,15 @@ impl SshClientConnection {
         loop {
             let response_frame = self.stream.read_packet().await?;
             let msg = UserAuthMessage::from_frame(&response_frame)?;
+            debug!(msg_type = ?std::mem::discriminant(&msg), "auth response");
             self.session.receive_userauth_message(msg.clone())?;
             match msg {
-                UserAuthMessage::Success => return Ok(()),
+                UserAuthMessage::Success => {
+                    info!(user = %user, "pubkey auth succeeded");
+                    return Ok(());
+                }
                 UserAuthMessage::Failure { .. } => {
+                    warn!(user = %user, "pubkey auth rejected");
                     return Err(RusshError::new(
                         RusshErrorCategory::Auth,
                         "public key authentication rejected",
@@ -989,6 +1011,7 @@ impl SshClientConnection {
         cols: u32,
         rows: u32,
     ) -> Result<(u32, u32), RusshError> {
+        debug!(term, cols, rows, "opening shell channel");
         let (local_id, open_msg) = self.channel_manager.open_channel(ChannelKind::Session);
         self.stream.write_packet(&open_msg.to_frame()?).await?;
 
@@ -1003,6 +1026,7 @@ impl SshClientConnection {
                 } if *recipient_channel == local_id => {
                     let rid = *sender_channel;
                     self.channel_manager.accept_confirmation(local_id, &ch)?;
+                    debug!(local_id, remote_id = rid, "channel open confirmed");
                     break rid;
                 }
                 ChannelMessage::OpenFailure { .. } => {
@@ -1013,6 +1037,7 @@ impl SshClientConnection {
         };
 
         // Request PTY.
+        debug!("requesting PTY");
         let pty_req = ChannelMessage::Request {
             recipient_channel: remote_id,
             want_reply: true,
@@ -1030,7 +1055,10 @@ impl SshClientConnection {
             let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match ch {
-                ChannelMessage::Success { .. } => break,
+                ChannelMessage::Success { .. } => {
+                    debug!("PTY accepted");
+                    break;
+                }
                 ChannelMessage::Failure { .. } => {
                     return Err(protocol_err("pty-req rejected"));
                 }
@@ -1039,6 +1067,7 @@ impl SshClientConnection {
         }
 
         // Request shell.
+        debug!("requesting shell");
         let shell_req = ChannelMessage::Request {
             recipient_channel: remote_id,
             want_reply: true,
@@ -1049,7 +1078,10 @@ impl SshClientConnection {
             let frame = self.read_channel_packet().await?;
             let ch = ChannelMessage::from_bytes(&frame.payload)?;
             match ch {
-                ChannelMessage::Success { .. } => break,
+                ChannelMessage::Success { .. } => {
+                    info!("shell opened");
+                    break;
+                }
                 ChannelMessage::Failure { .. } => {
                     return Err(protocol_err("shell request rejected"));
                 }
@@ -1071,6 +1103,7 @@ impl SshClientConnection {
         input: &mut (impl tokio::io::AsyncRead + Unpin),
         output: &mut (impl tokio::io::AsyncWrite + Unpin),
     ) -> Result<u32, RusshError> {
+        debug!(remote_id, "starting shell session I/O loop");
         let mut buf = vec![0u8; 4096];
         let mut exit_code: u32 = 0;
         loop {
@@ -1108,14 +1141,23 @@ impl SshClientConnection {
                             request: ChannelRequest::ExitStatus { exit_status },
                             ..
                         } => {
+                            debug!(exit_status, "received exit-status");
                             exit_code = exit_status;
                         }
-                        ChannelMessage::Eof { .. } | ChannelMessage::Close { .. } => break,
+                        ChannelMessage::Eof { .. } => {
+                            debug!("received EOF from server");
+                            break;
+                        }
+                        ChannelMessage::Close { .. } => {
+                            debug!("received Close from server");
+                            break;
+                        }
                         _ => {}
                     }
                 }
             }
         }
+        info!(exit_code, "shell session ended");
         Ok(exit_code)
     }
 
@@ -1728,11 +1770,40 @@ impl SshServerConnection {
                 break;
             }
 
-            // Skip non-channel messages (e.g. GLOBAL_REQUEST, IGNORE, DEBUG).
+            // Handle SSH_MSG_GLOBAL_REQUEST (80): reply REQUEST_FAILURE when want_reply set.
+            if frame.message_type() == Some(80) {
+                // Payload: string(request_name) bool(want_reply) [data...]
+                let payload = &frame.payload;
+                // Skip message type byte (index 0), then read string length
+                if payload.len() >= 5 {
+                    let name_len = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+                    let want_reply_offset = 5 + name_len;
+                    let request_name = std::str::from_utf8(&payload[5..5 + name_len.min(payload.len().saturating_sub(5))]).unwrap_or("?");
+                    let want_reply = payload.get(want_reply_offset).copied().unwrap_or(0) != 0;
+                    debug!(request_name, want_reply, "GLOBAL_REQUEST");
+                    if want_reply {
+                        // SSH_MSG_REQUEST_FAILURE = 82
+                        let failure_frame = russh_core::PacketFrame { payload: vec![82] };
+                        let _ = self.stream.write_packet(&failure_frame).await;
+                    }
+                }
+                continue;
+            }
+
+            // Handle SSH_MSG_IGNORE (2) and SSH_MSG_DEBUG (4).
+            match frame.message_type() {
+                Some(2) | Some(4) => {
+                    trace!(msg_type = frame.message_type(), "ignoring transport msg in channel loop");
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Parse as channel message.
             let msg = match ChannelMessage::from_bytes(&frame.payload) {
                 Ok(m) => m,
                 Err(e) => {
-                    debug!(error = %e, "failed to parse channel message, skipping");
+                    debug!(error = %e, msg_type = frame.message_type(), "failed to parse channel message, skipping");
                     continue;
                 }
             };
@@ -2154,6 +2225,7 @@ impl SshServerConnection {
         let (mut pty_read, mut pty_write) = tokio::io::split(pty);
         let mut pty_buf = vec![0u8; 4096];
 
+        let mut shell_done = false;
         loop {
             tokio::select! {
                 // Data from SSH client → PTY (→ shell stdin).
@@ -2197,12 +2269,47 @@ impl SshServerConnection {
                     if self.stream.write_packet(&msg.to_frame()?).await.is_err() {
                         break;
                     }
+                    // If shell already exited and PTY drained, stop looping.
+                    if shell_done { break; }
+                }
+                // Shell process exited — drain any remaining PTY output then stop.
+                status = child.wait(), if !shell_done => {
+                    let exit_code = status.map(|s| s.code().unwrap_or(0) as u32).unwrap_or(0);
+                    info!(exit_code, "PTY shell exited");
+                    shell_done = true;
+                    // Drain any buffered PTY output (with short timeout).
+                    let drain_deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(200);
+                    loop {
+                        match tokio::time::timeout_at(drain_deadline, pty_read.read(&mut pty_buf)).await {
+                            Ok(Ok(n)) if n > 0 => {
+                                trace!(bytes = n, "PTY drain→client");
+                                let msg = ChannelMessage::Data {
+                                    recipient_channel: client_ch,
+                                    data: pty_buf[..n].to_vec(),
+                                };
+                                let _ = self.stream.write_packet(&msg.to_frame()?).await;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let _ = self.stream.write_packet(&ChannelMessage::Request {
+                        recipient_channel: client_ch,
+                        want_reply: false,
+                        request: ChannelRequest::ExitStatus { exit_status: exit_code },
+                    }.to_frame()?).await;
+                    let _ = self.stream.write_packet(&ChannelMessage::Eof { recipient_channel: client_ch }.to_frame()?).await;
+                    let _ = self.stream.write_packet(&ChannelMessage::Close { recipient_channel: client_ch }.to_frame()?).await;
+                    return Ok(());
                 }
             }
         }
 
+        // Fallback path (client closed channel first).
         let exit_code = child.wait().await.map(|s| s.code().unwrap_or(0) as u32).unwrap_or(0);
-        info!(exit_code, "PTY shell exited");
+        if !shell_done {
+            info!(exit_code, "PTY shell exited (client-closed)");
+        }
         let _ = self.stream.write_packet(&ChannelMessage::Request {
             recipient_channel: client_ch,
             want_reply: false,
