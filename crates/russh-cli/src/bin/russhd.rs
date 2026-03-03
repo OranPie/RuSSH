@@ -107,16 +107,12 @@ fn parse_args() -> CliArgs {
 }
 
 /// Load an existing host key or generate and persist a fresh one.
-fn resolve_host_key(path: Option<&PathBuf>) -> Option<[u8; 32]> {
+fn resolve_host_key(path: Option<&PathBuf>) -> [u8; 32] {
     match path {
-        None => None,
-        Some(p) if p.exists() => {
-            let seed = russh_cli::load_ed25519_seed(p).unwrap_or_else(|e| {
-                eprintln!("russhd: failed to load host key {}: {e}", p.display());
-                process::exit(1);
-            });
-            Some(seed)
-        }
+        Some(p) if p.exists() => russh_cli::load_ed25519_seed(p).unwrap_or_else(|e| {
+            eprintln!("russhd: failed to load host key {}: {e}", p.display());
+            process::exit(1);
+        }),
         Some(p) => {
             let mut seed = [0u8; 32];
             OsRng.fill_bytes(&mut seed);
@@ -129,7 +125,17 @@ fn resolve_host_key(path: Option<&PathBuf>) -> Option<[u8; 32]> {
                 p.display(),
                 hex_fingerprint(&signer.public_key_blob())
             );
-            Some(seed)
+            seed
+        }
+        None => {
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            let signer = Ed25519Signer::from_seed(&seed);
+            eprintln!(
+                "russhd: using ephemeral host key (fingerprint: {}, use -k to persist)",
+                hex_fingerprint(&signer.public_key_blob())
+            );
+            seed
         }
     }
 }
@@ -215,7 +221,7 @@ async fn main() {
     let auth_keys = load_authorized_keys(args.authorized_keys.as_ref());
 
     let mut cfg = ServerConfig::secure_defaults();
-    cfg.host_key_seed = seed;
+    cfg.host_key_seed = Some(seed);
 
     // Build auth policy: pubkey-only when authorized_keys is present.
     if let Some(keys) = auth_keys {

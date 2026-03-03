@@ -1661,11 +1661,10 @@ impl ServerSession {
                     let reply = TransportMessage::from_frame(&server_kexinit_frame)?;
                     Ok(Some(reply))
                 } else {
-                    // Simple test path: respond with NEWKEYS immediately
-                    self.state = SessionState::Established;
-                    self.awaiting_client_newkeys = true;
-                    self.bump_outgoing_sequence();
-                    Ok(Some(TransportMessage::NewKeys))
+                    Err(RusshError::new(
+                        RusshErrorCategory::Config,
+                        "no host key configured; cannot complete key exchange",
+                    ))
                 }
             }
             TransportMessage::NewKeys => {
@@ -2640,6 +2639,7 @@ mod tests {
 
     use russh_auth::{AuthMethod, ServerAuthPolicy, UserAuthMessage, UserAuthRequest};
     use russh_core::{AlgorithmSet, PacketCodec, RusshErrorCategory};
+    use russh_crypto::{Curve25519Sha256, KeyExchangeAlgorithm, OsRng};
 
     use super::{
         ClientConfig, ClientSession, DisconnectReasonCode, KexInitProposal, PeerDescription,
@@ -2685,6 +2685,45 @@ mod tests {
                     .with_client_extensions(),
             ),
         }
+    }
+
+    fn test_server_config() -> ServerConfig {
+        ServerConfig {
+            host_key_seed: Some([0xAA; 32]),
+            ..ServerConfig::secure_defaults()
+        }
+    }
+
+    /// Drive a server through the full ECDH KEX handshake so it reaches
+    /// `Established` state with `awaiting_client_newkeys` cleared.
+    fn drive_server_past_kex(server: &mut ServerSession) {
+        server
+            .accept_banner("SSH-2.0-OpenSSH_9.8")
+            .expect("banner should be accepted");
+        server
+            .negotiate_with_client(&AlgorithmSet::secure_defaults())
+            .expect("negotiation should succeed");
+
+        let reply = server
+            .receive_message(test_kexinit([0x33; 16]))
+            .expect("server should accept KEXINIT")
+            .expect("server should produce KexInit reply");
+        assert!(matches!(reply, TransportMessage::KexInit { .. }));
+
+        let client_kp = Curve25519Sha256::generate_keypair(&mut OsRng);
+        let reply = server
+            .receive_message(TransportMessage::KexEcdhInit {
+                client_pubkey: client_kp.public_key.clone(),
+            })
+            .expect("server should accept KexEcdhInit")
+            .expect("server should produce KexEcdhReply");
+        assert!(matches!(reply, TransportMessage::KexEcdhReply { .. }));
+
+        server
+            .receive_message(TransportMessage::NewKeys)
+            .expect("server should accept client NewKeys");
+
+        assert_eq!(server.state(), SessionState::Established);
     }
 
     #[test]
@@ -3091,21 +3130,9 @@ mod tests {
 
     #[test]
     fn server_userauth_success_response_is_emitted() {
-        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        let mut server = ServerSession::new(test_server_config());
         server.activate_userauth(ServerAuthPolicy::secure_defaults());
-        server
-            .accept_banner("SSH-2.0-OpenSSH_9.8")
-            .expect("banner should be accepted");
-        server
-            .negotiate_with_client(&AlgorithmSet::secure_defaults())
-            .expect("negotiation should succeed");
-        let _newkeys = server
-            .receive_message(test_kexinit([0x92; 16]))
-            .expect("server should accept KEXINIT")
-            .expect("NEWKEYS response expected");
-        server
-            .receive_message(TransportMessage::NewKeys)
-            .expect("server should accept client NEWKEYS");
+        drive_server_past_kex(&mut server);
         let _service_accept = server
             .receive_message(TransportMessage::ServiceRequest {
                 service: "ssh-userauth".to_string(),
@@ -3130,24 +3157,12 @@ mod tests {
     fn server_userauth_partial_response_includes_remaining_methods() {
         let mut policy = ServerAuthPolicy::secure_defaults();
         policy
-            .set_required_methods([AuthMethod::PublicKey, AuthMethod::KeyboardInteractive])
+            .set_required_methods([AuthMethod::Password, AuthMethod::KeyboardInteractive])
             .expect("required methods should be configured");
 
-        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        let mut server = ServerSession::new(test_server_config());
         server.activate_userauth(policy);
-        server
-            .accept_banner("SSH-2.0-OpenSSH_9.8")
-            .expect("banner should be accepted");
-        server
-            .negotiate_with_client(&AlgorithmSet::secure_defaults())
-            .expect("negotiation should succeed");
-        let _newkeys = server
-            .receive_message(test_kexinit([0x93; 16]))
-            .expect("server should accept KEXINIT")
-            .expect("NEWKEYS response expected");
-        server
-            .receive_message(TransportMessage::NewKeys)
-            .expect("server should accept client NEWKEYS");
+        drive_server_past_kex(&mut server);
         let _service_accept = server
             .receive_message(TransportMessage::ServiceRequest {
                 service: "ssh-userauth".to_string(),
@@ -3156,12 +3171,10 @@ mod tests {
             .expect("service accept should be emitted");
 
         let response = server
-            .receive_userauth_message(UserAuthMessage::Request(UserAuthRequest::PublicKey {
+            .receive_userauth_message(UserAuthMessage::Request(UserAuthRequest::Password {
                 user: "alice".to_string(),
                 service: "ssh-connection".to_string(),
-                algorithm: "ssh-ed25519".to_string(),
-                public_key: vec![1, 2, 3, 4],
-                signature: Some(vec![5, 6, 7]),
+                password: "pw".to_string(),
             }))
             .expect("USERAUTH request should be evaluated")
             .expect("server should emit USERAUTH response");
@@ -3402,7 +3415,7 @@ mod tests {
 
     #[test]
     fn server_negotiation_and_kex_complete_flow() {
-        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        let mut server = ServerSession::new(test_server_config());
         server
             .accept_banner("SSH-2.0-OpenSSH_9.8")
             .expect("banner should be accepted");
@@ -3416,14 +3429,27 @@ mod tests {
         let reply = server
             .receive_message(test_kexinit([0x33; 16]))
             .expect("server should accept KEXINIT")
-            .expect("server should produce NEWKEYS");
-        assert_eq!(reply, TransportMessage::NewKeys);
+            .expect("server should produce KexInit reply");
+        assert!(matches!(reply, TransportMessage::KexInit { .. }));
+
+        let client_kp = Curve25519Sha256::generate_keypair(&mut OsRng);
+        let reply = server
+            .receive_message(TransportMessage::KexEcdhInit {
+                client_pubkey: client_kp.public_key.clone(),
+            })
+            .expect("server should accept KexEcdhInit")
+            .expect("server should produce KexEcdhReply");
+        assert!(matches!(reply, TransportMessage::KexEcdhReply { .. }));
+
+        server
+            .receive_message(TransportMessage::NewKeys)
+            .expect("server should accept client NewKeys");
         assert_eq!(server.state(), SessionState::Established);
     }
 
     #[test]
     fn server_strict_kex_requires_client_newkeys_before_service() {
-        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        let mut server = ServerSession::new(test_server_config());
         server
             .accept_banner("SSH-2.0-OpenSSH_9.8")
             .expect("banner should be accepted");
@@ -3431,10 +3457,19 @@ mod tests {
             .negotiate_with_client(&AlgorithmSet::secure_defaults())
             .expect("negotiation should succeed");
 
-        let _newkeys = server
+        let reply = server
             .receive_message(test_kexinit_with_client_extensions([0x88; 16]))
             .expect("server should accept strict client KEXINIT")
-            .expect("server should produce NEWKEYS");
+            .expect("server should produce KexInit reply");
+        assert!(matches!(reply, TransportMessage::KexInit { .. }));
+
+        let client_kp = Curve25519Sha256::generate_keypair(&mut OsRng);
+        let _ecdh_reply = server
+            .receive_message(TransportMessage::KexEcdhInit {
+                client_pubkey: client_kp.public_key.clone(),
+            })
+            .expect("server should accept KexEcdhInit")
+            .expect("server should produce KexEcdhReply");
 
         let error = server
             .receive_message(TransportMessage::ServiceRequest {
@@ -3447,7 +3482,7 @@ mod tests {
 
     #[test]
     fn server_strict_kex_allows_service_after_client_newkeys() {
-        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        let mut server = ServerSession::new(test_server_config());
         server
             .accept_banner("SSH-2.0-OpenSSH_9.8")
             .expect("banner should be accepted");
@@ -3455,10 +3490,19 @@ mod tests {
             .negotiate_with_client(&AlgorithmSet::secure_defaults())
             .expect("negotiation should succeed");
 
-        let _newkeys = server
+        let reply = server
             .receive_message(test_kexinit_with_client_extensions([0x89; 16]))
             .expect("server should accept strict client KEXINIT")
-            .expect("server should produce NEWKEYS");
+            .expect("server should produce KexInit reply");
+        assert!(matches!(reply, TransportMessage::KexInit { .. }));
+
+        let client_kp = Curve25519Sha256::generate_keypair(&mut OsRng);
+        let _ecdh_reply = server
+            .receive_message(TransportMessage::KexEcdhInit {
+                client_pubkey: client_kp.public_key.clone(),
+            })
+            .expect("server should accept KexEcdhInit")
+            .expect("server should produce KexEcdhReply");
 
         server
             .receive_message(TransportMessage::NewKeys)
@@ -3479,7 +3523,7 @@ mod tests {
 
     #[test]
     fn server_sequence_numbers_advance_with_traffic() {
-        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        let mut server = ServerSession::new(test_server_config());
         server
             .accept_banner("SSH-2.0-OpenSSH_9.8")
             .expect("banner should be accepted");
@@ -3487,20 +3531,35 @@ mod tests {
             .negotiate_with_client(&AlgorithmSet::secure_defaults())
             .expect("negotiation should succeed");
 
+        // KEXINIT: incoming=1, outgoing=1 (server produces KexInit reply)
         let reply = server
             .receive_message(test_kexinit([0x90; 16]))
             .expect("KEXINIT should succeed")
-            .expect("NEWKEYS expected");
-        assert_eq!(reply, TransportMessage::NewKeys);
+            .expect("KexInit reply expected");
+        assert!(matches!(reply, TransportMessage::KexInit { .. }));
         assert_eq!(server.incoming_sequence(), 1);
         assert_eq!(server.outgoing_sequence(), 1);
 
+        // KexEcdhInit: incoming=2, outgoing=2 (server produces KexEcdhReply)
+        let client_kp = Curve25519Sha256::generate_keypair(&mut OsRng);
+        let reply = server
+            .receive_message(TransportMessage::KexEcdhInit {
+                client_pubkey: client_kp.public_key.clone(),
+            })
+            .expect("KexEcdhInit should succeed")
+            .expect("KexEcdhReply expected");
+        assert!(matches!(reply, TransportMessage::KexEcdhReply { .. }));
+        assert_eq!(server.incoming_sequence(), 2);
+        assert_eq!(server.outgoing_sequence(), 2);
+
+        // NewKeys: incoming=3, outgoing stays 2 (no reply)
         server
             .receive_message(TransportMessage::NewKeys)
             .expect("client NEWKEYS should be accepted");
-        assert_eq!(server.incoming_sequence(), 2);
-        assert_eq!(server.outgoing_sequence(), 1);
+        assert_eq!(server.incoming_sequence(), 3);
+        assert_eq!(server.outgoing_sequence(), 2);
 
+        // ServiceRequest: incoming=4, outgoing=3 (produces ServiceAccept)
         let service_reply = server
             .receive_message(TransportMessage::ServiceRequest {
                 service: "ssh-userauth".to_string(),
@@ -3513,8 +3572,8 @@ mod tests {
                 service: "ssh-userauth".to_string()
             }
         );
-        assert_eq!(server.incoming_sequence(), 3);
-        assert_eq!(server.outgoing_sequence(), 2);
+        assert_eq!(server.incoming_sequence(), 4);
+        assert_eq!(server.outgoing_sequence(), 3);
     }
 
     #[test]
@@ -3541,21 +3600,9 @@ mod tests {
 
     #[test]
     fn server_keyboard_interactive_flow_completes_authentication() {
-        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        let mut server = ServerSession::new(test_server_config());
         server.activate_userauth(ServerAuthPolicy::secure_defaults());
-        server
-            .accept_banner("SSH-2.0-OpenSSH_9.8")
-            .expect("banner should be accepted");
-        server
-            .negotiate_with_client(&AlgorithmSet::secure_defaults())
-            .expect("negotiation should succeed");
-        let _newkeys = server
-            .receive_message(test_kexinit([0x94; 16]))
-            .expect("server should accept KEXINIT")
-            .expect("NEWKEYS response expected");
-        server
-            .receive_message(TransportMessage::NewKeys)
-            .expect("server should accept client NEWKEYS");
+        drive_server_past_kex(&mut server);
         let _service_accept = server
             .receive_message(TransportMessage::ServiceRequest {
                 service: "ssh-userauth".to_string(),
@@ -3598,21 +3645,9 @@ mod tests {
 
     #[test]
     fn server_keyboard_interactive_response_without_pending_request_errors() {
-        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        let mut server = ServerSession::new(test_server_config());
         server.activate_userauth(ServerAuthPolicy::secure_defaults());
-        server
-            .accept_banner("SSH-2.0-OpenSSH_9.8")
-            .expect("banner should be accepted");
-        server
-            .negotiate_with_client(&AlgorithmSet::secure_defaults())
-            .expect("negotiation should succeed");
-        let _newkeys = server
-            .receive_message(test_kexinit([0x95; 16]))
-            .expect("server should accept KEXINIT")
-            .expect("NEWKEYS response expected");
-        server
-            .receive_message(TransportMessage::NewKeys)
-            .expect("server should accept client NEWKEYS");
+        drive_server_past_kex(&mut server);
         let _service_accept = server
             .receive_message(TransportMessage::ServiceRequest {
                 service: "ssh-userauth".to_string(),
