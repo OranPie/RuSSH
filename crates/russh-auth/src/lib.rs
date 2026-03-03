@@ -128,6 +128,9 @@ pub struct ServerAuthPolicy {
     /// Certificate auth is always verified cryptographically (CA signature); this
     /// adds policy checks (trusted CA keys, required principal).
     pub certificate_validator: Option<CertificateValidator>,
+    /// If set, only public keys present in this store are accepted.
+    /// When `None`, any cryptographically valid key is accepted (insecure default).
+    pub authorized_keys: Option<MemoryAuthorizedKeys>,
 }
 
 impl ServerAuthPolicy {
@@ -146,12 +149,18 @@ impl ServerAuthPolicy {
             required_methods: BTreeSet::new(),
             max_attempts: 6,
             certificate_validator: None,
+            authorized_keys: None,
         }
     }
 
     /// Configure a certificate validator for cert-based publickey auth.
     pub fn set_certificate_validator(&mut self, v: CertificateValidator) {
         self.certificate_validator = Some(v);
+    }
+
+    /// Configure the authorized keys store for public-key auth.
+    pub fn set_authorized_keys(&mut self, keys: MemoryAuthorizedKeys) {
+        self.authorized_keys = Some(keys);
     }
 
     #[must_use]
@@ -592,7 +601,7 @@ pub struct KnownHostEntry {
 }
 
 /// In-memory authorized keys store keyed by user.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MemoryAuthorizedKeys {
     entries: BTreeMap<String, Vec<AuthorizedKeyEntry>>,
 }
@@ -1306,6 +1315,18 @@ impl AuthSession {
     #[must_use]
     pub fn certificate_validator(&self) -> Option<&CertificateValidator> {
         self.policy.certificate_validator.as_ref()
+    }
+
+    /// Returns `true` if the given public-key blob is authorized for `user`.
+    ///
+    /// When no authorized-keys store is configured, all cryptographically valid keys
+    /// are accepted (permissive mode). With a store configured, only listed keys pass.
+    #[must_use]
+    pub fn check_authorized_key(&self, user: &str, key_blob: &[u8]) -> bool {
+        match &self.policy.authorized_keys {
+            Some(store) => store.is_authorized(user, key_blob),
+            None => true,
+        }
     }
 
     #[must_use]

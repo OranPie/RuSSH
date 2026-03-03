@@ -1,7 +1,7 @@
 //! russh — SSH client binary.
 //!
 //! Usage:
-//!   russh [OPTIONS] [USER@]HOST COMMAND [ARGS...]
+//!   russh [OPTIONS] [USER@]HOST [COMMAND [ARGS...]]
 //!
 //! Options:
 //!   -p PORT          Remote port (default: 22)
@@ -17,13 +17,14 @@ use std::{
     process,
 };
 
+use crossterm::terminal;
 use russh_crypto::Ed25519Signer;
 use russh_net::{SshClient, SshClientConnection};
 use russh_transport::ClientConfig;
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: russh [OPTIONS] [USER@]HOST COMMAND [ARGS...]\n\
+        "Usage: russh [OPTIONS] [USER@]HOST [COMMAND [ARGS...]]\n\
          \n\
          Options:\n\
          \x20 -p PORT          Remote port (default: 22)\n\
@@ -43,6 +44,7 @@ struct Args {
     identity: Option<PathBuf>,
     jump: Option<String>,
     strict_host_key_checking: bool,
+    tofu: bool,
     command: Vec<String>,
 }
 
@@ -54,6 +56,7 @@ fn parse_args() -> Args {
     let mut identity: Option<PathBuf> = None;
     let mut jump: Option<String> = None;
     let mut strict = true;
+    let mut tofu = true;
     let mut command: Vec<String> = Vec::new();
     let mut collecting_cmd = false;
 
@@ -103,14 +106,13 @@ fn parse_args() -> Args {
                     i += 1;
                     argv.get(i).cloned().unwrap_or_default()
                 };
-                if opt
-                    .to_ascii_lowercase()
-                    .contains("stricthostkeychecking=no")
-                {
+                let opt_lower = opt.to_ascii_lowercase();
+                if opt_lower.contains("stricthostkeychecking=no") {
                     strict = false;
+                    tofu = false;
                 }
             }
-            _ => {} // ignore unknown options for compatibility
+            _ => {}
         }
         i += 1;
     }
@@ -135,6 +137,7 @@ fn parse_args() -> Args {
         identity,
         jump,
         strict_host_key_checking: strict,
+        tofu,
         command,
     }
 }
@@ -223,6 +226,18 @@ async fn main() {
             })
     };
 
+    // TOFU / known-hosts check.
+    if args.tofu {
+        if let Some(key_blob) = conn.server_host_key_blob() {
+            russh_cli::verify_or_trust_host_key(&args.host, args.port, key_blob).unwrap_or_else(
+                |e| {
+                    eprintln!("russh: {e}");
+                    process::exit(1);
+                },
+            );
+        }
+    }
+
     // Authenticate: try pubkey first, fall back to password.
     let authed = if let Some(ref p) = identity_path {
         let seed = load_seed(p);
@@ -244,9 +259,32 @@ async fn main() {
     }
 
     if args.command.is_empty() {
-        eprintln!("russh: interactive shell not supported — provide a command to execute");
+        // Interactive shell mode.
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
+        let (_local_id, remote_id) = conn
+            .open_shell(&term, cols as u32, rows as u32)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("russh: shell open failed: {e}");
+                process::exit(255);
+            });
+
+        terminal::enable_raw_mode().unwrap_or_else(|e| {
+            eprintln!("russh: enable raw mode failed: {e}");
+            process::exit(1);
+        });
+
+        let mut stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        let exit_code = conn
+            .run_shell_session(remote_id, &mut stdin, &mut stdout)
+            .await
+            .unwrap_or(0);
+
+        terminal::disable_raw_mode().ok();
         conn.disconnect().await.ok();
-        process::exit(1);
+        process::exit(exit_code as i32);
     }
 
     let cmd = args.command.join(" ");

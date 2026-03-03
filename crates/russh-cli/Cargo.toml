@@ -16,7 +16,9 @@ russh-core   = { path = "../russh-core" }
 russh-crypto = { path = "../russh-crypto" }
 russh-net    = { path = "../russh-net" }
 russh-transport = { path = "../russh-transport" }
+russh-auth   = { path = "../russh-auth" }
 tokio = { workspace = true }
+crossterm = "0.28"
 
 [[bin]]
 name = "russh"

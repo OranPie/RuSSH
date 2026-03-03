@@ -141,3 +141,104 @@ pub fn save_seed_file(path: &std::path::Path, seed: &[u8; 32]) -> Result<(), Str
     data.extend_from_slice(seed);
     std::fs::write(path, &data).map_err(|e| format!("write {}: {e}", path.display()))
 }
+
+/// The default known_hosts path: `~/.russh/known_hosts`.
+pub fn default_known_hosts_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home)
+        .join(".russh")
+        .join("known_hosts")
+}
+
+/// Verify or TOFU-trust the server host key.
+///
+/// - Parses `~/.russh/known_hosts` (created if missing).
+/// - If a matching entry is found, verifies the key matches.
+/// - If no entry exists, writes one (TOFU) and prints a notice.
+///
+/// Returns `Ok(())` on success, `Err(String)` if the key has changed.
+pub fn verify_or_trust_host_key(host: &str, port: u16, key_blob: &[u8]) -> Result<(), String> {
+    use russh_auth::parse_known_hosts;
+
+    let kh_path = default_known_hosts_path();
+    if let Some(parent) = kh_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let host_key = format_known_hosts_key(key_blob)?;
+    let host_pattern = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+
+    let existing = std::fs::read_to_string(&kh_path).unwrap_or_default();
+    let entries = parse_known_hosts(&existing).map_err(|e| format!("parse known_hosts: {e}"))?;
+
+    // Look for a matching host entry.
+    for entry in &entries {
+        let matches = entry
+            .host_patterns
+            .iter()
+            .any(|p| p == &host_pattern || p == host);
+        if matches {
+            // Verify key matches.
+            let stored = format_known_hosts_key(&entry.key)?;
+            if stored != host_key {
+                return Err(format!(
+                    "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n\
+                     Host key for '{host_pattern}' has changed.\n\
+                     Stored: {stored}\n\
+                     Got:    {host_key}"
+                ));
+            }
+            return Ok(());
+        }
+    }
+
+    // TOFU: no existing entry — trust and record.
+    eprintln!(
+        "The authenticity of host '{host_pattern}' can't be established.\n\
+         Ed25519 key fingerprint: {host_key}\n\
+         This key has been added to known_hosts."
+    );
+    let line = format!("{host_pattern} ssh-ed25519 {host_key}\n");
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&kh_path)
+        .map_err(|e| format!("open known_hosts: {e}"))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("write known_hosts: {e}"))?;
+    Ok(())
+}
+
+/// Format a raw key blob as the base64-encoded string used in known_hosts.
+fn format_known_hosts_key(key_blob: &[u8]) -> Result<String, String> {
+    Ok(base64_encode(key_blob))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2).div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}

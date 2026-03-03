@@ -661,6 +661,12 @@ impl SshClientConnection {
         })
     }
 
+    /// Returns the server's host public key blob (SSH wire format), available after KEX.
+    #[must_use]
+    pub fn server_host_key_blob(&self) -> Option<&[u8]> {
+        self.session.server_host_key_blob()
+    }
+
     /// Authenticate with a password.  Returns `Ok(())` on success.
     pub async fn authenticate_password(&mut self, password: &str) -> Result<(), RusshError> {
         let user = self.session.config.user.clone();
@@ -970,6 +976,146 @@ impl SshClientConnection {
         }
 
         Ok(result)
+    }
+
+    /// Open a session channel with a PTY request and interactive shell.
+    ///
+    /// Returns `(local_id, remote_id)` once the shell request is accepted.
+    /// Use [`run_shell_session`] to drive bidirectional I/O.
+    pub async fn open_shell(
+        &mut self,
+        term: &str,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(u32, u32), RusshError> {
+        let (local_id, open_msg) = self.channel_manager.open_channel(ChannelKind::Session);
+        self.stream.write_packet(&open_msg.to_frame()?).await?;
+
+        let remote_id = loop {
+            let frame = self.read_channel_packet().await?;
+            let ch = ChannelMessage::from_bytes(&frame.payload)?;
+            match &ch {
+                ChannelMessage::OpenConfirmation {
+                    recipient_channel,
+                    sender_channel,
+                    ..
+                } if *recipient_channel == local_id => {
+                    let rid = *sender_channel;
+                    self.channel_manager.accept_confirmation(local_id, &ch)?;
+                    break rid;
+                }
+                ChannelMessage::OpenFailure { .. } => {
+                    return Err(protocol_err("shell channel open rejected"));
+                }
+                _ => {}
+            }
+        };
+
+        // Request PTY.
+        let pty_req = ChannelMessage::Request {
+            recipient_channel: remote_id,
+            want_reply: true,
+            request: ChannelRequest::PtyReq {
+                term: term.to_owned(),
+                width_chars: cols,
+                height_rows: rows,
+                width_pixels: 0,
+                height_pixels: 0,
+                term_modes: vec![],
+            },
+        };
+        self.stream.write_packet(&pty_req.to_frame()?).await?;
+        loop {
+            let frame = self.read_channel_packet().await?;
+            let ch = ChannelMessage::from_bytes(&frame.payload)?;
+            match ch {
+                ChannelMessage::Success { .. } => break,
+                ChannelMessage::Failure { .. } => {
+                    return Err(protocol_err("pty-req rejected"));
+                }
+                _ => {}
+            }
+        }
+
+        // Request shell.
+        let shell_req = ChannelMessage::Request {
+            recipient_channel: remote_id,
+            want_reply: true,
+            request: ChannelRequest::Shell,
+        };
+        self.stream.write_packet(&shell_req.to_frame()?).await?;
+        loop {
+            let frame = self.read_channel_packet().await?;
+            let ch = ChannelMessage::from_bytes(&frame.payload)?;
+            match ch {
+                ChannelMessage::Success { .. } => break,
+                ChannelMessage::Failure { .. } => {
+                    return Err(protocol_err("shell request rejected"));
+                }
+                _ => {}
+            }
+        }
+
+        Ok((local_id, remote_id))
+    }
+
+    /// Drive an interactive shell session with bidirectional I/O.
+    ///
+    /// Reads raw bytes from `input` (e.g. stdin) and forwards to the channel;
+    /// data arriving on the channel is written to `output` (e.g. stdout).
+    /// Returns when the server sends EOF or CLOSE.
+    pub async fn run_shell_session(
+        &mut self,
+        remote_id: u32,
+        input: &mut (impl tokio::io::AsyncRead + Unpin),
+        output: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<u32, RusshError> {
+        let mut buf = vec![0u8; 4096];
+        let mut exit_code: u32 = 0;
+        loop {
+            tokio::select! {
+                // stdin → channel
+                n = input.read(&mut buf) => {
+                    let n = n.map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
+                    if n == 0 {
+                        let eof = ChannelMessage::Eof { recipient_channel: remote_id };
+                        let _ = self.stream.write_packet(&eof.to_frame()?).await;
+                        break;
+                    }
+                    let data_msg = ChannelMessage::Data {
+                        recipient_channel: remote_id,
+                        data: buf[..n].to_vec(),
+                    };
+                    self.stream.write_packet(&data_msg.to_frame()?).await?;
+                }
+                // channel → stdout
+                frame_res = self.stream.read_packet() => {
+                    let frame = frame_res?;
+                    let ch = ChannelMessage::from_bytes(&frame.payload)?;
+                    match ch {
+                        ChannelMessage::Data { data, .. } => {
+                            output.write_all(&data).await
+                                .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
+                            output.flush().await
+                                .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
+                        }
+                        ChannelMessage::ExtendedData { data, .. } => {
+                            output.write_all(&data).await
+                                .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
+                        }
+                        ChannelMessage::Request {
+                            request: ChannelRequest::ExitStatus { exit_status },
+                            ..
+                        } => {
+                            exit_code = exit_status;
+                        }
+                        ChannelMessage::Eof { .. } | ChannelMessage::Close { .. } => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(exit_code)
     }
 
     /// Open a session channel, request the `sftp` subsystem, and return an
@@ -1357,6 +1503,12 @@ pub trait SessionHandler: Send + Sync + 'static {
     /// Return the root directory where SCP files should be stored, or
     /// `None` to reject SCP transfers.
     fn scp_root(&self) -> Option<PathBuf>;
+
+    /// Return the shell executable path to use for interactive sessions,
+    /// or `None` to reject shell requests.
+    fn shell_command(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A [`SessionHandler`] that runs exec commands in a sandboxed environment
@@ -1559,6 +1711,7 @@ impl SshServerConnection {
                             scp_root: None,
                             sftp_server: None,
                             sftp_framer: SftpFramer::new(),
+                            pty_requested: false,
                         },
                     );
                     let confirm = ChannelMessage::OpenConfirmation {
@@ -1639,6 +1792,33 @@ impl SshServerConnection {
                                     };
                                     self.stream.write_packet(&fail.to_frame()?).await?;
                                 }
+                            }
+                        }
+
+                        ChannelRequest::PtyReq { .. } => {
+                            state.pty_requested = true;
+                            if want_reply {
+                                let ok = ChannelMessage::Success {
+                                    recipient_channel: client_ch,
+                                };
+                                self.stream.write_packet(&ok.to_frame()?).await?;
+                            }
+                        }
+
+                        ChannelRequest::Shell => {
+                            if let Some(shell) = handler.shell_command() {
+                                if want_reply {
+                                    let ok = ChannelMessage::Success {
+                                        recipient_channel: client_ch,
+                                    };
+                                    self.stream.write_packet(&ok.to_frame()?).await?;
+                                }
+                                self.run_shell_channel(client_ch, &shell).await?;
+                            } else if want_reply {
+                                let fail = ChannelMessage::Failure {
+                                    recipient_channel: client_ch,
+                                };
+                                self.stream.write_packet(&fail.to_frame()?).await?;
                             }
                         }
 
@@ -1753,6 +1933,109 @@ impl SshServerConnection {
         };
         self.stream.write_packet(&ack.to_frame()?).await
     }
+
+    /// Spawn `shell_exe` as a child process and bridge its stdin/stdout
+    /// bidirectionally with the SSH channel data stream.
+    async fn run_shell_channel(
+        &mut self,
+        client_ch: u32,
+        shell_exe: &str,
+    ) -> Result<(), RusshError> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        let mut child = Command::new(shell_exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
+
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| RusshError::new(RusshErrorCategory::Io, "no stdin"))?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| RusshError::new(RusshErrorCategory::Io, "no stdout"))?;
+        let child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| RusshError::new(RusshErrorCategory::Io, "no stderr"))?;
+
+        let mut stdout_reader = BufReader::new(child_stdout);
+        let mut stderr_reader = BufReader::new(child_stderr);
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+
+        loop {
+            tokio::select! {
+                // Data from SSH client → child stdin
+                frame_res = self.stream.read_packet() => {
+                    match frame_res {
+                        Err(_) => break,
+                        Ok(frame) => {
+                            match ChannelMessage::from_bytes(&frame.payload) {
+                                Ok(ChannelMessage::Data { data, .. }) => {
+                                    if child_stdin.write_all(&data).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Ok(ChannelMessage::Eof { .. }) | Ok(ChannelMessage::Close { .. }) => break,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                // Data from child stdout → SSH channel
+                n = stdout_reader.read_until(b'\n', &mut stdout_buf) => {
+                    if n.unwrap_or(0) == 0 { break; }
+                    let data = std::mem::take(&mut stdout_buf);
+                    let msg = ChannelMessage::Data { recipient_channel: client_ch, data };
+                    if self.stream.write_packet(&msg.to_frame()?).await.is_err() { break; }
+                }
+                // Data from child stderr → SSH channel (extended data type 1)
+                n = stderr_reader.read_until(b'\n', &mut stderr_buf) => {
+                    if n.unwrap_or(0) == 0 { break; }
+                    stderr_buf.clear();
+                }
+            }
+        }
+
+        let exit_code = child
+            .wait()
+            .await
+            .map(|s| s.code().unwrap_or(0) as u32)
+            .unwrap_or(0);
+        let exit_msg = ChannelMessage::Request {
+            recipient_channel: client_ch,
+            want_reply: false,
+            request: ChannelRequest::ExitStatus {
+                exit_status: exit_code,
+            },
+        };
+        let _ = self.stream.write_packet(&exit_msg.to_frame()?).await;
+        let _ = self
+            .stream
+            .write_packet(
+                &ChannelMessage::Eof {
+                    recipient_channel: client_ch,
+                }
+                .to_frame()?,
+            )
+            .await;
+        let _ = self
+            .stream
+            .write_packet(
+                &ChannelMessage::Close {
+                    recipient_channel: client_ch,
+                }
+                .to_frame()?,
+            )
+            .await;
+        Ok(())
+    }
 }
 
 // ── ServerChannelState ───────────────────────────────────────────────────────
@@ -1764,6 +2047,8 @@ struct ServerChannelState {
     sftp_server: Option<SftpFileServer>,
     /// Framer to reassemble SFTP packets across multiple DATA messages.
     sftp_framer: SftpFramer,
+    /// Whether the client has requested a PTY on this channel.
+    pty_requested: bool,
 }
 
 // ── SshServer ────────────────────────────────────────────────────────────────

@@ -722,6 +722,8 @@ pub struct ClientSession {
     session_keys: Option<SessionKeys>,
     local_version: String,
     remote_version: String,
+    /// Raw SSH wire-format blob of the server's host public key, stored after KEX.
+    server_host_key_blob: Option<Vec<u8>>,
 }
 
 impl ClientSession {
@@ -748,12 +750,19 @@ impl ClientSession {
             session_keys: None,
             local_version: String::new(),
             remote_version: String::new(),
+            server_host_key_blob: None,
         }
     }
 
     pub async fn handshake(&mut self, remote_version: &str) -> Result<(), RusshError> {
         self.handshake_with_peer(PeerDescription::openssh_like(remote_version))
             .await
+    }
+
+    /// Returns the server's host public key blob (SSH wire format), available after KEX.
+    #[must_use]
+    pub fn server_host_key_blob(&self) -> Option<&[u8]> {
+        self.server_host_key_blob.as_deref()
     }
 
     /// Override the local SSH version string used in the exchange hash.
@@ -1226,6 +1235,7 @@ impl ClientSession {
 
         self.session_keys = Some(keys.clone());
         self.kex_context = None;
+        self.server_host_key_blob = Some(server_host_key_blob.clone());
 
         let (host_key_alg, mac_c2s, mac_s2c, strict_kex, ext_info_c, ext_info_s) = self
             .negotiated
@@ -1993,6 +2003,19 @@ impl ServerSession {
                                 partial_success: false,
                             }));
                         }
+                    }
+                    // Check the key against the authorized-keys store (when configured).
+                    let key_authorized = self
+                        .auth_session
+                        .as_ref()
+                        .is_none_or(|s| s.check_authorized_key(&user, &public_key));
+                    if !key_authorized {
+                        let methods = self.allowed_userauth_methods();
+                        self.bump_outgoing_sequence();
+                        return Ok(Some(UserAuthMessage::Failure {
+                            methods,
+                            partial_success: false,
+                        }));
                     }
                     (
                         user.clone(),
