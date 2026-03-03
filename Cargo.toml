@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/russh-auth",
     "crates/russh-channel",
+    "crates/russh-cli",
     "crates/russh-config",
     "crates/russh-core",
     "crates/russh-crypto",
