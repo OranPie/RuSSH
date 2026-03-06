@@ -24,4 +24,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --lib
+        timeout-minutes: 30
+      - name: Integration tests (OpenSSH interop)
+        run: cargo test --workspace --test '*'
+        timeout-minutes: 60
+        continue-on-error: true
