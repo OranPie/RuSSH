@@ -2131,10 +2131,10 @@ impl SshServerConnection {
             #[cfg(not(unix))]
             {
                 let _ = (cols, rows, pty_term, env);
-                return Err(RusshError::new(
+                Err(RusshError::new(
                     RusshErrorCategory::Channel,
                     "PTY shell sessions are not supported on this platform",
-                ));
+                ))
             }
         } else {
             // No PTY: pipe-only mode for non-interactive exec.

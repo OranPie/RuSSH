@@ -710,7 +710,8 @@ mod interop_tests {
         };
 
         let addr = format!("127.0.0.1:{}", fixture.port);
-        let mut config = ClientConfig::secure_defaults("root");
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let mut config = ClientConfig::secure_defaults(&username);
         config.strict_host_key_checking = false;
 
         let mut conn = SshClientConnection::connect(&addr, config)
@@ -741,7 +742,8 @@ mod interop_tests {
         };
 
         let addr = format!("127.0.0.1:{}", fixture.port);
-        let mut config = ClientConfig::secure_defaults("root");
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let mut config = ClientConfig::secure_defaults(&username);
         config.strict_host_key_checking = false;
 
         let mut conn = SshClientConnection::connect(&addr, config)
