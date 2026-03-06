@@ -691,9 +691,10 @@ fn base64_standard(input: &[u8]) -> String {
 mod interop_tests {
     use super::{SshdFixture, base64_decode_standard, openssh_available};
     use russh_crypto::{RandomSource, Signer};
+    #[cfg(unix)]
+    use russh_net::SshAgentClient;
     use russh_net::{
-        DefaultSessionHandler, Ed25519Signer, SshAgentClient, SshClient, SshClientConnection,
-        SshServer,
+        DefaultSessionHandler, Ed25519Signer, SshClient, SshClientConnection, SshServer,
     };
     use russh_transport::{ClientConfig, ServerConfig};
     use tokio::task;
@@ -778,7 +779,7 @@ mod interop_tests {
             return;
         }
 
-        let tmp = std::env::temp_dir().join(format!("russh_openssh_exec_{}", std::process::id()));
+        let tmp = super::unique_temp_path("russh_openssh_exec");
         std::fs::create_dir_all(&tmp).ok();
         let client_key = tmp.join("id_ed25519");
         let ok = std::process::Command::new("ssh-keygen")
@@ -860,7 +861,7 @@ mod interop_tests {
             return;
         }
 
-        let tmp = std::env::temp_dir().join(format!("russh_openssh_sftp_{}", std::process::id()));
+        let tmp = super::unique_temp_path("russh_openssh_sftp");
         std::fs::create_dir_all(&tmp).ok();
         let client_key = tmp.join("id_ed25519");
         let ok = std::process::Command::new("ssh-keygen")
@@ -980,7 +981,7 @@ mod interop_tests {
             return;
         }
 
-        let tmp = std::env::temp_dir().join(format!("russh_cert_auth_{}", std::process::id()));
+        let tmp = super::unique_temp_path("russh_cert_auth");
         std::fs::create_dir_all(&tmp).ok();
 
         // Generate CA key.
@@ -1168,7 +1169,7 @@ mod interop_tests {
             return;
         }
 
-        let tmp = std::env::temp_dir().join(format!("russh_russh_cert_{}", std::process::id()));
+        let tmp = super::unique_temp_path("russh_russh_cert");
         std::fs::create_dir_all(&tmp).ok();
 
         // Generate CA key.
@@ -1320,6 +1321,7 @@ mod interop_tests {
     /// 2. Generate a user key and add it with `ssh-add`.
     /// 3. Spawn sshd with the user's public key in `authorized_keys`.
     /// 4. Authenticate via `SshAgentClient::from_env()` + `authenticate_via_agent`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn russh_agent_auth_against_openssh_sshd() {
         if !openssh_available() {
@@ -1332,7 +1334,7 @@ mod interop_tests {
             return;
         }
 
-        let tmp = std::env::temp_dir().join(format!("russh_agent_auth_{}", std::process::id()));
+        let tmp = super::unique_temp_path("russh_agent_auth");
         std::fs::create_dir_all(&tmp).ok();
 
         // Generate user key.
@@ -1450,7 +1452,7 @@ mod interop_tests {
 
         // Spawn the target sshd with the same key.
         // Reuse the jump fixture's user key by writing it as a .pub file for the target sshd.
-        let tmp_pub = std::env::temp_dir().join(format!("russh_pj_pub_{}.pub", std::process::id()));
+        let tmp_pub = super::unique_temp_path("russh_pj_pub").with_extension("pub");
         {
             let signer_tmp = Ed25519Signer::from_seed(&jump_fixture.user_key_seed);
             let pub_line = format!(
@@ -1504,9 +1506,7 @@ mod interop_tests {
         conn.disconnect().await.ok();
 
         // Clean up temp pub file.
-        let _ = std::fs::remove_file(
-            std::env::temp_dir().join(format!("russh_pj_pub_{}.pub", std::process::id())),
-        );
+        let _ = std::fs::remove_file(&tmp_pub);
     }
 }
 
