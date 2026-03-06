@@ -40,12 +40,12 @@ pub use agent::SshAgentClient;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, trace, warn};
 
+#[cfg(unix)]
+use russh_auth::AgentClient;
 use russh_auth::{
     ServerAuthPolicy, UserAuthMessage, UserAuthRequest, build_ed25519_signature_blob,
     build_userauth_signing_payload,
 };
-#[cfg(unix)]
-use russh_auth::AgentClient;
 use russh_channel::{ChannelKind, ChannelManager, ChannelMessage, ChannelRequest, ForwardHandle};
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{AeadCipher, Aes256GcmCipher, Signer};
