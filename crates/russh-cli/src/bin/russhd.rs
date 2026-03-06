@@ -220,11 +220,11 @@ async fn main() {
 
     // Initialize tracing subscriber so russh-net tracing macros emit to stderr.
     let tracing_level = match log_level {
-        VerboseLevel::Quiet  => tracing::Level::ERROR,
+        VerboseLevel::Quiet => tracing::Level::ERROR,
         VerboseLevel::Normal => tracing::Level::WARN,
         VerboseLevel::Verbose => tracing::Level::INFO,
-        VerboseLevel::Debug  => tracing::Level::DEBUG,
-        VerboseLevel::Trace  => tracing::Level::TRACE,
+        VerboseLevel::Debug => tracing::Level::DEBUG,
+        VerboseLevel::Trace => tracing::Level::TRACE,
     };
     tracing_subscriber::fmt()
         .with_max_level(tracing_level)

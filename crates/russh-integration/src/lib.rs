@@ -646,10 +646,14 @@ fn which_on_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn set_permissions_600(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
+
+#[cfg(not(unix))]
+fn set_permissions_600(_path: &std::path::Path) {}
 
 /// Standard (RFC 4648) base64 encode without line wrapping.
 fn base64_standard(input: &[u8]) -> String {

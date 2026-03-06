@@ -21,6 +21,7 @@ russh-sftp    = { path = "../russh-sftp" }
 russh-transport = { path = "../russh-transport" }
 tokio.workspace = true
 tracing.workspace = true
-nix = { version = "0.29", features = ["process", "fs", "term"] }
+
+[target.'cfg(unix)'.dependencies]
 pty-process = { version = "0.4", features = ["async"] }
 
