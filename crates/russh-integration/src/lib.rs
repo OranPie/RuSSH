@@ -295,6 +295,17 @@ fn remove_path_if_exists(path: &Path) {
     }
 }
 
+#[cfg(test)]
+async fn interop_test_guard() -> tokio::sync::OwnedSemaphorePermit {
+    static LOCK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("interop test semaphore closed")
+}
+
 fn futures_block_on<T>(future: impl std::future::Future<Output = T>) -> T {
     use std::pin::Pin;
     use std::task::{Context, Poll, Waker};
@@ -688,6 +699,7 @@ fn base64_standard(input: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod interop_tests {
     use super::{SshdFixture, base64_decode_standard, openssh_available};
     use russh_crypto::{RandomSource, Signer};
@@ -702,6 +714,7 @@ mod interop_tests {
     /// RuSSH client executes a command on a real OpenSSH sshd.
     #[tokio::test]
     async fn russh_client_exec_against_openssh_sshd() {
+        let _guard = super::interop_test_guard().await;
         if !openssh_available() {
             return;
         }
@@ -734,6 +747,7 @@ mod interop_tests {
     /// RuSSH client performs SFTP upload + read-back against a real OpenSSH sshd.
     #[tokio::test]
     async fn russh_client_sftp_against_openssh_sshd() {
+        let _guard = super::interop_test_guard().await;
         if !openssh_available() {
             return;
         }
@@ -775,6 +789,7 @@ mod interop_tests {
     /// A real OpenSSH `ssh` client executes a command on a RuSSH server.
     #[tokio::test]
     async fn openssh_ssh_exec_against_russh_server() {
+        let _guard = super::interop_test_guard().await;
         if !openssh_available() {
             return;
         }
@@ -857,6 +872,7 @@ mod interop_tests {
     /// A real OpenSSH `sftp` client uploads a file to a RuSSH SFTP server.
     #[tokio::test]
     async fn openssh_sftp_against_russh_server() {
+        let _guard = super::interop_test_guard().await;
         if !openssh_available() {
             return;
         }
@@ -977,6 +993,7 @@ mod interop_tests {
     /// 5. Authenticate with `authenticate_pubkey_with_cert`.
     #[tokio::test]
     async fn russh_cert_auth_against_openssh_sshd() {
+        let _guard = super::interop_test_guard().await;
         if !openssh_available() {
             return;
         }
@@ -1165,6 +1182,7 @@ mod interop_tests {
     /// RuSSH validates the CA signature and accepts the connection.
     #[tokio::test]
     async fn openssh_cert_auth_against_russh_server() {
+        let _guard = super::interop_test_guard().await;
         if !openssh_available() {
             return;
         }
@@ -1324,6 +1342,7 @@ mod interop_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn russh_agent_auth_against_openssh_sshd() {
+        let _guard = super::interop_test_guard().await;
         if !openssh_available() {
             return;
         }
@@ -1440,6 +1459,7 @@ mod interop_tests {
     /// the target through the jump host using `SshClient::connect_via_jump`.
     #[tokio::test]
     async fn russh_proxyjump_through_openssh_sshd() {
+        let _guard = super::interop_test_guard().await;
         if !openssh_available() {
             return;
         }
