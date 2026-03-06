@@ -17,6 +17,7 @@
 //!
 //! These helpers form the foundation for future interoperability test suites
 //! that spawn real OpenSSH client/server processes against RuSSH endpoints.
+#![cfg_attr(not(unix), allow(clippy::items_after_test_module))]
 
 use std::future::ready;
 use std::path::{Path, PathBuf};
@@ -524,7 +525,7 @@ impl SshdFixture {
              PermitRootLogin yes\n\
              AllowUsers {user}\n\
              LogLevel ERROR\n\
-             Subsystem sftp /usr/lib/openssh/sftp-server\n",
+             Subsystem sftp internal-sftp\n",
             host_key = host_key_path.display(),
             auth_keys = auth_keys_path.display(),
             user = std::env::var("USER").unwrap_or_else(|_| "root".into()),
@@ -847,6 +848,8 @@ mod interop_tests {
                     "BatchMode=yes",
                     "-o",
                     "PreferredAuthentications=publickey",
+                    "-o",
+                    "IdentitiesOnly=yes",
                     "-p",
                     &port_str,
                     "127.0.0.1",
@@ -946,6 +949,8 @@ mod interop_tests {
                         "BatchMode=yes",
                         "-o",
                         "PreferredAuthentications=publickey",
+                        "-o",
+                        "IdentitiesOnly=yes",
                         "-P",
                         &port_str,
                         "-b",
@@ -1310,6 +1315,8 @@ mod interop_tests {
                     "BatchMode=yes",
                     "-o",
                     "PreferredAuthentications=publickey",
+                    "-o",
+                    "IdentitiesOnly=yes",
                     "-p",
                     &port_str,
                     "127.0.0.1",
