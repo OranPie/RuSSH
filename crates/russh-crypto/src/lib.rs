@@ -34,12 +34,9 @@
 //! # Example
 //!
 //! ```rust
-//! use russh_crypto::{OsRng, HashAlgorithm, Sha256};
+//! use russh_crypto::{HashAlgorithm, Sha256};
 //!
-//! let mut rng = OsRng;
-//! let mut hash = Sha256::new();
-//! hash.update(b"hello");
-//! let digest = hash.finalize();
+//! let digest = Sha256::digest(b"hello");
 //! assert_eq!(digest.len(), 32);
 //! ```
 
@@ -330,9 +327,9 @@ impl MacAlgorithm for HmacSha512 {
 // ============================================================
 
 use aes_gcm::{
-    Aes128Gcm, Aes256Gcm, KeyInit,
     aead::generic_array::GenericArray,
     aead::{Aead, Payload},
+    Aes128Gcm, Aes256Gcm, KeyInit,
 };
 use chacha20poly1305::ChaCha20Poly1305;
 

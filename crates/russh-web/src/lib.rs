@@ -134,7 +134,7 @@ async fn handle_socket(mut socket: WebSocket, log: Arc<StderrLogger>) {
     );
 
     // Phase 4: open interactive shell.
-    let (_local_id, remote_id) = match conn.open_shell("xterm-256color", 80, 24).await {
+    let (local_id, remote_id) = match conn.open_shell("xterm-256color", 80, 24).await {
         Ok(ids) => ids,
         Err(e) => {
             send_error(&mut socket, &format!("shell failed: {e}")).await;
@@ -199,7 +199,7 @@ async fn handle_socket(mut socket: WebSocket, log: Arc<StderrLogger>) {
     let mut output = ChannelWriter::new(ssh_tx);
 
     let exit_code = conn
-        .run_shell_session(remote_id, &mut input, &mut output)
+        .run_shell_session(local_id, remote_id, &mut input, &mut output)
         .await
         .unwrap_or(0);
 

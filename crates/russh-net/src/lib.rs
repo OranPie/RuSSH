@@ -37,7 +37,7 @@ mod agent;
 #[cfg(unix)]
 pub use agent::SshAgentClient;
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, trace, warn};
 
 #[cfg(unix)]
@@ -84,6 +84,61 @@ fn io_err(e: std::io::Error) -> RusshError {
 
 fn protocol_err(msg: impl Into<String>) -> RusshError {
     RusshError::new(RusshErrorCategory::Protocol, msg)
+}
+
+fn resolve_scp_target_path(root: &Path, filename: &str) -> Result<PathBuf, RusshError> {
+    let mut sanitized = PathBuf::new();
+    for component in Path::new(filename).components() {
+        match component {
+            Component::Normal(part) => sanitized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(protocol_err(format!(
+                    "scp target path {:?} escapes SCP root",
+                    filename
+                )));
+            }
+        }
+    }
+    Ok(root.join(sanitized))
+}
+
+fn scp_status_data(code: u8, message: &str) -> Vec<u8> {
+    let mut data = Vec::with_capacity(message.len() + 2);
+    data.push(code);
+    data.extend_from_slice(message.as_bytes());
+    data.push(b'\n');
+    data
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_u32(out, bytes.len() as u32);
+    out.extend_from_slice(bytes);
+}
+
+fn channel_data_frame(recipient_channel: u32, data: &[u8]) -> PacketFrame {
+    let mut payload = Vec::with_capacity(1 + 4 + 4 + data.len());
+    payload.push(94);
+    write_u32(&mut payload, recipient_channel);
+    write_bytes(&mut payload, data);
+    PacketFrame::new(payload)
+}
+
+fn channel_extended_data_frame(
+    recipient_channel: u32,
+    data_type_code: u32,
+    data: &[u8],
+) -> PacketFrame {
+    let mut payload = Vec::with_capacity(1 + 4 + 4 + 4 + data.len());
+    payload.push(95);
+    write_u32(&mut payload, recipient_channel);
+    write_u32(&mut payload, data_type_code);
+    write_bytes(&mut payload, data);
+    PacketFrame::new(payload)
 }
 
 // ── DirectionalCipher ────────────────────────────────────────────────────────
@@ -1104,6 +1159,7 @@ impl SshClientConnection {
     /// Returns when the server sends EOF or CLOSE.
     pub async fn run_shell_session(
         &mut self,
+        local_id: u32,
         remote_id: u32,
         input: &mut (impl tokio::io::AsyncRead + Unpin),
         output: &mut (impl tokio::io::AsyncWrite + Unpin),
@@ -1111,49 +1167,58 @@ impl SshClientConnection {
         debug!(remote_id, "starting shell session I/O loop");
         let mut buf = vec![0u8; 4096];
         let mut exit_code: u32 = 0;
+        let mut input_open = true;
         loop {
             tokio::select! {
                 // stdin → channel
-                n = input.read(&mut buf) => {
+                n = input.read(&mut buf), if input_open => {
                     let n = n.map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
                     if n == 0 {
                         let eof = ChannelMessage::Eof { recipient_channel: remote_id };
-                        let _ = self.stream.write_packet(&eof.to_frame()?).await;
-                        break;
+                        self.stream.write_packet(&eof.to_frame()?).await?;
+                        input_open = false;
+                        continue;
                     }
-                    let data_msg = ChannelMessage::Data {
-                        recipient_channel: remote_id,
-                        data: buf[..n].to_vec(),
-                    };
-                    self.stream.write_packet(&data_msg.to_frame()?).await?;
+                    let frame = channel_data_frame(remote_id, &buf[..n]);
+                    self.stream.write_packet(&frame).await?;
                 }
                 // channel → stdout
                 frame_res = self.stream.read_packet() => {
                     let frame = frame_res?;
                     let ch = ChannelMessage::from_bytes(&frame.payload)?;
+                    let responses = self.channel_manager.process(&ch)?;
+                    for response in responses {
+                        self.stream.write_packet(&response.to_frame()?).await?;
+                    }
                     match ch {
-                        ChannelMessage::Data { data, .. } => {
+                        ChannelMessage::Data {
+                            recipient_channel,
+                            data,
+                        } if recipient_channel == local_id => {
                             output.write_all(&data).await
                                 .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
-                            output.flush().await
-                                .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
                         }
-                        ChannelMessage::ExtendedData { data, .. } => {
+                        ChannelMessage::ExtendedData {
+                            recipient_channel,
+                            data,
+                            ..
+                        } if recipient_channel == local_id => {
                             output.write_all(&data).await
                                 .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
                         }
                         ChannelMessage::Request {
+                            recipient_channel,
                             request: ChannelRequest::ExitStatus { exit_status },
                             ..
-                        } => {
+                        } if recipient_channel == local_id => {
                             debug!(exit_status, "received exit-status");
                             exit_code = exit_status;
                         }
-                        ChannelMessage::Eof { .. } => {
+                        ChannelMessage::Eof { recipient_channel } if recipient_channel == local_id => {
                             debug!("received EOF from server");
                             break;
                         }
-                        ChannelMessage::Close { .. } => {
+                        ChannelMessage::Close { recipient_channel } if recipient_channel == local_id => {
                             debug!("received Close from server");
                             break;
                         }
@@ -1162,6 +1227,8 @@ impl SshClientConnection {
                 }
             }
         }
+        output.flush().await
+            .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
         info!(exit_code, "shell session ended");
         Ok(exit_code)
     }
@@ -1498,11 +1565,7 @@ async fn channel_bridge(
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
-                let msg = ChannelMessage::Data {
-                    recipient_channel: remote_id,
-                    data: read_buf[..n].to_vec(),
-                };
-                let Ok(frame) = msg.to_frame() else { break };
+                let frame = channel_data_frame(remote_id, &read_buf[..n]);
                 if jump.stream.write_packet(&frame).await.is_err() {
                     break;
                 }
@@ -2082,6 +2145,7 @@ impl SshServerConnection {
         if data.is_empty() {
             return Ok(());
         }
+        let mut response = vec![0x00];
         if data[0] == b'C' {
             if let Ok(s) = std::str::from_utf8(data) {
                 let header_end = s.find('\n').unwrap_or(s.len());
@@ -2093,19 +2157,37 @@ impl SshServerConnection {
                     let file_data_start = header_end + 1;
                     if file_data_start + size <= data.len() {
                         let file_bytes = &data[file_data_start..file_data_start + size];
-                        let dest = root.join(filename);
-                        if let Some(parent) = dest.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                        match resolve_scp_target_path(root, filename) {
+                            Ok(dest) => {
+                                let write_result = if let Some(parent) = dest.parent() {
+                                    std::fs::create_dir_all(parent)
+                                        .and_then(|_| std::fs::write(&dest, file_bytes))
+                                } else {
+                                    std::fs::write(&dest, file_bytes)
+                                };
+                                if let Err(error) = write_result {
+                                    response =
+                                        scp_status_data(0x01, &format!("scp write failed: {error}"));
+                                }
+                            }
+                            Err(error) => {
+                                response = scp_status_data(0x01, error.message());
+                            }
                         }
-                        let _ = std::fs::write(&dest, file_bytes);
+                    } else {
+                        response = scp_status_data(0x01, "scp payload shorter than declared size");
                     }
+                } else {
+                    response = scp_status_data(0x01, "invalid scp header");
                 }
+            } else {
+                response = scp_status_data(0x01, "invalid utf-8 in scp header");
             }
         }
-        // Send ACK.
+        // Send ACK or error status.
         let ack = ChannelMessage::Data {
             recipient_channel: client_ch,
-            data: vec![0x00],
+            data: response,
         };
         self.stream.write_packet(&ack.to_frame()?).await
     }
@@ -2149,10 +2231,12 @@ impl SshServerConnection {
                 .spawn()
                 .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
 
-            let mut child_stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| RusshError::new(RusshErrorCategory::Io, "no stdin"))?;
+            let mut child_stdin = Some(
+                child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| RusshError::new(RusshErrorCategory::Io, "no stdin"))?,
+            );
             let child_stdout = child
                 .stdout
                 .take()
@@ -2166,46 +2250,78 @@ impl SshServerConnection {
             let mut stderr_reader = tokio::io::BufReader::new(child_stderr);
             let mut buf = vec![0u8; 4096];
             let mut stderr_buf = vec![0u8; 4096];
+            let mut channel_open = true;
+            let mut stdout_open = true;
+            let mut stderr_open = true;
+            let mut exit_code = None;
 
-            loop {
+            while stdout_open || stderr_open || exit_code.is_none() {
                 tokio::select! {
-                    frame_res = self.stream.read_packet() => {
+                    frame_res = self.stream.read_packet(), if channel_open => {
                         match frame_res {
-                            Err(_) => break,
+                            Err(_) => {
+                                channel_open = false;
+                                child_stdin.take();
+                            }
                             Ok(frame) => {
                                 match ChannelMessage::from_bytes(&frame.payload) {
                                     Ok(ChannelMessage::Data { data, .. }) => {
-                                        if child_stdin.write_all(&data).await.is_err() {
-                                            break;
+                                        if let Some(stdin) = child_stdin.as_mut() {
+                                            if stdin.write_all(&data).await.is_err() {
+                                                child_stdin.take();
+                                            }
                                         }
                                     }
-                                    Ok(ChannelMessage::Eof { .. }) | Ok(ChannelMessage::Close { .. }) => break,
+                                    Ok(ChannelMessage::Eof { .. }) | Ok(ChannelMessage::Close { .. }) => {
+                                        channel_open = false;
+                                        child_stdin.take();
+                                    }
                                     _ => {}
                                 }
                             }
                         }
                     }
-                    n = stdout_reader.read(&mut buf) => {
+                    n = stdout_reader.read(&mut buf), if stdout_open => {
                         let n = n.unwrap_or(0);
-                        if n == 0 { break; }
-                        let msg = ChannelMessage::Data { recipient_channel: client_ch, data: buf[..n].to_vec() };
-                        if self.stream.write_packet(&msg.to_frame()?).await.is_err() { break; }
+                        if n == 0 {
+                            stdout_open = false;
+                            continue;
+                        }
+                        let frame = channel_data_frame(client_ch, &buf[..n]);
+                        if self.stream.write_packet(&frame).await.is_err() { break; }
                     }
-                    n = stderr_reader.read(&mut stderr_buf) => {
+                    n = stderr_reader.read(&mut stderr_buf), if stderr_open => {
                         let n = n.unwrap_or(0);
-                        if n == 0 { break; }
+                        if n == 0 {
+                            stderr_open = false;
+                            continue;
+                        }
                         // Send stderr as extended data type 1.
-                        let msg = ChannelMessage::ExtendedData { recipient_channel: client_ch, data_type_code: 1, data: stderr_buf[..n].to_vec() };
-                        if self.stream.write_packet(&msg.to_frame()?).await.is_err() { break; }
+                        let frame = channel_extended_data_frame(client_ch, 1, &stderr_buf[..n]);
+                        if self.stream.write_packet(&frame).await.is_err() { break; }
+                    }
+                    status = child.wait(), if exit_code.is_none() => {
+                        exit_code = Some(status.map(|s| s.code().unwrap_or(0) as u32).unwrap_or(0));
+                        child_stdin.take();
                     }
                 }
             }
 
-            let exit_code = child
-                .wait()
-                .await
-                .map(|s| s.code().unwrap_or(0) as u32)
-                .unwrap_or(0);
+            let exit_code = if let Some(code) = exit_code {
+                code
+            } else {
+                child_stdin.take();
+                match tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await {
+                    Ok(status) => status.map(|s| s.code().unwrap_or(0) as u32).unwrap_or(0),
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        match tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await {
+                            Ok(status) => status.map(|s| s.code().unwrap_or(0) as u32).unwrap_or(0),
+                            Err(_) => 0,
+                        }
+                    }
+                }
+            };
             info!(exit_code, "shell (no-pty) exited");
             let _ = self
                 .stream
@@ -2278,13 +2394,17 @@ impl SshServerConnection {
         // Re-create to own: use the already-moved pty.
         let (mut pty_read, mut pty_write) = tokio::io::split(pty);
         let mut pty_buf = vec![0u8; 4096];
+        let mut client_open = true;
 
         loop {
             tokio::select! {
                 // Data from SSH client → PTY (→ shell stdin).
-                frame_res = self.stream.read_packet() => {
+                frame_res = self.stream.read_packet(), if client_open => {
                     match frame_res {
-                        Err(_) => break,
+                        Err(_) => {
+                            client_open = false;
+                            let _ = pty_write.shutdown().await;
+                        }
                         Ok(frame) => match ChannelMessage::from_bytes(&frame.payload) {
                             Ok(ChannelMessage::Data { data, .. }) => {
                                 trace!(bytes = data.len(), "client→PTY");
@@ -2303,7 +2423,10 @@ impl SshServerConnection {
                                 pty_read = r;
                                 pty_write = w;
                             }
-                            Ok(ChannelMessage::Eof { .. }) | Ok(ChannelMessage::Close { .. }) => break,
+                            Ok(ChannelMessage::Eof { .. }) | Ok(ChannelMessage::Close { .. }) => {
+                                client_open = false;
+                                let _ = pty_write.shutdown().await;
+                            }
                             _ => {}
                         },
                     }
@@ -2315,11 +2438,8 @@ impl SshServerConnection {
                         Ok(n) => n,
                     };
                     trace!(bytes = n, "PTY→client");
-                    let msg = ChannelMessage::Data {
-                        recipient_channel: client_ch,
-                        data: pty_buf[..n].to_vec(),
-                    };
-                    if self.stream.write_packet(&msg.to_frame()?).await.is_err() {
+                    let frame = channel_data_frame(client_ch, &pty_buf[..n]);
+                    if self.stream.write_packet(&frame).await.is_err() {
                         break;
                     }
                 }
@@ -2334,11 +2454,8 @@ impl SshServerConnection {
                         match tokio::time::timeout_at(drain_deadline, pty_read.read(&mut pty_buf)).await {
                             Ok(Ok(n)) if n > 0 => {
                                 trace!(bytes = n, "PTY drain→client");
-                                let msg = ChannelMessage::Data {
-                                    recipient_channel: client_ch,
-                                    data: pty_buf[..n].to_vec(),
-                                };
-                                let _ = self.stream.write_packet(&msg.to_frame()?).await;
+                                let frame = channel_data_frame(client_ch, &pty_buf[..n]);
+                                let _ = self.stream.write_packet(&frame).await;
                             }
                             _ => break,
                         }
@@ -2540,5 +2657,21 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&root_for_assert);
+    }
+
+    #[test]
+    fn scp_target_path_rejects_traversal() {
+        let root = PathBuf::from("/tmp/russh_scp_root");
+        let error = resolve_scp_target_path(&root, "../escape.txt")
+            .expect_err("traversal should be rejected");
+        assert_eq!(error.category(), RusshErrorCategory::Protocol);
+    }
+
+    #[test]
+    fn scp_target_path_allows_nested_relative_paths() {
+        let root = PathBuf::from("/tmp/russh_scp_root");
+        let path = resolve_scp_target_path(&root, "nested/file.txt")
+            .expect("nested path should be accepted");
+        assert_eq!(path, root.join("nested/file.txt"));
     }
 }

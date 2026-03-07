@@ -533,16 +533,13 @@ impl SshdFixture {
         std::fs::write(&config_path, config_text).ok()?;
 
         // Spawn sshd in foreground mode.
-        let child = Command::new(&sshd_path)
+        let mut child = Command::new(&sshd_path)
             .args(["-D", "-f", config_path.to_str()?])
             .spawn()
             .ok()?;
 
         // Wait up to 3 s for the port to accept connections.
-        let ready = (0..30).any(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-        });
+        let ready = wait_for_tcp_ready(port, Some(&mut child), std::time::Duration::from_secs(3));
         if !ready {
             return None;
         }
@@ -616,15 +613,12 @@ impl SshdFixture {
         );
         std::fs::write(&config_path, config_text).ok()?;
 
-        let child = Command::new(&sshd_path)
+        let mut child = Command::new(&sshd_path)
             .args(["-D", "-f", config_path.to_str()?])
             .spawn()
             .ok()?;
 
-        let ready = (0..30).any(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-        });
+        let ready = wait_for_tcp_ready(port, Some(&mut child), std::time::Duration::from_secs(3));
         if !ready {
             return None;
         }
@@ -650,6 +644,26 @@ fn free_port() -> Option<u16> {
     let port = listener.local_addr().ok()?.port();
     drop(listener);
     Some(port)
+}
+
+fn wait_for_tcp_ready(
+    port: u16,
+    mut child: Option<&mut Child>,
+    timeout: std::time::Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        if let Some(proc) = child.as_mut() {
+            if proc.try_wait().ok().flatten().is_some() {
+                return false;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    false
 }
 
 fn which_on_path(name: &str) -> bool {
@@ -837,7 +851,7 @@ mod interop_tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::task::yield_now().await;
 
         let client_key_str = client_key.to_str().unwrap().to_owned();
         let port_str = port.to_string();
@@ -934,7 +948,7 @@ mod interop_tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::task::yield_now().await;
 
         // `sftp -b batch_file` uploads using the batch command `put local remote`.
         let batch_cmds = format!("put {} /upload.txt\n", local_file.display());
@@ -1153,10 +1167,7 @@ mod interop_tests {
         };
 
         // Wait for sshd to be ready.
-        let ready = (0..30).any(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-        });
+        let ready = super::wait_for_tcp_ready(port, Some(&mut sshd), std::time::Duration::from_secs(3));
         if !ready {
             let _ = sshd.kill();
             let _ = std::fs::remove_dir_all(&tmp);
@@ -1309,7 +1320,7 @@ mod interop_tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::task::yield_now().await;
 
         let user_key_str = user_key_path.to_str().unwrap().to_owned();
         let cert_str = cert_path.to_str().unwrap().to_owned();

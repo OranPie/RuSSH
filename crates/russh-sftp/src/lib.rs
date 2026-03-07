@@ -1136,6 +1136,15 @@ impl SftpFileServer {
         }
     }
 
+    fn canonical_root(&self) -> Result<PathBuf, RusshError> {
+        fs::canonicalize(&self.root).map_err(|error| {
+            RusshError::new(
+                RusshErrorCategory::Io,
+                format!("failed to canonicalize SFTP root {:?}: {error}", self.root),
+            )
+        })
+    }
+
     fn alloc_handle(&mut self) -> Vec<u8> {
         let n = self.next_handle;
         self.next_handle = self.next_handle.wrapping_add(1);
@@ -1159,6 +1168,86 @@ impl SftpFileServer {
             }
         }
         Ok(self.root.join(sanitized))
+    }
+
+    fn validate_within_root(
+        &self,
+        path: &Path,
+        allow_missing_leaf: bool,
+    ) -> Result<(), RusshError> {
+        let canonical_root = self.canonical_root()?;
+        let mut current = if allow_missing_leaf && !path.exists() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+
+        loop {
+            match fs::canonicalize(current) {
+                Ok(resolved) => {
+                    if resolved.starts_with(&canonical_root) {
+                        return Ok(());
+                    }
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Protocol,
+                        format!("path {:?} escapes SFTP root", path),
+                    ));
+                }
+                Err(_) if allow_missing_leaf => {
+                    if let Some(parent) = current.parent() {
+                        current = parent;
+                        continue;
+                    }
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Protocol,
+                        format!("path {:?} escapes SFTP root", path),
+                    ));
+                }
+                Err(error) => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Io,
+                        format!("failed to resolve SFTP path {:?}: {error}", path),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn resolve_path_checked(
+        &self,
+        path: &str,
+        allow_missing_leaf: bool,
+    ) -> Result<PathBuf, RusshError> {
+        let full_path = self.resolve_path(path)?;
+        self.validate_within_root(&full_path, allow_missing_leaf)?;
+        Ok(full_path)
+    }
+
+    fn display_path(&self, path: &Path) -> Result<String, RusshError> {
+        let canonical_root = self.canonical_root()?;
+        let resolved = fs::canonicalize(path).map_err(|error| {
+            RusshError::new(
+                RusshErrorCategory::Io,
+                format!("failed to canonicalize SFTP path {:?}: {error}", path),
+            )
+        })?;
+        if !resolved.starts_with(&canonical_root) {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                format!("path {:?} escapes SFTP root", path),
+            ));
+        }
+        let relative = resolved.strip_prefix(&canonical_root).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                format!("path {:?} escapes SFTP root", path),
+            )
+        })?;
+        if relative.as_os_str().is_empty() {
+            Ok("/".to_string())
+        } else {
+            Ok(format!("/{}", relative.display()))
+        }
     }
 
     fn io_status(e: &std::io::Error) -> SftpStatus {
@@ -1197,7 +1286,7 @@ impl SftpFileServer {
                 ..
             } => {
                 let id = *id;
-                let full_path = match self.resolve_path(filename) {
+                let full_path = match self.resolve_path_checked(filename, true) {
                     Err(_) => {
                         return Ok(SftpWirePacket::Status {
                             id,
@@ -1304,7 +1393,7 @@ impl SftpFileServer {
 
             SftpWirePacket::Stat { id, path } | SftpWirePacket::Lstat { id, path } => {
                 let id = *id;
-                match self.resolve_path(path) {
+                match self.resolve_path_checked(path, false) {
                     Err(_) => Ok(SftpWirePacket::Status {
                         id,
                         status: SftpStatus::PermissionDenied,
@@ -1340,7 +1429,7 @@ impl SftpFileServer {
 
             SftpWirePacket::Opendir { id, path } => {
                 let id = *id;
-                let full_path = match self.resolve_path(path) {
+                let full_path = match self.resolve_path_checked(path, false) {
                     Err(_) => {
                         return Ok(SftpWirePacket::Status {
                             id,
@@ -1412,7 +1501,7 @@ impl SftpFileServer {
 
             SftpWirePacket::Remove { id, filename } => {
                 let id = *id;
-                match self.resolve_path(filename) {
+                match self.resolve_path_checked(filename, false) {
                     Err(_) => Ok(SftpWirePacket::Status {
                         id,
                         status: SftpStatus::PermissionDenied,
@@ -1427,7 +1516,7 @@ impl SftpFileServer {
 
             SftpWirePacket::Mkdir { id, path, .. } => {
                 let id = *id;
-                match self.resolve_path(path) {
+                match self.resolve_path_checked(path, false) {
                     Err(_) => Ok(SftpWirePacket::Status {
                         id,
                         status: SftpStatus::PermissionDenied,
@@ -1442,7 +1531,7 @@ impl SftpFileServer {
 
             SftpWirePacket::Rmdir { id, path } => {
                 let id = *id;
-                match self.resolve_path(path) {
+                match self.resolve_path_checked(path, false) {
                     Err(_) => Ok(SftpWirePacket::Status {
                         id,
                         status: SftpStatus::PermissionDenied,
@@ -1457,15 +1546,23 @@ impl SftpFileServer {
 
             SftpWirePacket::Realpath { id, path } => {
                 let id = *id;
-                match self.resolve_path(path) {
+                match self.resolve_path_checked(path, false) {
                     Err(_) => Ok(SftpWirePacket::Status {
                         id,
                         status: SftpStatus::PermissionDenied,
                         message: "path escapes root".to_string(),
                     }),
                     Ok(full_path) => {
-                        let resolved = fs::canonicalize(&full_path).unwrap_or(full_path);
-                        let name = resolved.to_string_lossy().to_string();
+                        let name = match self.display_path(&full_path) {
+                            Ok(name) => name,
+                            Err(_) => {
+                                return Ok(SftpWirePacket::Status {
+                                    id,
+                                    status: SftpStatus::PermissionDenied,
+                                    message: "path escapes root".to_string(),
+                                });
+                            }
+                        };
                         Ok(SftpWirePacket::Name {
                             id,
                             entries: vec![SftpNameEntry {
@@ -1484,7 +1581,7 @@ impl SftpFileServer {
                 newpath,
             } => {
                 let id = *id;
-                let old = match self.resolve_path(oldpath) {
+                let old = match self.resolve_path_checked(oldpath, false) {
                     Err(_) => {
                         return Ok(SftpWirePacket::Status {
                             id,
@@ -1494,7 +1591,7 @@ impl SftpFileServer {
                     }
                     Ok(p) => p,
                 };
-                let new = match self.resolve_path(newpath) {
+                let new = match self.resolve_path_checked(newpath, true) {
                     Err(_) => {
                         return Ok(SftpWirePacket::Status {
                             id,
@@ -1566,7 +1663,7 @@ mod tests {
 
     use russh_channel::{Channel, ChannelKind};
 
-    use super::SftpClient;
+    use super::{SftpClient, SftpFileServer, SftpStatus, SftpWirePacket};
 
     #[test]
     fn write_then_read_round_trip() {
@@ -1662,5 +1759,101 @@ mod tests {
         assert_eq!(error.category(), russh_core::RusshErrorCategory::Protocol);
 
         fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn realpath_does_not_leak_host_paths() {
+        use std::os::unix::fs::symlink;
+
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_realpath_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(root.join("nested")).expect("root should be created");
+        fs::write(root.join("nested/file.txt"), b"x").expect("file should be created");
+
+        let outside = root.with_extension("outside");
+        if outside.exists() {
+            fs::remove_dir_all(&outside).expect("outside cleanup should succeed");
+        }
+        fs::create_dir_all(&outside).expect("outside should be created");
+        symlink(&outside, root.join("escape")).expect("symlink should be created");
+
+        let mut server = SftpFileServer::new(&root);
+        let packet = server
+            .process(&SftpWirePacket::Realpath {
+                id: 1,
+                path: "/nested/file.txt".to_string(),
+            })
+            .expect("realpath should succeed");
+
+        match packet {
+            SftpWirePacket::Name { entries, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].filename, "/nested/file.txt");
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        let packet = server
+            .process(&SftpWirePacket::Realpath {
+                id: 2,
+                path: "/escape".to_string(),
+            })
+            .expect("realpath should respond");
+        match packet {
+            SftpWirePacket::Status { status, .. } => {
+                assert_eq!(status, SftpStatus::PermissionDenied);
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+        fs::remove_dir_all(&outside).expect("outside cleanup should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_symlink_escape_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let outside = root.with_extension("outside");
+        if outside.exists() {
+            fs::remove_dir_all(&outside).expect("outside cleanup should succeed");
+        }
+        fs::create_dir_all(&outside).expect("outside should be created");
+        symlink(&outside, root.join("escape")).expect("symlink should be created");
+
+        let mut server = SftpFileServer::new(&root);
+        let packet = server
+            .process(&SftpWirePacket::Open {
+                id: 7,
+                filename: "escape/pwned.txt".to_string(),
+                pflags: super::open_flags::WRITE | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should respond");
+
+        match packet {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(id, 7);
+                assert_eq!(status, SftpStatus::PermissionDenied);
+            }
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        assert!(!outside.join("pwned.txt").exists());
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+        fs::remove_dir_all(&outside).expect("outside cleanup should succeed");
     }
 }

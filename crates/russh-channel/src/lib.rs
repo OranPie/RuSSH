@@ -35,7 +35,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use russh_core::{RusshError, RusshErrorCategory};
 use russh_transport::ClientSession;
@@ -140,19 +140,19 @@ impl JumpChain {
 /// Lightweight multiplexing pool that reuses established client sessions by key.
 #[derive(Debug, Default)]
 pub struct ConnectionPool {
-    entries: Arc<Mutex<HashMap<String, Arc<ClientSession>>>>,
+    entries: Arc<RwLock<HashMap<String, Arc<ClientSession>>>>,
 }
 
 impl ConnectionPool {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            entries: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn insert(&self, key: impl Into<String>, session: ClientSession) -> Result<(), RusshError> {
-        let mut guard = self.entries.lock().map_err(|_| {
+        let mut guard = self.entries.write().map_err(|_| {
             RusshError::new(
                 RusshErrorCategory::Channel,
                 "connection pool lock poisoned during insert",
@@ -163,7 +163,7 @@ impl ConnectionPool {
     }
 
     pub fn get(&self, key: &str) -> Result<Option<Arc<ClientSession>>, RusshError> {
-        let guard = self.entries.lock().map_err(|_| {
+        let guard = self.entries.read().map_err(|_| {
             RusshError::new(
                 RusshErrorCategory::Channel,
                 "connection pool lock poisoned during get",
@@ -173,7 +173,7 @@ impl ConnectionPool {
     }
 
     pub fn len(&self) -> Result<usize, RusshError> {
-        let guard = self.entries.lock().map_err(|_| {
+        let guard = self.entries.read().map_err(|_| {
             RusshError::new(
                 RusshErrorCategory::Channel,
                 "connection pool lock poisoned during len",

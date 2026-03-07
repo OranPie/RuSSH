@@ -27,12 +27,13 @@
 //! # Example
 //!
 //! ```rust
-//! use russh_core::PacketCodec;
+//! use russh_core::{PacketCodec, PacketFrame};
 //!
-//! let mut codec = PacketCodec::new();
-//! let encoded = codec.encode(&[1, 2, 3]);
-//! let decoded = codec.decode(&encoded).unwrap().unwrap();
-//! assert_eq!(decoded, vec![1, 2, 3]);
+//! let codec = PacketCodec::with_defaults();
+//! let frame = PacketFrame::new(vec![1, 2, 3]);
+//! let encoded = codec.encode(&frame).unwrap();
+//! let decoded = codec.decode(&encoded).unwrap();
+//! assert_eq!(decoded.payload, vec![1, 2, 3]);
 //! ```
 
 use std::error::Error;

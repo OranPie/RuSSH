@@ -300,7 +300,7 @@ async fn main() {
         log.log(Severity::Debug, "opening interactive shell");
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
-        let (_local_id, remote_id) = conn
+        let (local_id, remote_id) = conn
             .open_shell(&term, cols as u32, rows as u32)
             .await
             .unwrap_or_else(|e| {
@@ -316,7 +316,7 @@ async fn main() {
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
         let exit_code = conn
-            .run_shell_session(remote_id, &mut stdin, &mut stdout)
+            .run_shell_session(local_id, remote_id, &mut stdin, &mut stdout)
             .await
             .unwrap_or(0);
 
