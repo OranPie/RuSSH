@@ -33,6 +33,8 @@ RuSSH is a layered Rust workspace for building secure, OpenSSH-compatible SSH cl
 | `russh-config` | OpenSSH config parser, `resolve_for_host`, Host glob matching, token expansion |
 | `russh-observability` | `EventSink` / `MetricsHook` traits; `tracing` and `metrics` optional backends |
 | `russh-net` | **v0.2** Async TCP client/server (`SshClient`, `SshServer`, SFTP, SCP, exec) |
+| `russh-web` | WebSocket bridge + static terminal UI (`/ws` legacy, `/ws-tunnel` secure opaque TCP tunnel) |
+| `russh-web-wasm` | Browser SSH client core (WASM) used by secure tunnel mode |
 | `russh-integration` | End-to-end smoke scenarios, OpenSSH interop helpers |
 
 ## Quick start
@@ -56,6 +58,26 @@ cargo test -p russh-observability --features tracing,metrics
 # Fuzz (requires cargo-fuzz + nightly)
 cargo +nightly fuzz run fuzz_packet_codec
 ```
+
+## Web Client (Secure Tunnel Mode)
+
+Run local web UI + bridge:
+
+```sh
+./scripts/run_web_local.sh
+```
+
+Then open `http://127.0.0.1:8088` and use:
+
+- `Mode`: `Secure Tunnel (Preferred)`
+- `WebSocket URL`: `ws://127.0.0.1:8090/ws-tunnel`
+
+Security model:
+
+- `/ws` (legacy): server terminates SSH and can observe plaintext session data.
+- `/ws-tunnel` (preferred): server forwards opaque TCP bytes only; SSH transport/auth run in-browser via WASM.
+
+For full web setup, compatibility notes, and troubleshooting, see [`docs/web.md`](docs/web.md).
 
 ## Security posture
 

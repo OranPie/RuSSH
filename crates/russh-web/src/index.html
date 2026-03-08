@@ -3,146 +3,702 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RuSSH Web Terminal</title>
+<title>RuSSH Static Web Client</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #1a1a2e; color: #e0e0e0; font-family: system-ui, sans-serif; }
-  #login {
-    max-width: 380px; margin: 60px auto; padding: 32px;
-    background: #16213e; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.5);
+  :root {
+    --bg-0: #08151f;
+    --bg-1: #0f2433;
+    --bg-2: #12384d;
+    --panel: #f6f4ee;
+    --ink: #1f1d18;
+    --muted: #5f646a;
+    --line: #d9d4c9;
+    --accent: #0f9d88;
+    --accent-2: #1472a8;
+    --danger: #b3261e;
+    --ok: #147f3c;
   }
-  #login h1 { font-size: 1.4rem; margin-bottom: 20px; color: #0f3460; text-align: center; }
-  #login h1 span { color: #e94560; }
-  #login label { display: block; margin-bottom: 4px; font-size: .85rem; color: #a0a0c0; }
-  #login input {
-    width: 100%; padding: 8px 12px; margin-bottom: 14px; border: 1px solid #333;
-    border-radius: 6px; background: #0f3460; color: #e0e0e0; font-size: .95rem;
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    color: var(--ink);
+    font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    background:
+      radial-gradient(1200px 600px at 95% 8%, rgba(20, 114, 168, 0.35), transparent 55%),
+      radial-gradient(900px 500px at 5% 95%, rgba(15, 157, 136, 0.30), transparent 55%),
+      linear-gradient(160deg, var(--bg-0), var(--bg-1) 45%, var(--bg-2));
+    display: grid;
+    place-items: center;
+    padding: 18px;
   }
-  #login input:focus { outline: none; border-color: #e94560; }
-  #login button {
-    width: 100%; padding: 10px; background: #e94560; color: #fff;
-    border: none; border-radius: 6px; font-size: 1rem; cursor: pointer;
+  .shell {
+    width: min(1200px, 100%);
+    min-height: min(860px, 100vh - 36px);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 22px 56px rgba(4, 10, 16, 0.45);
+    display: grid;
+    grid-template-rows: auto auto 1fr;
   }
-  #login button:hover { background: #c93650; }
-  #login .error { color: #e94560; font-size: .85rem; margin-bottom: 10px; }
-  #terminal-container {
-    display: none; width: 100vw; height: 100vh; padding: 4px; background: #000;
+  .topbar {
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #fffdf8;
+    gap: 10px;
   }
-  #terminal-container .xterm { height: 100%; }
-  #status {
-    position: fixed; bottom: 8px; right: 12px; font-size: .75rem; color: #555;
+  .brand {
+    font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+    font-size: 14px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #17466a;
+  }
+  .status { font-size: 13px; color: var(--muted); }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--danger); }
+
+  .controls {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    gap: 10px;
+    align-items: end;
+    background: #fbfaf6;
+  }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font-size: 12px; color: var(--muted); font-weight: 600; }
+  .field input, .field select {
+    width: 100%;
+    border: 1px solid #cbc5b8;
+    background: #fff;
+    border-radius: 10px;
+    height: 38px;
+    padding: 0 11px;
+    font-size: 14px;
+    color: var(--ink);
+  }
+  .field input:focus, .field select:focus {
+    outline: none;
+    border-color: var(--accent-2);
+    box-shadow: 0 0 0 3px rgba(20, 114, 168, 0.13);
+  }
+
+  .mode { grid-column: span 2; }
+  .ws { grid-column: span 3; }
+  .host { grid-column: span 2; }
+  .port { grid-column: span 1; }
+  .user { grid-column: span 2; }
+  .pass { grid-column: span 2; }
+  .seed { grid-column: span 2; }
+  .actions { grid-column: span 2; display: flex; gap: 8px; }
+
+  button {
+    appearance: none;
+    border: 0;
+    border-radius: 10px;
+    height: 38px;
+    padding: 0 12px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform .08s ease, opacity .15s ease;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: 0.55; cursor: not-allowed; }
+  .connect { background: var(--accent); color: #fff; }
+  .disconnect, .ghost { background: #d7e7f3; color: #17466a; }
+
+  .hint { grid-column: 1 / -1; font-size: 12px; color: #4b545e; }
+
+  .workspace {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    gap: 10px;
+    padding: 10px;
+    background: #0b1118;
+    min-height: 460px;
+  }
+  .terminal-wrap { min-height: 460px; }
+  #terminal {
+    width: 100%;
+    height: 100%;
+    min-height: 460px;
+    border: 1px solid #25313f;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  .side {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: 10px;
+  }
+  .panel {
+    background: #f5f9fd;
+    border: 1px solid #d6dfe7;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 10px;
+    border-bottom: 1px solid #d6dfe7;
+    font-size: 12px;
+    font-weight: 700;
+    color: #274560;
+    background: #edf4fa;
+  }
+  .panel-body { padding: 10px; }
+  .settings-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .settings-grid label {
+    font-size: 12px;
+    color: #40505f;
+    display: grid;
+    gap: 4px;
+  }
+  .settings-grid input, .settings-grid select {
+    width: 100%;
+    border: 1px solid #bfcdda;
+    border-radius: 8px;
+    height: 34px;
+    padding: 0 9px;
+    font-size: 13px;
+    background: #fff;
+  }
+  .settings-grid input[type="checkbox"] {
+    width: auto;
+    height: auto;
+    justify-self: start;
+    margin: 3px 0;
+  }
+
+  #logWindow {
+    background: #0b1118;
+    color: #b8d0e8;
+    font-family: "IBM Plex Mono", "Cascadia Code", monospace;
+    font-size: 12px;
+    line-height: 1.4;
+    height: 320px;
+    overflow: auto;
+    padding: 8px;
+  }
+  .log-row { margin-bottom: 6px; white-space: pre-wrap; word-break: break-word; }
+  .log-info { color: #8ec8ff; }
+  .log-warn { color: #ffd166; }
+  .log-error { color: #ff8f8f; }
+
+  @media (max-width: 1120px) {
+    .workspace { grid-template-columns: 1fr; }
+    .side { grid-template-columns: 1fr 1fr; grid-template-rows: auto; }
+  }
+  @media (max-width: 980px) {
+    .mode { grid-column: span 4; }
+    .ws { grid-column: span 8; }
+    .host { grid-column: span 4; }
+    .port { grid-column: span 2; }
+    .user { grid-column: span 3; }
+    .pass { grid-column: span 3; }
+    .seed { grid-column: span 6; }
+    .actions { grid-column: span 6; }
+  }
+  @media (max-width: 640px) {
+    body { padding: 8px; }
+    .shell { min-height: calc(100vh - 16px); border-radius: 12px; }
+    .mode, .ws, .host, .port, .user, .pass, .seed, .actions { grid-column: span 12; }
+    .actions button { flex: 1; }
+    .side { grid-template-columns: 1fr; }
   }
 </style>
 </head>
 <body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">RuSSH Static Client</div>
+      <div id="status" class="status">Idle</div>
+    </header>
 
-<div id="login">
-  <h1>🔐 <span>RuSSH</span> Web Terminal</h1>
-  <div class="error" id="error"></div>
-  <label for="host">Host</label>
-  <input id="host" type="text" placeholder="192.168.1.1" autofocus>
-  <label for="port">Port</label>
-  <input id="port" type="number" value="22" min="1" max="65535">
-  <label for="user">Username</label>
-  <input id="user" type="text" placeholder="root">
-  <label for="password">Password</label>
-  <input id="password" type="password" placeholder="••••••••">
-  <button id="connectBtn" onclick="doConnect()">Connect</button>
-</div>
+    <section class="controls">
+      <div class="field mode">
+        <label for="mode">Mode</label>
+        <select id="mode">
+          <option value="tunnel">Secure Tunnel (Preferred)</option>
+          <option value="legacy">Legacy Server SSH</option>
+        </select>
+      </div>
+      <div class="field ws">
+        <label for="wsUrl">WebSocket URL</label>
+        <input id="wsUrl" placeholder="ws://127.0.0.1:8090/ws-tunnel">
+      </div>
+      <div class="field host">
+        <label for="host">SSH Host</label>
+        <input id="host" placeholder="10.0.0.12">
+      </div>
+      <div class="field port">
+        <label for="port">Port</label>
+        <input id="port" type="number" value="22" min="1" max="65535">
+      </div>
+      <div class="field user">
+        <label for="user">User (legacy)</label>
+        <input id="user" placeholder="root">
+      </div>
+      <div class="field pass">
+        <label for="password">Password (legacy)</label>
+        <input id="password" type="password" placeholder="optional">
+      </div>
+      <div class="field seed">
+        <label for="identitySeedHex">Identity Seed (legacy, optional)</label>
+        <input id="identitySeedHex" placeholder="64-hex Ed25519 seed">
+      </div>
+      <div class="actions">
+        <button id="connectBtn" class="connect">Connect</button>
+        <button id="disconnectBtn" class="disconnect" disabled>Disconnect</button>
+        <button id="clearLogsBtn" class="ghost">Clear Logs</button>
+      </div>
+      <div class="hint">
+        Preferred security path is <code>/ws-tunnel</code>. In this mode, server forwards opaque TCP bytes only and does not parse SSH payloads.
+      </div>
+    </section>
 
-<div id="terminal-container">
-  <div id="terminal"></div>
-</div>
-<div id="status"></div>
+    <section class="workspace">
+      <div class="terminal-wrap"><div id="terminal"></div></div>
+      <aside class="side">
+        <section class="panel">
+          <div class="panel-head">Appearance</div>
+          <div class="panel-body settings-grid">
+            <label>Theme
+              <select id="themeSelect">
+                <option value="midnight">Midnight</option>
+                <option value="paper">Paper</option>
+                <option value="amber">Amber</option>
+              </select>
+            </label>
+            <label>Font Size
+              <input id="fontSize" type="number" min="10" max="24" value="14">
+            </label>
+            <label>Cursor Blink
+              <input id="cursorBlink" type="checkbox" checked>
+            </label>
+            <button id="applyAppearanceBtn" class="ghost">Apply Appearance</button>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">Logs</div>
+          <div id="logWindow"></div>
+        </section>
+      </aside>
+    </section>
+  </main>
 
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
-<script>
-let ws, term, fitAddon;
+<script type="module">
+(async () => {
+  const els = {
+    mode: document.getElementById('mode'),
+    wsUrl: document.getElementById('wsUrl'),
+    host: document.getElementById('host'),
+    port: document.getElementById('port'),
+    user: document.getElementById('user'),
+    password: document.getElementById('password'),
+    identitySeedHex: document.getElementById('identitySeedHex'),
+    connectBtn: document.getElementById('connectBtn'),
+    disconnectBtn: document.getElementById('disconnectBtn'),
+    clearLogsBtn: document.getElementById('clearLogsBtn'),
+    status: document.getElementById('status'),
+    terminal: document.getElementById('terminal'),
+    logWindow: document.getElementById('logWindow'),
+    themeSelect: document.getElementById('themeSelect'),
+    fontSize: document.getElementById('fontSize'),
+    cursorBlink: document.getElementById('cursorBlink'),
+    applyAppearanceBtn: document.getElementById('applyAppearanceBtn'),
+  };
 
-function doConnect() {
-  const host = document.getElementById('host').value.trim();
-  const port = parseInt(document.getElementById('port').value) || 22;
-  const user = document.getElementById('user').value.trim();
-  const password = document.getElementById('password').value;
-  const errEl = document.getElementById('error');
-  errEl.textContent = '';
+  let wasmClient = null;
+  let term = null;
+  let fitAddon = null;
 
-  if (!host || !user) {
-    errEl.textContent = 'Host and username are required.';
-    return;
+  const defaults = {
+    mode: 'tunnel',
+    wsUrl: 'ws://127.0.0.1:8090/ws-tunnel',
+    host: '',
+    port: '22',
+    user: '',
+    theme: 'midnight',
+    fontSize: '14',
+    cursorBlink: '1',
+  };
+
+  const themes = {
+    midnight: { background: '#0b1118', foreground: '#d6deeb', cursor: '#8dd6ff', selectionBackground: '#224760' },
+    paper: { background: '#f8f8f4', foreground: '#22303c', cursor: '#1d6fa5', selectionBackground: '#cfe7fb' },
+    amber: { background: '#1a1303', foreground: '#ffd88a', cursor: '#ffbf47', selectionBackground: '#5a3d00' },
+  };
+
+  function nowTs() {
+    return new Date().toISOString().slice(11, 19);
   }
 
-  document.getElementById('connectBtn').disabled = true;
-  document.getElementById('connectBtn').textContent = 'Connecting…';
+  function addLog(level, text) {
+    const row = document.createElement('div');
+    row.className = `log-row log-${level}`;
+    row.textContent = `[${nowTs()}] ${text}`;
+    els.logWindow.appendChild(row);
+    els.logWindow.scrollTop = els.logWindow.scrollHeight;
+  }
 
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.binaryType = 'arraybuffer';
+  function loadProfile() {
+    try {
+      const saved = JSON.parse(localStorage.getItem('russh_web_profile') || '{}');
+      els.mode.value = saved.mode || defaults.mode;
+      els.wsUrl.value = saved.wsUrl || defaults.wsUrl;
+      els.host.value = saved.host || defaults.host;
+      els.port.value = saved.port || defaults.port;
+      els.user.value = saved.user || defaults.user;
+      els.themeSelect.value = saved.theme || defaults.theme;
+      els.fontSize.value = saved.fontSize || defaults.fontSize;
+      els.cursorBlink.checked = (saved.cursorBlink || defaults.cursorBlink) === '1';
+    } catch (_) {
+      els.mode.value = defaults.mode;
+      els.wsUrl.value = defaults.wsUrl;
+      els.host.value = defaults.host;
+      els.port.value = defaults.port;
+      els.user.value = defaults.user;
+      els.themeSelect.value = defaults.theme;
+      els.fontSize.value = defaults.fontSize;
+      els.cursorBlink.checked = defaults.cursorBlink === '1';
+    }
+  }
 
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ host, port, user, password }));
-  };
+  function saveProfile() {
+    localStorage.setItem('russh_web_profile', JSON.stringify({
+      mode: els.mode.value,
+      wsUrl: els.wsUrl.value.trim(),
+      host: els.host.value.trim(),
+      port: els.port.value.trim(),
+      user: els.user.value.trim(),
+      theme: els.themeSelect.value,
+      fontSize: els.fontSize.value,
+      cursorBlink: els.cursorBlink.checked ? '1' : '0',
+    }));
+  }
 
-  ws.onmessage = (ev) => {
-    if (typeof ev.data === 'string') {
-      const msg = JSON.parse(ev.data);
-      if (msg.type === 'connected') {
-        openTerminal();
-      } else if (msg.type === 'error') {
-        errEl.textContent = msg.message;
-        document.getElementById('connectBtn').disabled = false;
-        document.getElementById('connectBtn').textContent = 'Connect';
+  function setStatus(text, cls) {
+    els.status.textContent = text;
+    els.status.className = 'status' + (cls ? ` ${cls}` : '');
+  }
+
+  function setUiConnected(connected) {
+    els.connectBtn.disabled = connected;
+    els.disconnectBtn.disabled = !connected;
+    els.mode.disabled = connected;
+    els.wsUrl.disabled = connected;
+    els.host.disabled = connected;
+    els.port.disabled = connected;
+    els.user.disabled = connected;
+  }
+
+  function setConnectingUi() {
+    els.connectBtn.disabled = true;
+    els.disconnectBtn.disabled = true;
+    els.mode.disabled = true;
+    els.wsUrl.disabled = true;
+    els.host.disabled = true;
+    els.port.disabled = true;
+    els.user.disabled = true;
+  }
+
+  function ensureTerminal() {
+    if (term) return;
+    term = new Terminal({
+      cursorBlink: els.cursorBlink.checked,
+      convertEol: true,
+      scrollback: 8000,
+      fontSize: parseInt(els.fontSize.value, 10) || 14,
+      fontFamily: '"IBM Plex Mono", "Cascadia Code", monospace',
+      theme: themes[els.themeSelect.value] || themes.midnight,
+    });
+    fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(els.terminal);
+    fitAddon.fit();
+    term.focus();
+
+    term.onData((data) => {
+      if (wasmClient && wasmClient.is_connected()) {
+        const bytes = new TextEncoder().encode(data);
+        wasmClient.send_input(bytes).catch((err) => {
+          writeErr(`[send failed] ${String(err)}`);
+        });
       }
-    } else {
-      // Binary: terminal data from server.
-      if (term) {
-        term.write(new Uint8Array(ev.data));
+    });
+
+    window.addEventListener('resize', () => fitAddon && fitAddon.fit());
+  }
+
+  function applyAppearance() {
+    ensureTerminal();
+    const theme = themes[els.themeSelect.value] || themes.midnight;
+    term.options.theme = theme;
+    term.options.fontSize = parseInt(els.fontSize.value, 10) || 14;
+    term.options.cursorBlink = !!els.cursorBlink.checked;
+    if (fitAddon) fitAddon.fit();
+    saveProfile();
+    addLog('info', `appearance updated: theme=${els.themeSelect.value} size=${els.fontSize.value}`);
+  }
+
+  function writeInfo(line) {
+    ensureTerminal();
+    term.writeln(`\x1b[38;5;81m${line}\x1b[0m`);
+    addLog('info', line);
+  }
+
+  function writeWarn(line) {
+    ensureTerminal();
+    term.writeln(`\x1b[33m${line}\x1b[0m`);
+    addLog('warn', line);
+  }
+
+  function writeErr(line) {
+    ensureTerminal();
+    term.writeln(`\x1b[31m${line}\x1b[0m`);
+    addLog('error', line);
+  }
+
+  function createJsFallbackClient() {
+    let ws = null;
+    let connected = false;
+    let connecting = false;
+    let cbStatus = () => {};
+    let cbInfo = () => {};
+    let cbErr = () => {};
+    let cbBin = () => {};
+
+    return {
+      supports_tunnel: false,
+      init_client(status, info, error, binary) {
+        cbStatus = status;
+        cbInfo = info;
+        cbErr = error;
+        cbBin = binary;
+      },
+      async connect(mode, wsUrl, host, port, user, password, identitySeedHex) {
+        if (mode === 'tunnel') {
+          connecting = false;
+          connected = false;
+          cbStatus('error');
+          cbErr('Tunnel mode requires WASM SSH engine. JS fallback cannot perform SSH transport/auth.');
+          throw new Error('tunnel mode unsupported in JS fallback');
+        }
+        this.disconnect();
+        connecting = true;
+        cbStatus('connecting');
+        cbInfo(`[fallback-js] connecting via ${wsUrl} mode=${mode}`);
+        return await new Promise((resolve, reject) => {
+          ws = new WebSocket(wsUrl);
+          ws.binaryType = 'arraybuffer';
+          ws.onopen = () => {
+            const req = mode === 'tunnel'
+              ? { type: 'connect_tcp', host, port }
+              : { type: 'connect', host, port, user, password: password || undefined, identity_seed_hex: identitySeedHex || undefined };
+            ws.send(JSON.stringify(req));
+            resolve();
+          };
+          ws.onmessage = (ev) => {
+            if (typeof ev.data === 'string') {
+              try {
+                const msg = JSON.parse(ev.data);
+                if (msg.type === 'connected') {
+                  connecting = false;
+                  connected = true;
+                  cbStatus('connected');
+                  cbInfo('[fallback-js] session ready');
+                } else if (msg.type === 'error') {
+                  connecting = false;
+                  connected = false;
+                  cbStatus('error');
+                  cbErr(msg.message || 'bridge error');
+                } else {
+                  cbInfo(ev.data);
+                }
+              } catch (_) {
+                cbInfo(ev.data);
+              }
+              return;
+            }
+            cbBin(new Uint8Array(ev.data));
+          };
+          ws.onerror = () => {
+            connecting = false;
+            connected = false;
+            cbStatus('error');
+            cbErr('websocket error');
+            reject(new Error('websocket error'));
+          };
+          ws.onclose = () => {
+            connecting = false;
+            connected = false;
+            cbStatus('disconnected');
+          };
+        });
+      },
+      async send_input(bytes) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('websocket is not open');
+        ws.send(bytes);
+      },
+      disconnect() {
+        if (ws) {
+          try { ws.close(); } catch (_) {}
+          ws = null;
+        }
+        connecting = false;
+        connected = false;
+        cbStatus('disconnected');
+      },
+      is_connected() { return connected; },
+      is_connecting() { return connecting; },
+    };
+  }
+
+  function initClientCallbacks() {
+    wasmClient.init_client(
+      (tag) => {
+        const t = String(tag);
+        if (t === 'connecting') {
+          setConnectingUi();
+          setStatus('Connecting...', '');
+        } else if (t === 'connected') {
+          setUiConnected(true);
+          setStatus('Connected', 'ok');
+        } else if (t === 'disconnected') {
+          setUiConnected(false);
+          setStatus('Disconnected', '');
+        } else if (t === 'error') {
+          setUiConnected(false);
+          setStatus('Connection error', 'err');
+        }
+      },
+      (line) => writeInfo(String(line)),
+      (line) => {
+        writeErr(String(line));
+        setStatus(String(line), 'err');
+      },
+      (bytes) => {
+        ensureTerminal();
+        term.write(new Uint8Array(bytes));
       }
+    );
+  }
+
+  function disconnect(reason) {
+    if (!wasmClient) return;
+    wasmClient.disconnect();
+    setUiConnected(false);
+    setStatus(reason || 'Disconnected', reason ? 'err' : '');
+    addLog('warn', reason || 'disconnected');
+  }
+
+  function connect() {
+    if (!wasmClient) {
+      setStatus('Client not loaded yet', 'err');
+      return;
     }
-  };
 
-  ws.onclose = () => {
-    if (term) {
-      term.write('\r\n\x1b[31m[Connection closed]\x1b[0m\r\n');
+    const mode = els.mode.value;
+    const wsUrl = els.wsUrl.value.trim();
+    const host = els.host.value.trim();
+    const port = parseInt(els.port.value, 10) || 22;
+    const user = els.user.value.trim();
+    const password = els.password.value;
+    const identitySeedHex = els.identitySeedHex.value.trim();
+
+    if (!wsUrl || !host) {
+      setStatus('WS URL and host are required', 'err');
+      return;
     }
-    document.getElementById('status').textContent = 'Disconnected';
-  };
+    if (mode === 'tunnel' && wasmClient && wasmClient.supports_tunnel === false) {
+      setStatus('Tunnel mode requires WASM SSH engine; current client is JS fallback', 'err');
+      writeErr('WASM failed to load. Tunnel mode is unavailable in JS fallback.');
+      return;
+    }
+    if (mode === 'legacy' && !user) {
+      setStatus('User is required in legacy mode', 'err');
+      return;
+    }
 
-  ws.onerror = () => {
-    errEl.textContent = 'WebSocket connection failed.';
-    document.getElementById('connectBtn').disabled = false;
-    document.getElementById('connectBtn').textContent = 'Connect';
-  };
-}
+    saveProfile();
+    ensureTerminal();
+    term.clear();
+    writeInfo(`[connect] mode=${mode} url=${wsUrl} target=${host}:${port}`);
 
-function openTerminal() {
-  document.getElementById('login').style.display = 'none';
-  const container = document.getElementById('terminal-container');
-  container.style.display = 'block';
+    if (mode === 'tunnel') {
+      writeInfo('Tunnel mode active: SSH transport and auth run in-browser over opaque WS tunnel.');
+    }
 
-  term = new Terminal({
-    cursorBlink: true,
-    fontSize: 14,
-    fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
-    theme: { background: '#1a1a2e', foreground: '#e0e0e0', cursor: '#e94560' },
+    setConnectingUi();
+    setStatus('Connecting...', '');
+
+    wasmClient.connect(mode, wsUrl, host, port, user, password, identitySeedHex).catch((err) => {
+      setUiConnected(false);
+      setStatus(String(err), 'err');
+      writeErr(`[connect error] ${String(err)}`);
+    });
+  }
+
+  els.connectBtn.addEventListener('click', connect);
+  els.disconnectBtn.addEventListener('click', () => disconnect('Disconnected by user'));
+  els.clearLogsBtn.addEventListener('click', () => { els.logWindow.textContent = ''; });
+  els.applyAppearanceBtn.addEventListener('click', applyAppearance);
+  els.mode.addEventListener('change', () => {
+    if (els.mode.value === 'tunnel' && els.wsUrl.value.includes('/ws')) {
+      els.wsUrl.value = els.wsUrl.value.replace('/ws', '/ws-tunnel');
+    }
+    if (els.mode.value === 'legacy' && els.wsUrl.value.includes('/ws-tunnel')) {
+      els.wsUrl.value = els.wsUrl.value.replace('/ws-tunnel', '/ws');
+    }
   });
-  fitAddon = new FitAddon.FitAddon();
-  term.loadAddon(fitAddon);
-  term.open(document.getElementById('terminal'));
-  fitAddon.fit();
-  term.focus();
 
-  term.onData((data) => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(new TextEncoder().encode(data));
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && wasmClient && !wasmClient.is_connected() && !wasmClient.is_connecting()) {
+      e.preventDefault();
+      connect();
     }
   });
 
-  window.addEventListener('resize', () => fitAddon.fit());
-  document.getElementById('status').textContent = 'Connected';
-}
+  try {
+    const wasmModule = await import('./pkg/russh_web_wasm.js');
+    await wasmModule.default();
+    wasmClient = wasmModule;
+    initClientCallbacks();
+    addLog('info', 'WASM client loaded');
+  } catch (err) {
+    wasmClient = createJsFallbackClient();
+    initClientCallbacks();
+    writeWarn(`WASM unavailable (${String(err)}), using JS fallback client.`);
+  }
+
+  loadProfile();
+  ensureTerminal();
+  applyAppearance();
+  writeInfo('Client ready. Ctrl/Cmd+Enter to connect.');
+})().catch((err) => {
+  const status = document.getElementById('status');
+  status.textContent = `Client init failed: ${String(err)}`;
+  status.className = 'status err';
+});
 </script>
 </body>
 </html>

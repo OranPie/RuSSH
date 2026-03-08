@@ -1,4 +1,4 @@
-//! russh-web — browser-based SSH terminal over WebSocket.
+//! russh-web — browser-based SSH terminal and TCP tunnel over WebSocket.
 //!
 //! Serves a single-page xterm.js terminal that connects to any SSH server
 //! via RuSSH.  Communication flows:
@@ -6,6 +6,15 @@
 //! ```text
 //! Browser ←[WebSocket]→ russh-web ←[SSH]→ target server
 //! ```
+//!
+//! Security-focused mode:
+//!
+//! ```text
+//! Browser SSH client (WASM/JS) ←[WebSocket tunnel]→ russh-web ←[opaque TCP]→ target:22
+//! ```
+//!
+//! In tunnel mode, `russh-web` does not parse SSH payload bytes and only forwards
+//! opaque frames between WebSocket and TCP.
 //!
 //! ## Protocol
 //!
@@ -30,15 +39,22 @@ use russh_net::SshClientConnection;
 use russh_observability::{Severity, StderrLogger};
 use russh_transport::ClientConfig;
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Embedded HTML/JS page with xterm.js terminal.
 pub const INDEX_HTML: &str = include_str!("index.html");
 
 /// Build the axum router.
 pub fn app(log: Arc<StderrLogger>) -> Router {
+    let ws_log = log.clone();
+    let tunnel_log = log;
     Router::new()
         .route("/", get(index))
-        .route("/ws", get(move |ws| ws_handler(ws, log)))
+        .route("/ws", get(move |ws| ws_handler(ws, ws_log.clone())))
+        .route(
+            "/ws-tunnel",
+            get(move |ws| ws_tunnel_handler(ws, tunnel_log.clone())),
+        )
 }
 
 async fn index() -> impl IntoResponse {
@@ -55,8 +71,20 @@ struct ConnectRequest {
     identity_seed_hex: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TunnelConnectRequest {
+    #[serde(rename = "type", default)]
+    kind: String,
+    host: String,
+    port: Option<u16>,
+}
+
 async fn ws_handler(ws: WebSocketUpgrade, log: Arc<StderrLogger>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, log))
+}
+
+async fn ws_tunnel_handler(ws: WebSocketUpgrade, log: Arc<StderrLogger>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_tunnel_socket(socket, log))
 }
 
 /// Send a JSON error message over the WebSocket.
@@ -208,6 +236,92 @@ async fn handle_socket(mut socket: WebSocket, log: Arc<StderrLogger>) {
         &format!("ws: session ended (exit={exit_code})"),
     );
     // Dropping `output` closes ssh_tx, which ends the background task.
+}
+
+async fn handle_tunnel_socket(mut socket: WebSocket, log: Arc<StderrLogger>) {
+    let connect_req: TunnelConnectRequest = loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(text))) => {
+                match serde_json::from_str::<TunnelConnectRequest>(&text) {
+                    Ok(req) => break req,
+                    Err(e) => {
+                        send_error(&mut socket, &format!("bad request: {e}")).await;
+                        return;
+                    }
+                }
+            }
+            Some(Ok(_)) => continue,
+            _ => return,
+        }
+    };
+
+    if !connect_req.kind.is_empty() && connect_req.kind != "connect_tcp" {
+        send_error(&mut socket, "bad request: type must be connect_tcp").await;
+        return;
+    }
+
+    let port = connect_req.port.unwrap_or(22);
+    let addr = format!("{}:{port}", connect_req.host);
+    log.log(
+        Severity::Info,
+        &format!("ws-tunnel: opening opaque tunnel to {addr}"),
+    );
+
+    let stream = match tokio::net::TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            send_error(&mut socket, &format!("connect failed: {e}")).await;
+            return;
+        }
+    };
+    let (mut tcp_rd, mut tcp_wr) = stream.into_split();
+
+    let _ = socket
+        .send(Message::Text(r#"{"type":"connected"}"#.into()))
+        .await;
+
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        if tcp_wr.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        if tcp_wr.write_all(text.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            tcp_read = tcp_rd.read(&mut buf) => {
+                match tcp_read {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if socket.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    log.log(
+        Severity::Info,
+        &format!("ws-tunnel: closed opaque tunnel to {addr}"),
+    );
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
