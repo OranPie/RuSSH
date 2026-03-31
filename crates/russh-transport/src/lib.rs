@@ -53,6 +53,9 @@ pub struct TransportConfig {
     pub rekey_after_duration: Duration,
     pub idle_timeout: Duration,
     pub keepalive_interval: Duration,
+    /// Disconnect after this many consecutive keepalive requests with no reply.
+    /// Mirrors OpenSSH `ServerAliveCountMax`. Default: `3`.
+    pub keepalive_count_max: u32,
     pub policy: CryptoPolicy,
 }
 
@@ -69,6 +72,7 @@ pub struct TransportConfigBuilder {
     rekey_after_duration: Duration,
     idle_timeout: Duration,
     keepalive_interval: Duration,
+    keepalive_count_max: u32,
     policy: CryptoPolicy,
 }
 
@@ -79,6 +83,7 @@ impl Default for TransportConfigBuilder {
             rekey_after_duration: Duration::from_secs(60 * 60),
             idle_timeout: Duration::from_secs(300),
             keepalive_interval: Duration::from_secs(30),
+            keepalive_count_max: 3,
             policy: CryptoPolicy::secure_defaults(),
         }
     }
@@ -110,6 +115,12 @@ impl TransportConfigBuilder {
     }
 
     #[must_use]
+    pub fn keepalive_count_max(mut self, count: u32) -> Self {
+        self.keepalive_count_max = count;
+        self
+    }
+
+    #[must_use]
     pub fn policy(mut self, policy: CryptoPolicy) -> Self {
         self.policy = policy;
         self
@@ -122,6 +133,7 @@ impl TransportConfigBuilder {
             rekey_after_duration: self.rekey_after_duration,
             idle_timeout: self.idle_timeout,
             keepalive_interval: self.keepalive_interval,
+            keepalive_count_max: self.keepalive_count_max,
             policy: self.policy,
         }
     }
@@ -711,6 +723,7 @@ pub struct ClientSession {
     elapsed_since_rekey: Duration,
     elapsed_since_activity: Duration,
     elapsed_since_keepalive: Duration,
+    missed_keepalives: u32,
     pending_service: Option<String>,
     active_service: Option<String>,
     authenticated_user: Option<String>,
@@ -739,6 +752,7 @@ impl ClientSession {
             elapsed_since_rekey: Duration::ZERO,
             elapsed_since_activity: Duration::ZERO,
             elapsed_since_keepalive: Duration::ZERO,
+            missed_keepalives: 0,
             pending_service: None,
             active_service: None,
             authenticated_user: None,
@@ -1150,6 +1164,18 @@ impl ClientSession {
 
         let keepalive_interval = self.config.transport.keepalive_interval;
         if !keepalive_interval.is_zero() && self.elapsed_since_keepalive >= keepalive_interval {
+            self.missed_keepalives += 1;
+            let max = self.config.transport.keepalive_count_max;
+            if max > 0 && self.missed_keepalives > max {
+                self.close_with_code(
+                    DisconnectReasonCode::ByApplication,
+                    format!(
+                        "no reply after {} keepalive requests",
+                        self.missed_keepalives - 1
+                    ),
+                );
+                return Ok(false);
+            }
             self.events.push(TransportEvent::KeepaliveSent);
             self.elapsed_since_keepalive = Duration::ZERO;
         }
@@ -1433,6 +1459,7 @@ impl ClientSession {
     fn mark_activity(&mut self) {
         self.elapsed_since_activity = Duration::ZERO;
         self.elapsed_since_keepalive = Duration::ZERO;
+        self.missed_keepalives = 0;
     }
 
     fn protocol_violation(&mut self, reason: impl Into<String>) -> RusshError {
@@ -3537,6 +3564,93 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn client_keepalive_count_max_disconnects_after_exceeded() {
+        let transport = TransportConfig::builder()
+            .keepalive_interval(Duration::from_secs(10))
+            .keepalive_count_max(2)
+            .build();
+        let mut config = ClientConfig::secure_defaults("alice");
+        config.transport = transport;
+
+        let mut session = ClientSession::new(config);
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+        session
+            .receive_message(TransportMessage::NewKeys)
+            .expect("NEWKEYS should establish session");
+
+        // First keepalive: missed_keepalives becomes 1 (≤ max=2), still alive.
+        session
+            .advance_time(Duration::from_secs(10))
+            .expect("time advancement should succeed");
+        assert_eq!(session.state(), SessionState::Established);
+
+        // Second keepalive: missed_keepalives becomes 2 (≤ max=2), still alive.
+        session
+            .advance_time(Duration::from_secs(10))
+            .expect("time advancement should succeed");
+        assert_eq!(session.state(), SessionState::Established);
+
+        // Third keepalive: missed_keepalives becomes 3 (> max=2), should disconnect.
+        session
+            .advance_time(Duration::from_secs(10))
+            .expect("time advancement should succeed");
+        assert_eq!(session.state(), SessionState::Closed);
+        assert!(
+            session
+                .events()
+                .iter()
+                .any(|e| matches!(e, TransportEvent::Disconnected { .. }))
+        );
+    }
+
+    #[test]
+    fn client_keepalive_count_resets_on_activity() {
+        let transport = TransportConfig::builder()
+            .keepalive_interval(Duration::from_secs(10))
+            .keepalive_count_max(2)
+            .build();
+        let mut config = ClientConfig::secure_defaults("alice");
+        config.transport = transport;
+
+        let mut session = ClientSession::new(config);
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+        session
+            .receive_message(TransportMessage::NewKeys)
+            .expect("NEWKEYS should establish session");
+
+        // Two missed keepalives.
+        session
+            .advance_time(Duration::from_secs(10))
+            .expect("time advancement should succeed");
+        session
+            .advance_time(Duration::from_secs(10))
+            .expect("time advancement should succeed");
+        assert_eq!(session.state(), SessionState::Established);
+
+        // Activity resets the counter.
+        session
+            .receive_message(TransportMessage::Ignore {
+                data: vec![1, 2, 3],
+            })
+            .expect("IGNORE should be accepted");
+
+        // Two more missed keepalives — should still be alive because counter was reset.
+        session
+            .advance_time(Duration::from_secs(10))
+            .expect("time advancement should succeed");
+        session
+            .advance_time(Duration::from_secs(10))
+            .expect("time advancement should succeed");
+        assert_eq!(session.state(), SessionState::Established);
+    }
+
+    #[test]
+    fn keepalive_count_max_default_is_three() {
+        let transport = TransportConfig::builder().build();
+        assert_eq!(transport.keepalive_count_max, 3);
     }
 
     #[test]

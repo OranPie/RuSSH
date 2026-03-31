@@ -524,6 +524,14 @@ async fn main() {
     if let Some(secs) = alive_interval {
         cfg.transport.keepalive_interval = std::time::Duration::from_secs(secs);
     }
+    if let Some(count) = args.o_options.server_alive_count_max {
+        cfg.transport.keepalive_count_max = count as u32;
+    }
+
+    // Apply compression override from `-o`.
+    if let Some(false) = args.o_options.compression {
+        cfg.transport.policy.algorithms_mut().compression = vec!["none".to_string()];
+    }
 
     // Determine whether password auth is allowed.
     let password_auth_enabled = args.o_options.password_authentication.unwrap_or(true);
@@ -1150,5 +1158,67 @@ mod tests {
     fn l_flag_empty_by_default() {
         let args = parse_args_from(make_argv(&["host"]));
         assert!(args.local_forwards.is_empty());
+    }
+
+    // ── Compression / ServerAliveCountMax wiring tests ────────────────────
+
+    #[test]
+    fn compression_no_disables_zlib() {
+        let args = parse_args_from(make_argv(&["-o", "Compression=no", "host"]));
+        let mut cfg = ClientConfig::secure_defaults(&args.user);
+        if let Some(false) = args.o_options.compression {
+            cfg.transport.policy.algorithms_mut().compression = vec!["none".to_string()];
+        }
+        assert_eq!(
+            cfg.transport.policy.algorithms().compression,
+            vec!["none".to_string()]
+        );
+    }
+
+    #[test]
+    fn compression_yes_keeps_zlib() {
+        let args = parse_args_from(make_argv(&["-o", "Compression=yes", "host"]));
+        let mut cfg = ClientConfig::secure_defaults(&args.user);
+        if let Some(false) = args.o_options.compression {
+            cfg.transport.policy.algorithms_mut().compression = vec!["none".to_string()];
+        }
+        assert!(
+            cfg.transport
+                .policy
+                .algorithms()
+                .compression
+                .contains(&"zlib@openssh.com".to_string())
+        );
+    }
+
+    #[test]
+    fn compression_default_keeps_zlib() {
+        let args = parse_args_from(make_argv(&["host"]));
+        assert!(args.o_options.compression.is_none());
+        let cfg = ClientConfig::secure_defaults(&args.user);
+        assert!(
+            cfg.transport
+                .policy
+                .algorithms()
+                .compression
+                .contains(&"zlib@openssh.com".to_string())
+        );
+    }
+
+    #[test]
+    fn server_alive_count_max_applied() {
+        let args = parse_args_from(make_argv(&["-o", "ServerAliveCountMax=5", "host"]));
+        assert_eq!(args.o_options.server_alive_count_max, Some(5));
+        let mut cfg = ClientConfig::secure_defaults(&args.user);
+        if let Some(count) = args.o_options.server_alive_count_max {
+            cfg.transport.keepalive_count_max = count as u32;
+        }
+        assert_eq!(cfg.transport.keepalive_count_max, 5);
+    }
+
+    #[test]
+    fn server_alive_count_max_default_is_three() {
+        let cfg = ClientConfig::secure_defaults("user");
+        assert_eq!(cfg.transport.keepalive_count_max, 3);
     }
 }
