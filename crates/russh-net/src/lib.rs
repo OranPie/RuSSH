@@ -48,7 +48,10 @@ use russh_auth::{
 };
 use russh_channel::{ChannelKind, ChannelManager, ChannelMessage, ChannelRequest, ForwardHandle};
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
-use russh_crypto::{AeadCipher, Aes256GcmCipher, Signer};
+use russh_crypto::{
+    AeadCipher, Aes128CtrCipher, Aes256CtrCipher, Aes256GcmCipher, HmacSha256, HmacSha512,
+    MacAlgorithm, Signer, StreamCipher,
+};
 use russh_scp::build_scp_file_upload;
 use russh_sftp::{SftpFileServer, SftpFramer, SftpWirePacket};
 use russh_transport::{
@@ -143,12 +146,62 @@ fn channel_extended_data_frame(
 
 // ── DirectionalCipher ────────────────────────────────────────────────────────
 
-/// Per-direction AEAD cipher state (used for one of TX or RX).
+/// Object-safe trait for stream cipher encrypt/decrypt operations.
+trait CtrCipherOps: Send {
+    fn encrypt_in_place(&mut self, data: &mut [u8]);
+    fn decrypt_in_place(&mut self, data: &mut [u8]);
+}
+
+impl<T: StreamCipher + Send> CtrCipherOps for T {
+    fn encrypt_in_place(&mut self, data: &mut [u8]) {
+        StreamCipher::encrypt_in_place(self, data);
+    }
+    fn decrypt_in_place(&mut self, data: &mut [u8]) {
+        StreamCipher::decrypt_in_place(self, data);
+    }
+}
+
+/// MAC algorithm dispatch enum.
+enum MacKind {
+    Sha256,
+    Sha512,
+}
+
+impl MacKind {
+    fn tag_len(&self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha512 => 64,
+        }
+    }
+
+    fn sign(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha256 => HmacSha256::sign(key, data),
+            Self::Sha512 => HmacSha512::sign(key, data),
+        }
+    }
+
+    fn verify(&self, key: &[u8], data: &[u8], tag: &[u8]) -> Result<(), RusshError> {
+        let ok = match self {
+            Self::Sha256 => HmacSha256::verify(key, data, tag),
+            Self::Sha512 => HmacSha512::verify(key, data, tag),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(RusshError::new(
+                RusshErrorCategory::Crypto,
+                "MAC verification failed",
+            ))
+        }
+    }
+}
+
+/// Per-direction cipher state (used for one of TX or RX).
 ///
-/// After NEWKEYS, both sides must encrypt/decrypt packets.  Only
-/// `aes256-gcm@openssh.com` is implemented here; all other negotiated ciphers
-/// fall back to `None` (plaintext), which works for loopback tests where both
-/// sides use RuSSH.
+/// After NEWKEYS, both sides must encrypt/decrypt packets.
+/// Supports AEAD ciphers (AES-GCM) and stream ciphers with ETM MAC (AES-CTR).
 enum DirectionalCipher {
     None,
     Aes256Gcm {
@@ -156,22 +209,65 @@ enum DirectionalCipher {
         /// Current 12-byte nonce: first 4 bytes fixed, last 8 bytes counter.
         nonce: [u8; 12],
     },
+    AesCtr {
+        cipher: Box<dyn CtrCipherOps + Send>,
+        mac: MacKind,
+        mac_key: Vec<u8>,
+        /// Sequence number for MAC computation (incremented per packet).
+        sequence_number: u32,
+    },
 }
 
 impl DirectionalCipher {
-    /// Build a cipher from the negotiated algorithm name, key material, and IV.
-    fn new(name: &str, key: &[u8], iv: &[u8]) -> Self {
-        if name == "aes256-gcm@openssh.com" {
-            if let Ok(cipher) = Aes256GcmCipher::new(key) {
-                let mut nonce = [0u8; 12];
-                nonce.copy_from_slice(&iv[..12]);
-                return Self::Aes256Gcm {
-                    cipher: Box::new(cipher),
-                    nonce,
-                };
+    /// Build a cipher from the negotiated algorithm name, key material, IV, and MAC.
+    fn new(cipher_name: &str, key: &[u8], iv: &[u8], mac_name: &str, mac_key: &[u8]) -> Self {
+        match cipher_name {
+            "aes256-gcm@openssh.com" => {
+                if let Ok(cipher) = Aes256GcmCipher::new(key) {
+                    let mut nonce = [0u8; 12];
+                    let copy_len = iv.len().min(12);
+                    nonce[..copy_len].copy_from_slice(&iv[..copy_len]);
+                    return Self::Aes256Gcm {
+                        cipher: Box::new(cipher),
+                        nonce,
+                    };
+                }
+                Self::None
             }
+            "aes256-ctr" => {
+                if let Ok(cipher) = Aes256CtrCipher::new(key, iv) {
+                    let mac = match mac_name {
+                        "hmac-sha2-512-etm@openssh.com" => MacKind::Sha512,
+                        _ => MacKind::Sha256,
+                    };
+                    Self::AesCtr {
+                        cipher: Box::new(cipher),
+                        mac,
+                        mac_key: mac_key.to_vec(),
+                        sequence_number: 0,
+                    }
+                } else {
+                    Self::None
+                }
+            }
+            "aes128-ctr" => {
+                if let Ok(cipher) = Aes128CtrCipher::new(key, iv) {
+                    let mac = match mac_name {
+                        "hmac-sha2-512-etm@openssh.com" => MacKind::Sha512,
+                        _ => MacKind::Sha256,
+                    };
+                    Self::AesCtr {
+                        cipher: Box::new(cipher),
+                        mac,
+                        mac_key: mac_key.to_vec(),
+                        sequence_number: 0,
+                    }
+                } else {
+                    Self::None
+                }
+            }
+            _ => Self::None,
         }
-        Self::None
     }
 
     /// Increment the last 8 bytes of the nonce as a big-endian u64 counter.
@@ -213,29 +309,29 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
     /// server → client direction uses `key_s2c` / `iv_s2c`.
     pub fn enable_client_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
         self.tx_cipher =
-            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s);
+            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s, &neg.mac_client_to_server, &keys.mac_key_c2s);
         self.rx_cipher =
-            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c);
+            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c, &neg.mac_server_to_client, &keys.mac_key_s2c);
     }
 
     /// Enable AEAD encryption for the **server** side after NEWKEYS.
     pub fn enable_server_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
         self.tx_cipher =
-            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c);
+            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c, &neg.mac_server_to_client, &keys.mac_key_s2c);
         self.rx_cipher =
-            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s);
+            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s, &neg.mac_client_to_server, &keys.mac_key_c2s);
     }
 
     /// Enable only the TX (outgoing) cipher for the server after sending NEWKEYS.
     pub fn enable_server_tx_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
         self.tx_cipher =
-            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c);
+            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c, &neg.mac_server_to_client, &keys.mac_key_s2c);
     }
 
     /// Enable only the RX (incoming) cipher for the server after receiving client NEWKEYS.
     pub fn enable_server_rx_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
         self.rx_cipher =
-            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s);
+            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s, &neg.mac_client_to_server, &keys.mac_key_c2s);
     }
 
     /// Read lines until one starts with "SSH-" (the version banner).
@@ -325,6 +421,55 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                 }
                 Ok(PacketFrame::new(plaintext[1..payload_end].to_vec()))
             }
+            DirectionalCipher::AesCtr {
+                cipher,
+                mac,
+                mac_key,
+                sequence_number,
+            } => {
+                // ETM: packet_length is plaintext, body is encrypted, MAC follows
+                let mut len_buf = [0u8; 4];
+                self.inner.read_exact(&mut len_buf).await.map_err(io_err)?;
+                let pkt_len = u32::from_be_bytes(len_buf) as usize;
+
+                if pkt_len > PacketCodec::DEFAULT_MAX_PACKET_SIZE + 512 {
+                    return Err(protocol_err("incoming packet length too large"));
+                }
+
+                let mut encrypted_body = vec![0u8; pkt_len];
+                self.inner
+                    .read_exact(&mut encrypted_body)
+                    .await
+                    .map_err(io_err)?;
+
+                // Read MAC tag
+                let mac_len = mac.tag_len();
+                let mut mac_tag = vec![0u8; mac_len];
+                self.inner.read_exact(&mut mac_tag).await.map_err(io_err)?;
+
+                // Verify MAC over (seqnum || packet_length || encrypted_body)
+                let mut mac_data = Vec::new();
+                mac_data.extend_from_slice(&sequence_number.to_be_bytes());
+                mac_data.extend_from_slice(&len_buf);
+                mac_data.extend_from_slice(&encrypted_body);
+                mac.verify(mac_key, &mac_data, &mac_tag).map_err(|e| {
+                    RusshError::new(RusshErrorCategory::Crypto, e.to_string())
+                })?;
+                *sequence_number = sequence_number.wrapping_add(1);
+
+                // Decrypt
+                cipher.decrypt_in_place(&mut encrypted_body);
+
+                if encrypted_body.is_empty() {
+                    return Err(protocol_err("AES-CTR decrypted to empty plaintext"));
+                }
+                let padding_len = encrypted_body[0] as usize;
+                let payload_end = encrypted_body.len().saturating_sub(padding_len);
+                if payload_end == 0 {
+                    return Err(protocol_err("AES-CTR padding exceeds plaintext length"));
+                }
+                Ok(PacketFrame::new(encrypted_body[1..payload_end].to_vec()))
+            }
         }
     }
 
@@ -367,6 +512,48 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                     .write_all(&ciphertext_and_tag)
                     .await
                     .map_err(io_err)
+            }
+            DirectionalCipher::AesCtr {
+                cipher,
+                mac,
+                mac_key,
+                sequence_number,
+            } => {
+                const BLOCK: usize = 16;
+                let payload = &frame.payload;
+                let body_len = 1 + payload.len();
+                let remainder = body_len % BLOCK;
+                let mut padding_len = if remainder == 0 {
+                    BLOCK
+                } else {
+                    BLOCK - remainder
+                };
+                if padding_len < 4 {
+                    padding_len += BLOCK;
+                }
+
+                let mut plaintext = Vec::with_capacity(body_len + padding_len);
+                plaintext.push(padding_len as u8);
+                plaintext.extend_from_slice(payload);
+                plaintext.extend(std::iter::repeat_n(0u8, padding_len));
+
+                let packet_length = (plaintext.len() as u32).to_be_bytes();
+
+                cipher.encrypt_in_place(&mut plaintext);
+
+                // Compute MAC over (seqnum || packet_length || encrypted_body)
+                let mut mac_data = Vec::new();
+                mac_data.extend_from_slice(&sequence_number.to_be_bytes());
+                mac_data.extend_from_slice(&packet_length);
+                mac_data.extend_from_slice(&plaintext);
+                let tag = mac.sign(mac_key, &mac_data);
+
+                *sequence_number = sequence_number.wrapping_add(1);
+
+                // Wire: [4-byte length] [encrypted body] [MAC tag]
+                self.inner.write_all(&packet_length).await.map_err(io_err)?;
+                self.inner.write_all(&plaintext).await.map_err(io_err)?;
+                self.inner.write_all(&tag).await.map_err(io_err)
             }
         }
     }

@@ -30,7 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{
-    Ed25519Verifier, Verifier, constant_time_eq, decode_ssh_string, encode_ssh_string,
+    EcdsaP256Verifier, Ed25519Verifier, RsaVerifier, Verifier, constant_time_eq,
+    decode_ssh_string, encode_ssh_string,
 };
 
 /// Client authentication request variants.
@@ -1491,12 +1492,51 @@ pub fn verify_publickey_auth_signature(
     public_key_blob: &[u8],
     signature_blob: &[u8],
 ) -> Result<(), RusshError> {
-    let key_bytes = parse_ed25519_public_key_blob(public_key_blob)?;
-    let sig_bytes = parse_ed25519_signature_blob(signature_blob)?;
     let payload =
         build_userauth_signing_payload(session_id, user, service, algorithm, public_key_blob);
-    let verifier = Ed25519Verifier::from_bytes(&key_bytes)?;
-    verifier.verify(&payload, &sig_bytes)
+
+    // Parse key type from public key blob
+    let mut key_offset = 0;
+    let key_type = decode_ssh_string(public_key_blob, &mut key_offset)?;
+    let key_type_str = std::str::from_utf8(&key_type).unwrap_or("");
+
+    // Parse signature blob
+    let mut sig_offset = 0;
+    let _sig_algo = decode_ssh_string(signature_blob, &mut sig_offset)?;
+    let sig_bytes = decode_ssh_string(signature_blob, &mut sig_offset)?;
+
+    match key_type_str {
+        "ssh-ed25519" => {
+            let pubkey_bytes = decode_ssh_string(public_key_blob, &mut key_offset)?;
+            let pubkey_arr: [u8; 32] = pubkey_bytes.try_into().map_err(|_| {
+                RusshError::new(
+                    RusshErrorCategory::Crypto,
+                    "Ed25519 public key must be 32 bytes",
+                )
+            })?;
+            let verifier = Ed25519Verifier::from_bytes(&pubkey_arr)?;
+            verifier.verify(&payload, &sig_bytes)
+        }
+        "ecdsa-sha2-nistp256" => {
+            let _curve_name = decode_ssh_string(public_key_blob, &mut key_offset)?;
+            let ec_point = decode_ssh_string(public_key_blob, &mut key_offset)?;
+            let verifier = EcdsaP256Verifier::from_sec1_bytes(&ec_point)?;
+            verifier.verify(&payload, &sig_bytes)
+        }
+        "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
+            let verifier = RsaVerifier::from_ssh_blob(public_key_blob)?;
+            let verifier = if key_type_str == "rsa-sha2-512" {
+                verifier.with_sha512()
+            } else {
+                verifier
+            };
+            verifier.verify(&payload, &sig_bytes)
+        }
+        _ => Err(RusshError::new(
+            RusshErrorCategory::Crypto,
+            format!("unsupported public key algorithm: {key_type_str}"),
+        )),
+    }
 }
 
 /// Verify the user signature in a certificate-based publickey auth request.

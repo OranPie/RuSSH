@@ -36,9 +36,10 @@ use russh_auth::{
 };
 use russh_core::{AlgorithmSet, PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{
-    CryptoPolicy, Curve25519Sha256, Ed25519Signer, Ed25519Verifier, HashAlgorithm,
-    KeyExchangeAlgorithm, OsRng, Sha256, Signer, Verifier, decode_ssh_string, derive_key_sha256,
-    encode_mpint, encode_ssh_string,
+    CryptoPolicy, Curve25519Sha256, DhGroup14Sha256, EcdhNistp256, EcdsaP256Signer,
+    EcdsaP256Verifier, Ed25519Signer, Ed25519Verifier, HashAlgorithm, KexKeyPair,
+    KeyExchangeAlgorithm, OsRng, RsaVerifier, Sha256, Signer, Verifier, decode_ssh_string,
+    derive_key_sha256, encode_mpint, encode_ssh_string,
 };
 
 const SSH_USERAUTH_SERVICE: &str = "ssh-userauth";
@@ -840,14 +841,13 @@ impl ClientSession {
         .to_frame()?;
 
         if self.kex_context.is_none() {
-            let keypair = Curve25519Sha256::generate_keypair(&mut OsRng);
             self.kex_context = Some(KexContext {
                 local_version: self.local_version.clone(),
                 remote_version: self.remote_version.clone(),
                 local_kexinit_payload: frame.payload.clone(),
                 remote_kexinit_payload: Vec::new(),
-                ephemeral_private_key: keypair.secret_bytes().to_vec(),
-                ephemeral_public_key: keypair.public_key.clone(),
+                ephemeral_private_key: Vec::new(),
+                ephemeral_public_key: Vec::new(),
             });
         }
 
@@ -1167,13 +1167,17 @@ impl ClientSession {
 
     /// Build a KEX_ECDH_INIT frame using the ephemeral keypair from kex_context.
     pub fn send_kex_ecdh_init(&mut self) -> Result<PacketFrame, RusshError> {
-        let ctx = self.kex_context.as_ref().ok_or_else(|| {
-            RusshError::new(
-                RusshErrorCategory::Protocol,
-                "no kex context: call send_kexinit first",
-            )
-        })?;
-        let pubkey = ctx.ephemeral_public_key.clone();
+        let kex_alg = self
+            .negotiated
+            .as_ref()
+            .map(|n| n.kex.clone())
+            .unwrap_or_else(|| "curve25519-sha256".to_string());
+        let keypair = generate_kex_keypair(&kex_alg)?;
+        let pubkey = keypair.public_key.clone();
+        if let Some(ctx) = self.kex_context.as_mut() {
+            ctx.ephemeral_private_key = keypair.secret_bytes().to_vec();
+            ctx.ephemeral_public_key = keypair.public_key.clone();
+        }
         self.bump_outgoing_sequence();
         TransportMessage::KexEcdhInit {
             client_pubkey: pubkey,
@@ -1210,11 +1214,16 @@ impl ClientSession {
             .ok_or_else(|| RusshError::new(RusshErrorCategory::Protocol, "no kex context"))?
             .clone();
 
+        let kex_alg = self
+            .negotiated
+            .as_ref()
+            .map(|n| n.kex.clone())
+            .unwrap_or_else(|| "curve25519-sha256".to_string());
         let kex_result =
-            Curve25519Sha256::compute_shared_secret(&ctx.ephemeral_private_key, &server_pubkey)?;
+            compute_kex_shared_secret(&kex_alg, &ctx.ephemeral_private_key, &server_pubkey)?;
         let shared_secret_mpint = encode_mpint(&kex_result.shared_secret);
 
-        let exchange_hash = compute_exchange_hash_curve25519(
+        let exchange_hash = compute_exchange_hash(
             &ctx.local_version,
             &ctx.remote_version,
             &ctx.local_kexinit_payload,
@@ -1224,6 +1233,7 @@ impl ClientSession {
             &server_pubkey,
             &shared_secret_mpint,
             true,
+            is_dh_kex(&kex_alg),
         );
 
         if self.config.strict_host_key_checking {
@@ -1647,7 +1657,12 @@ impl ServerSession {
                         proposal: Box::new(local),
                     }
                     .to_frame()?;
-                    let keypair = Curve25519Sha256::generate_keypair(&mut OsRng);
+                    let kex_alg = self
+                        .negotiated
+                        .as_ref()
+                        .map(|n| n.kex.clone())
+                        .unwrap_or_else(|| "curve25519-sha256".to_string());
+                    let keypair = generate_kex_keypair(&kex_alg)?;
                     self.kex_context = Some(KexContext {
                         local_version: self.local_version.clone(),
                         remote_version: self.remote_version.clone(),
@@ -1727,14 +1742,24 @@ impl ServerSession {
                         )
                     })?
                     .clone();
-                let kex_result = Curve25519Sha256::compute_shared_secret(
+                let kex_alg = self
+                    .negotiated
+                    .as_ref()
+                    .map(|n| n.kex.clone())
+                    .unwrap_or_else(|| "curve25519-sha256".to_string());
+                let host_key_alg = self
+                    .negotiated
+                    .as_ref()
+                    .map(|n| n.host_key.clone())
+                    .unwrap_or_else(|| "ssh-ed25519".to_string());
+                let kex_result = compute_kex_shared_secret(
+                    &kex_alg,
                     &ctx.ephemeral_private_key,
                     &client_pubkey,
                 )?;
                 let shared_secret_mpint = encode_mpint(&kex_result.shared_secret);
-                let host_signer = Ed25519Signer::from_seed(&seed);
-                let host_key_blob = host_signer.public_key_blob();
-                let exchange_hash = compute_exchange_hash_curve25519(
+                let host_key_blob = get_server_host_key_blob(&seed, &host_key_alg)?;
+                let exchange_hash = compute_exchange_hash(
                     &ctx.local_version,
                     &ctx.remote_version,
                     &ctx.local_kexinit_payload,
@@ -1744,11 +1769,10 @@ impl ServerSession {
                     &ctx.ephemeral_public_key,
                     &shared_secret_mpint,
                     false,
+                    is_dh_kex(&kex_alg),
                 );
-                let sig_bytes = host_signer.sign(&exchange_hash)?;
-                let mut signature = Vec::new();
-                signature.extend_from_slice(&encode_ssh_string(b"ssh-ed25519"));
-                signature.extend_from_slice(&encode_ssh_string(&sig_bytes));
+                let signature =
+                    sign_server_exchange_hash(&seed, &host_key_alg, &exchange_hash)?;
                 let keys = derive_session_keys(&shared_secret_mpint, &exchange_hash, None);
                 self.session_keys = Some(keys);
                 self.kex_context = None;
@@ -2548,11 +2572,12 @@ fn read_ssh_bytes(bytes: &[u8], offset: &mut usize) -> Result<Vec<u8>, RusshErro
     Ok(result)
 }
 
-/// Compute the RFC 4253 exchange hash for curve25519-sha256.
+/// Compute the RFC 4253 exchange hash.
 /// When `is_client` is true, `local_version` is V_C and `remote_version` is V_S.
 /// When `is_client` is false (server), `local_version` is V_S and `remote_version` is V_C.
+/// When `dh_mode` is true, ephemeral public keys are encoded as mpint (DH groups).
 #[allow(clippy::too_many_arguments)]
-fn compute_exchange_hash_curve25519(
+fn compute_exchange_hash(
     local_version: &str,
     remote_version: &str,
     local_kexinit_payload: &[u8],
@@ -2562,6 +2587,7 @@ fn compute_exchange_hash_curve25519(
     server_ephemeral_pubkey: &[u8],
     shared_secret_mpint: &[u8],
     is_client: bool,
+    dh_mode: bool,
 ) -> Vec<u8> {
     let (v_c, v_s, i_c, i_s) = if is_client {
         (
@@ -2584,8 +2610,13 @@ fn compute_exchange_hash_curve25519(
     data.extend_from_slice(&encode_ssh_string(i_c));
     data.extend_from_slice(&encode_ssh_string(i_s));
     data.extend_from_slice(&encode_ssh_string(server_host_key_blob));
-    data.extend_from_slice(&encode_ssh_string(client_ephemeral_pubkey));
-    data.extend_from_slice(&encode_ssh_string(server_ephemeral_pubkey));
+    if dh_mode {
+        data.extend_from_slice(&encode_mpint(client_ephemeral_pubkey));
+        data.extend_from_slice(&encode_mpint(server_ephemeral_pubkey));
+    } else {
+        data.extend_from_slice(&encode_ssh_string(client_ephemeral_pubkey));
+        data.extend_from_slice(&encode_ssh_string(server_ephemeral_pubkey));
+    }
     data.extend_from_slice(shared_secret_mpint);
     Sha256::digest(&data)
 }
@@ -2599,8 +2630,8 @@ fn derive_session_keys(
     let sid = session_id.unwrap_or(exchange_hash);
     SessionKeys {
         session_id: sid.to_vec(),
-        iv_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'A', sid, 12),
-        iv_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'B', sid, 12),
+        iv_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'A', sid, 16),
+        iv_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'B', sid, 16),
         key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'C', sid, 32),
         key_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'D', sid, 32),
         mac_key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'E', sid, 32),
@@ -2616,32 +2647,125 @@ fn verify_host_key_signature(
 ) -> Result<(), RusshError> {
     let mut offset = 0;
     let algo = decode_ssh_string(host_key_blob, &mut offset)?;
-    if algo != b"ssh-ed25519" {
-        return Err(RusshError::new(
-            RusshErrorCategory::Crypto,
-            "unsupported host key algorithm",
-        ));
-    }
-    let pubkey_bytes = decode_ssh_string(host_key_blob, &mut offset)?;
-    let pubkey_arr: [u8; 32] = pubkey_bytes.try_into().map_err(|_| {
-        RusshError::new(
-            RusshErrorCategory::Crypto,
-            "Ed25519 public key must be 32 bytes",
-        )
-    })?;
+    let algo_str = std::str::from_utf8(&algo).unwrap_or("");
 
     let mut sig_offset = 0;
-    let sig_algo = decode_ssh_string(signature_blob, &mut sig_offset)?;
-    if sig_algo != b"ssh-ed25519" {
-        return Err(RusshError::new(
-            RusshErrorCategory::Crypto,
-            "unsupported signature algorithm",
-        ));
-    }
+    let _sig_algo = decode_ssh_string(signature_blob, &mut sig_offset)?;
     let sig_bytes = decode_ssh_string(signature_blob, &mut sig_offset)?;
 
-    let verifier = Ed25519Verifier::from_bytes(&pubkey_arr)?;
-    verifier.verify(exchange_hash, &sig_bytes)
+    match algo_str {
+        "ssh-ed25519" => {
+            let pubkey_bytes = decode_ssh_string(host_key_blob, &mut offset)?;
+            let pubkey_arr: [u8; 32] = pubkey_bytes.try_into().map_err(|_| {
+                RusshError::new(
+                    RusshErrorCategory::Crypto,
+                    "Ed25519 public key must be 32 bytes",
+                )
+            })?;
+            let verifier = Ed25519Verifier::from_bytes(&pubkey_arr)?;
+            verifier.verify(exchange_hash, &sig_bytes)
+        }
+        "ecdsa-sha2-nistp256" => {
+            let _curve_name = decode_ssh_string(host_key_blob, &mut offset)?;
+            let ec_point = decode_ssh_string(host_key_blob, &mut offset)?;
+            let verifier = EcdsaP256Verifier::from_sec1_bytes(&ec_point)?;
+            verifier.verify(exchange_hash, &sig_bytes)
+        }
+        "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
+            let verifier = RsaVerifier::from_ssh_blob(host_key_blob)?;
+            let verifier = if algo_str == "rsa-sha2-512" {
+                verifier.with_sha512()
+            } else {
+                verifier
+            };
+            verifier.verify(exchange_hash, &sig_bytes)
+        }
+        _ => Err(RusshError::new(
+            RusshErrorCategory::Crypto,
+            format!("unsupported host key algorithm: {algo_str}"),
+        )),
+    }
+}
+
+fn generate_kex_keypair(kex_alg: &str) -> Result<KexKeyPair, RusshError> {
+    match kex_alg {
+        "curve25519-sha256" | "curve25519-sha256@libssh.org" => {
+            Ok(Curve25519Sha256::generate_keypair(&mut OsRng))
+        }
+        "ecdh-sha2-nistp256" => Ok(EcdhNistp256::generate_keypair(&mut OsRng)),
+        "diffie-hellman-group14-sha256" => Ok(DhGroup14Sha256::generate_keypair(&mut OsRng)),
+        _ => Err(RusshError::new(
+            RusshErrorCategory::Crypto,
+            format!("unsupported KEX algorithm: {kex_alg}"),
+        )),
+    }
+}
+
+fn compute_kex_shared_secret(
+    kex_alg: &str,
+    private_key: &[u8],
+    peer_pubkey: &[u8],
+) -> Result<russh_crypto::KexResult, RusshError> {
+    match kex_alg {
+        "curve25519-sha256" | "curve25519-sha256@libssh.org" => {
+            Curve25519Sha256::compute_shared_secret(private_key, peer_pubkey)
+        }
+        "ecdh-sha2-nistp256" => EcdhNistp256::compute_shared_secret(private_key, peer_pubkey),
+        "diffie-hellman-group14-sha256" => {
+            DhGroup14Sha256::compute_shared_secret(private_key, peer_pubkey)
+        }
+        _ => Err(RusshError::new(
+            RusshErrorCategory::Crypto,
+            format!("unsupported KEX algorithm: {kex_alg}"),
+        )),
+    }
+}
+
+fn is_dh_kex(kex_alg: &str) -> bool {
+    kex_alg.starts_with("diffie-hellman-")
+}
+
+fn get_server_host_key_blob(
+    seed: &[u8; 32],
+    host_key_alg: &str,
+) -> Result<Vec<u8>, RusshError> {
+    match host_key_alg {
+        "ssh-ed25519" => Ok(Ed25519Signer::from_seed(seed).public_key_blob()),
+        "ecdsa-sha2-nistp256" => Ok(EcdsaP256Signer::from_bytes(seed)?.public_key_blob()),
+        _ => Err(RusshError::new(
+            RusshErrorCategory::Crypto,
+            format!("unsupported host key algorithm: {host_key_alg}"),
+        )),
+    }
+}
+
+fn sign_server_exchange_hash(
+    seed: &[u8; 32],
+    host_key_alg: &str,
+    exchange_hash: &[u8],
+) -> Result<Vec<u8>, RusshError> {
+    match host_key_alg {
+        "ssh-ed25519" => {
+            let signer = Ed25519Signer::from_seed(seed);
+            let sig_bytes = signer.sign(exchange_hash)?;
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&encode_ssh_string(b"ssh-ed25519"));
+            blob.extend_from_slice(&encode_ssh_string(&sig_bytes));
+            Ok(blob)
+        }
+        "ecdsa-sha2-nistp256" => {
+            let signer = EcdsaP256Signer::from_bytes(seed)?;
+            let sig_bytes = signer.sign(exchange_hash)?;
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&encode_ssh_string(b"ecdsa-sha2-nistp256"));
+            blob.extend_from_slice(&encode_ssh_string(&sig_bytes));
+            Ok(blob)
+        }
+        _ => Err(RusshError::new(
+            RusshErrorCategory::Crypto,
+            format!("unsupported host key algorithm for signing: {host_key_alg}"),
+        )),
+    }
 }
 
 #[cfg(test)]
