@@ -6,7 +6,7 @@
 //! Options:
 //!   -p PORT          Remote port (default: 22)
 //!   -l USER          Login user
-//!   -i IDENTITY      Path to Ed25519 private key (default: ~/.ssh/id_ed25519)
+//!   -i IDENTITY      Path to Ed25519 private key (may be repeated; default: ~/.ssh/id_ed25519)
 //!   -J JUMP          ProxyJump: [user@]host[:port]
 //!   -o KEY=VALUE     OpenSSH-style option (supports StrictHostKeyChecking=no)
 //!   -h, --help       Print this help
@@ -30,7 +30,7 @@ fn usage() -> ! {
          Options:\n\
          \x20 -p PORT          Remote port (default: 22)\n\
          \x20 -l USER          Login user\n\
-         \x20 -i IDENTITY      Path to Ed25519 private key (default: ~/.ssh/id_ed25519)\n\
+         \x20 -i IDENTITY      Path to Ed25519 private key (may be repeated)\n\
          \x20 -J JUMP          ProxyJump: [user@]host[:port]\n\
          \x20 -o KEY=VALUE     OpenSSH option (e.g. StrictHostKeyChecking=no)\n\
          \x20 -v               Increase verbosity (-vv, -vvv for more)\n\
@@ -44,7 +44,7 @@ struct Args {
     host: String,
     port: u16,
     user: String,
-    identity: Option<PathBuf>,
+    identity: Vec<PathBuf>,
     jump: Option<String>,
     strict_host_key_checking: bool,
     tofu: bool,
@@ -58,7 +58,7 @@ fn parse_args() -> Args {
     let mut host: Option<String> = None;
     let mut port: u16 = 22;
     let mut user: Option<String> = None;
-    let mut identity: Option<PathBuf> = None;
+    let mut identity: Vec<PathBuf> = Vec::new();
     let mut jump: Option<String> = None;
     let mut strict = true;
     let mut tofu = true;
@@ -100,7 +100,9 @@ fn parse_args() -> Args {
             }
             "-i" => {
                 i += 1;
-                identity = argv.get(i).map(PathBuf::from);
+                if let Some(p) = argv.get(i) {
+                    identity.push(PathBuf::from(p));
+                }
             }
             "-J" => {
                 i += 1;
@@ -155,17 +157,17 @@ fn parse_args() -> Args {
     }
 }
 
-fn resolve_identity(path: Option<&PathBuf>) -> Option<PathBuf> {
-    if let Some(p) = path {
-        return Some(p.clone());
+fn resolve_identity(paths: &[PathBuf]) -> Vec<PathBuf> {
+    if !paths.is_empty() {
+        return paths.to_vec();
     }
-    let home = std::env::var("HOME").ok()?;
-    let default = PathBuf::from(home).join(".ssh").join("id_ed25519");
-    if default.exists() {
-        Some(default)
-    } else {
-        None
+    if let Ok(home) = std::env::var("HOME") {
+        let default = PathBuf::from(home).join(".ssh").join("id_ed25519");
+        if default.exists() {
+            return vec![default];
+        }
     }
+    Vec::new()
 }
 
 fn read_password(prompt: &str) -> String {
@@ -176,6 +178,16 @@ fn read_password(prompt: &str) -> String {
     buf.trim_end_matches('\n')
         .trim_end_matches('\r')
         .to_string()
+}
+
+fn try_load_seed(path: &std::path::Path) -> Option<[u8; 32]> {
+    match russh_cli::load_ed25519_seed(path) {
+        Ok(seed) => Some(seed),
+        Err(e) => {
+            eprintln!("russh: warning: cannot load {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 fn load_seed(path: &std::path::Path) -> [u8; 32] {
@@ -204,7 +216,7 @@ async fn main() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
-    let identity_path = resolve_identity(args.identity.as_ref());
+    let identity_paths = resolve_identity(&args.identity);
 
     let mut cfg = ClientConfig::secure_defaults(&args.user);
     cfg.strict_host_key_checking = args.strict_host_key_checking;
@@ -225,10 +237,13 @@ async fn main() {
         let mut jump_cfg = ClientConfig::secure_defaults(&jump_user);
         jump_cfg.strict_host_key_checking = args.strict_host_key_checking;
 
-        let jump_seed = identity_path.as_deref().map(load_seed).unwrap_or_else(|| {
-            eprintln!("russh: -J requires an identity file (-i)");
-            process::exit(1);
-        });
+        let jump_seed = identity_paths
+            .first()
+            .map(|p| load_seed(p))
+            .unwrap_or_else(|| {
+                eprintln!("russh: -J requires an identity file (-i)");
+                process::exit(1);
+            });
 
         SshClient::connect_via_jump(
             format!("{jump_host}:{jump_port}"),
@@ -273,14 +288,20 @@ async fn main() {
         log.log(Severity::Debug, "host key verified");
     }
 
-    // Authenticate: try pubkey first, fall back to password.
-    let authed = if let Some(ref p) = identity_path {
-        let seed = load_seed(p);
-        let signer = Ed25519Signer::from_seed(&seed);
-        conn.authenticate_pubkey(&signer).await.is_ok()
-    } else {
-        false
-    };
+    // Authenticate: try each identity file (pubkey) in order, fall back to password.
+    let mut authed = false;
+    for id_path in &identity_paths {
+        if let Some(seed) = try_load_seed(id_path) {
+            let signer = Ed25519Signer::from_seed(&seed);
+            match conn.authenticate_pubkey(&signer).await {
+                Ok(()) => {
+                    authed = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
 
     if !authed {
         let prompt = format!("{}@{}'s password: ", args.user, args.host);

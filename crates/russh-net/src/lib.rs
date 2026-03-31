@@ -3048,4 +3048,48 @@ mod tests {
         // Total length: 1 + 4 + 21 + 1 = 27
         assert_eq!(p.len(), 27);
     }
+
+    /// Verify that a WindowChange channel request round-trips through
+    /// encoding and decoding, and that the SSH-spec `want_reply = false`
+    /// convention is preserved.
+    #[test]
+    fn window_change_request_encodes_correctly() {
+        use russh_channel::{ChannelMessage, ChannelRequest};
+
+        let msg = ChannelMessage::Request {
+            recipient_channel: 7,
+            want_reply: false,
+            request: ChannelRequest::WindowChange {
+                width_chars: 200,
+                height_rows: 50,
+                width_pixels: 1600,
+                height_pixels: 800,
+            },
+        };
+        let bytes = msg.to_bytes().expect("encode window-change");
+        let decoded = ChannelMessage::from_bytes(&bytes).expect("decode window-change");
+        assert_eq!(decoded, msg);
+
+        // Confirm want_reply is false in the wire encoding (byte at offset 5
+        // inside the CHANNEL_REQUEST payload: msg_type(1) + recipient(4) +
+        // string-length(4) + "window-change"(13) = offset 22, then want_reply).
+        // Instead of hard-coding offsets, re-check via the decoded struct.
+        if let ChannelMessage::Request {
+            want_reply,
+            request:
+                ChannelRequest::WindowChange {
+                    width_chars,
+                    height_rows,
+                    ..
+                },
+            ..
+        } = decoded
+        {
+            assert!(!want_reply, "window-change must have want_reply=false");
+            assert_eq!(width_chars, 200);
+            assert_eq!(height_rows, 50);
+        } else {
+            panic!("unexpected decoded variant");
+        }
+    }
 }
