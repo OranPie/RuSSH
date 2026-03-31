@@ -4,7 +4,8 @@
 //!
 //! [`SftpWirePacket`] encodes and decodes all SFTP v3 wire packets:
 //! - **Client→Server**: INIT, OPEN, CLOSE, READ, WRITE, LSTAT, FSTAT,
-//!   SETSTAT, OPENDIR, READDIR, REMOVE, MKDIR, RMDIR, REALPATH, STAT, RENAME
+//!   SETSTAT, OPENDIR, READDIR, REMOVE, MKDIR, RMDIR, REALPATH, STAT, RENAME,
+//!   READLINK, SYMLINK
 //! - **Server→Client**: VERSION, STATUS, HANDLE, DATA, NAME, ATTRS
 //!
 //! Packet format: `uint32 length || byte type || body` with all integers
@@ -394,6 +395,8 @@ pub mod sftp_type {
     pub const REALPATH: u8 = 16;
     pub const STAT: u8 = 17;
     pub const RENAME: u8 = 18;
+    pub const SSH_FXP_READLINK: u8 = 19;
+    pub const SSH_FXP_SYMLINK: u8 = 20;
     pub const STATUS: u8 = 101;
     pub const HANDLE: u8 = 102;
     pub const DATA: u8 = 103;
@@ -730,6 +733,16 @@ pub enum SftpWirePacket {
         oldpath: String,
         newpath: String,
     },
+    Readlink {
+        id: u32,
+        path: String,
+    },
+    /// OpenSSH reverses the argument order: target_path comes first on the wire.
+    Symlink {
+        id: u32,
+        target_path: String,
+        link_path: String,
+    },
     // Server → Client
     Version {
         version: u32,
@@ -872,6 +885,22 @@ impl SftpWirePacket {
                 sftp_write_u32(&mut body, *id);
                 sftp_write_string(&mut body, oldpath.as_bytes());
                 sftp_write_string(&mut body, newpath.as_bytes());
+            }
+            Self::Readlink { id, path } => {
+                body.push(sftp_type::SSH_FXP_READLINK);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, path.as_bytes());
+            }
+            Self::Symlink {
+                id,
+                target_path,
+                link_path,
+            } => {
+                // OpenSSH order: target_path first, then link_path
+                body.push(sftp_type::SSH_FXP_SYMLINK);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, target_path.as_bytes());
+                sftp_write_string(&mut body, link_path.as_bytes());
             }
             Self::Status {
                 id,
@@ -1046,6 +1075,22 @@ impl SftpWirePacket {
                     id,
                     oldpath,
                     newpath,
+                }
+            }
+            sftp_type::SSH_FXP_READLINK => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let path = sftp_read_utf8(data, &mut off)?;
+                Self::Readlink { id, path }
+            }
+            sftp_type::SSH_FXP_SYMLINK => {
+                // OpenSSH order: target_path first, then link_path
+                let id = sftp_read_u32(data, &mut off)?;
+                let target_path = sftp_read_utf8(data, &mut off)?;
+                let link_path = sftp_read_utf8(data, &mut off)?;
+                Self::Symlink {
+                    id,
+                    target_path,
+                    link_path,
                 }
             }
             sftp_type::STATUS => {
@@ -1607,6 +1652,66 @@ impl SftpFileServer {
                 }
             }
 
+            SftpWirePacket::Readlink { id, path } => {
+                let id = *id;
+                let full_path = match self.resolve_path_checked(path, false) {
+                    Err(_) => {
+                        return Ok(SftpWirePacket::Status {
+                            id,
+                            status: SftpStatus::PermissionDenied,
+                            message: "path escapes root".to_string(),
+                        });
+                    }
+                    Ok(p) => p,
+                };
+                match fs::read_link(&full_path) {
+                    Ok(target) => {
+                        let target_str = target.to_string_lossy().to_string();
+                        Ok(SftpWirePacket::Name {
+                            id,
+                            entries: vec![SftpNameEntry {
+                                filename: target_str.clone(),
+                                longname: target_str,
+                                attrs: FileAttrs::default(),
+                            }],
+                        })
+                    }
+                    Err(e) => Ok(Self::status_err(id, &e)),
+                }
+            }
+
+            SftpWirePacket::Symlink {
+                id,
+                target_path,
+                link_path,
+            } => {
+                let id = *id;
+                let link_full = match self.resolve_path_checked(link_path, true) {
+                    Err(_) => {
+                        return Ok(SftpWirePacket::Status {
+                            id,
+                            status: SftpStatus::PermissionDenied,
+                            message: "path escapes root".to_string(),
+                        });
+                    }
+                    Ok(p) => p,
+                };
+                let target_full = match self.resolve_path_checked(target_path, true) {
+                    Err(_) => {
+                        return Ok(SftpWirePacket::Status {
+                            id,
+                            status: SftpStatus::PermissionDenied,
+                            message: "path escapes root".to_string(),
+                        });
+                    }
+                    Ok(p) => p,
+                };
+                match std::os::unix::fs::symlink(&target_full, &link_full) {
+                    Ok(_) => Ok(Self::status_ok(id)),
+                    Err(e) => Ok(Self::status_err(id, &e)),
+                }
+            }
+
             // Unsupported or server→client packets
             _ => Ok(SftpWirePacket::Status {
                 id: 0,
@@ -1855,5 +1960,90 @@ mod tests {
 
         fs::remove_dir_all(&root).expect("cleanup should succeed");
         fs::remove_dir_all(&outside).expect("outside cleanup should succeed");
+    }
+
+    #[test]
+    fn symlink_wire_round_trip() {
+        let pkt = SftpWirePacket::Symlink {
+            id: 42,
+            target_path: "/data/target.txt".to_string(),
+            link_path: "/data/link.txt".to_string(),
+        };
+        let encoded = pkt.encode();
+        let decoded = SftpWirePacket::decode(&encoded).expect("decode should succeed");
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn readlink_wire_round_trip() {
+        let pkt = SftpWirePacket::Readlink {
+            id: 99,
+            path: "/some/symlink".to_string(),
+        };
+        let encoded = pkt.encode();
+        let decoded = SftpWirePacket::decode(&encoded).expect("decode should succeed");
+        assert_eq!(pkt, decoded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sftp_server_symlink_readlink_flow() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_symlink_readlink_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+        fs::write(root.join("target.txt"), b"hello").expect("file should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Create a symlink: link.txt -> target.txt
+        let response = server
+            .process(&SftpWirePacket::Symlink {
+                id: 1,
+                target_path: "target.txt".to_string(),
+                link_path: "link.txt".to_string(),
+            })
+            .expect("symlink should succeed");
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        // Verify symlink exists on disk
+        assert!(
+            root.join("link.txt")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // Readlink to verify the target
+        let response = server
+            .process(&SftpWirePacket::Readlink {
+                id: 2,
+                path: "link.txt".to_string(),
+            })
+            .expect("readlink should succeed");
+        match response {
+            SftpWirePacket::Name { id, entries } => {
+                assert_eq!(id, 2);
+                assert_eq!(entries.len(), 1);
+                // The readlink target should contain the resolved path to target.txt
+                assert!(
+                    entries[0].filename.contains("target.txt"),
+                    "expected target.txt in readlink result, got: {}",
+                    entries[0].filename
+                );
+            }
+            other => panic!("expected Name, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
     }
 }
