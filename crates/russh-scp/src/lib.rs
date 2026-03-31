@@ -4,6 +4,7 @@
 //!
 //! SCP uses a line-oriented protocol layered over an SSH `exec` channel:
 //!
+//! - **[`ScpTimestamp`]** — `T<mtime> 0 <atime> 0\n` timestamp preservation directive.
 //! - **[`ScpFileHeader`]** — `C<mode> <size> <filename>\n` file copy header.
 //! - **[`ScpDirHeader`]** — `D<mode> 0 <dirname>\n` directory descend header.
 //! - **`SCP_END_DIR`** — `E\n` directory ascend marker.
@@ -41,6 +42,7 @@ pub struct ScpCopyOptions {
     pub overwrite: bool,
     pub recursive: bool,
     pub preserve_permissions: bool,
+    pub preserve_times: bool,
     pub follow_symlinks: bool,
     pub buffer_size: usize,
 }
@@ -52,6 +54,7 @@ impl ScpCopyOptions {
             overwrite: true,
             recursive: false,
             preserve_permissions: true,
+            preserve_times: false,
             follow_symlinks: false,
             buffer_size: 128 * 1024,
         }
@@ -380,6 +383,62 @@ fn ensure_target_not_inside_source(source: &Path, target: &Path) -> Result<(), R
 // SCP wire protocol helpers
 // ---------------------------------------------------------------------------
 
+/// SCP T-directive for preserving file timestamps.
+/// Wire format: `T<mtime_secs> 0 <atime_secs> 0\n`
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScpTimestamp {
+    pub mtime_secs: u64,
+    pub atime_secs: u64,
+}
+
+impl ScpTimestamp {
+    pub fn encode(&self) -> Vec<u8> {
+        format!("T{} 0 {} 0\n", self.mtime_secs, self.atime_secs).into_bytes()
+    }
+
+    pub fn decode(line: &str) -> Result<Self, RusshError> {
+        let s = line.trim_end_matches('\n');
+        if !s.starts_with('T') {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "expected SCP T directive",
+            ));
+        }
+        let parts: Vec<&str> = s[1..].split(' ').collect();
+        if parts.len() != 4 {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "malformed SCP T directive",
+            ));
+        }
+        let mtime_secs: u64 = parts[0].parse().map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "SCP T directive mtime is not a valid integer",
+            )
+        })?;
+        let atime_secs: u64 = parts[2].parse().map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "SCP T directive atime is not a valid integer",
+            )
+        })?;
+        Ok(Self {
+            mtime_secs,
+            atime_secs,
+        })
+    }
+}
+
+/// Apply mtime and atime to a file path using filetime.
+pub fn apply_timestamps(path: &std::path::Path, ts: &ScpTimestamp) -> Result<(), RusshError> {
+    use filetime::FileTime;
+    let mtime = FileTime::from_unix_time(ts.mtime_secs as i64, 0);
+    let atime = FileTime::from_unix_time(ts.atime_secs as i64, 0);
+    filetime::set_file_times(path, atime, mtime)
+        .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))
+}
+
 /// SCP file copy header sent by the source process.
 /// Format: `C<mode> <size> <filename>\n`
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,10 +578,11 @@ pub fn parse_scp_file_receive(buf: &[u8]) -> Result<Option<(String, Vec<u8>)>, R
 mod tests {
     use std::env;
     use std::fs;
+    use std::time::Duration;
 
     use russh_channel::{Channel, ChannelKind};
 
-    use super::{ScpClient, ScpCopyOptions, ScpDirection};
+    use super::{ScpClient, ScpCopyOptions, ScpDirection, ScpTimestamp, apply_timestamps};
 
     #[test]
     fn file_copy_succeeds() {
@@ -629,6 +689,61 @@ mod tests {
             .recursive_copy_with_options(&source, &nested_target, ScpCopyOptions::secure_defaults())
             .expect_err("copy into subtree should be rejected");
         assert_eq!(error.category(), russh_core::RusshErrorCategory::Io);
+
+        fs::remove_dir_all(&tmp).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn scp_timestamp_encode_decode_round_trip() {
+        let ts = ScpTimestamp {
+            mtime_secs: 1_700_000_000,
+            atime_secs: 1_700_000_100,
+        };
+        let encoded = ts.encode();
+        let decoded = ScpTimestamp::decode(std::str::from_utf8(&encoded).unwrap())
+            .expect("decode should work");
+        assert_eq!(decoded.mtime_secs, ts.mtime_secs);
+        assert_eq!(decoded.atime_secs, ts.atime_secs);
+    }
+
+    #[test]
+    fn scp_timestamp_decode_parses_t_directive() {
+        let ts = ScpTimestamp::decode("T1234567890 0 1234567890 0\n").expect("decode should work");
+        assert_eq!(ts.mtime_secs, 1_234_567_890);
+        assert_eq!(ts.atime_secs, 1_234_567_890);
+    }
+
+    #[test]
+    fn scp_timestamp_apply_sets_file_times() {
+        let tmp = env::temp_dir().join("russh_scp_timestamp_test");
+        if tmp.exists() {
+            fs::remove_dir_all(&tmp).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&tmp).expect("tmp directory should be created");
+
+        let file = tmp.join("ts_test.txt");
+        fs::write(&file, b"timestamp-test").expect("file write should succeed");
+
+        let ts = ScpTimestamp {
+            mtime_secs: 1_000_000,
+            atime_secs: 2_000_000,
+        };
+        apply_timestamps(&file, &ts).expect("apply_timestamps should succeed");
+
+        let meta = fs::metadata(&file).expect("metadata should be readable");
+        let mtime = meta
+            .modified()
+            .expect("modified time should be available")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime since epoch");
+        let atime = meta
+            .accessed()
+            .expect("access time should be available")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("atime since epoch");
+
+        assert_eq!(mtime, Duration::from_secs(1_000_000));
+        assert_eq!(atime, Duration::from_secs(2_000_000));
 
         fs::remove_dir_all(&tmp).expect("cleanup should succeed");
     }
