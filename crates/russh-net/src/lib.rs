@@ -61,6 +61,8 @@ use russh_transport::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+
 /// Re-exported for callers that want to use public-key auth without depending on `russh-crypto` directly.
 pub use russh_crypto::Ed25519Signer;
 
@@ -303,6 +305,116 @@ impl DirectionalCipher {
     }
 }
 
+// ── DirectionalCompression ────────────────────────────────────────────────────
+
+/// Per-direction compression state for `zlib@openssh.com` (delayed compression).
+///
+/// The zlib stream is stateful: compression context persists across packets.
+/// Each packet is flushed with `Z_SYNC_FLUSH` per RFC 4253 §6.2.
+enum DirectionalCompression {
+    None,
+    Zlib {
+        compress: Compress,
+        decompress: Decompress,
+    },
+}
+
+impl DirectionalCompression {
+    fn new_zlib() -> Self {
+        Self::Zlib {
+            compress: Compress::new(Compression::default(), true),
+            decompress: Decompress::new(true),
+        }
+    }
+
+    /// Compress `data` in place using Z_SYNC_FLUSH.  No-op for `None`.
+    fn compress_payload(&mut self, data: &mut Vec<u8>) -> Result<(), RusshError> {
+        match self {
+            Self::None => Ok(()),
+            Self::Zlib { compress, .. } => {
+                let input = std::mem::take(data);
+                let mut output = vec![0u8; input.len() + 64];
+                let mut in_offset = 0;
+                let mut out_offset = 0;
+                loop {
+                    let before_in = compress.total_in();
+                    let before_out = compress.total_out();
+                    let status = compress
+                        .compress(
+                            &input[in_offset..],
+                            &mut output[out_offset..],
+                            FlushCompress::Sync,
+                        )
+                        .map_err(|e| {
+                            RusshError::new(
+                                RusshErrorCategory::Protocol,
+                                format!("zlib compress error: {e}"),
+                            )
+                        })?;
+                    in_offset += (compress.total_in() - before_in) as usize;
+                    out_offset += (compress.total_out() - before_out) as usize;
+                    match status {
+                        Status::Ok | Status::BufError => {
+                            if in_offset >= input.len() && out_offset < output.len() {
+                                break;
+                            }
+                            // Need more output space.
+                            output.resize(output.len() + input.len().max(128) + 64, 0);
+                        }
+                        Status::StreamEnd => break,
+                    }
+                }
+                output.truncate(out_offset);
+                *data = output;
+                Ok(())
+            }
+        }
+    }
+
+    /// Decompress `data` in place using Z_SYNC_FLUSH.  No-op for `None`.
+    fn decompress_payload(&mut self, data: &mut Vec<u8>) -> Result<(), RusshError> {
+        match self {
+            Self::None => Ok(()),
+            Self::Zlib { decompress, .. } => {
+                let input = std::mem::take(data);
+                let mut output = vec![0u8; input.len() * 2 + 64];
+                let mut in_offset = 0;
+                let mut out_offset = 0;
+                loop {
+                    let before_in = decompress.total_in();
+                    let before_out = decompress.total_out();
+                    let status = decompress
+                        .decompress(
+                            &input[in_offset..],
+                            &mut output[out_offset..],
+                            FlushDecompress::Sync,
+                        )
+                        .map_err(|e| {
+                            RusshError::new(
+                                RusshErrorCategory::Protocol,
+                                format!("zlib decompress error: {e}"),
+                            )
+                        })?;
+                    in_offset += (decompress.total_in() - before_in) as usize;
+                    out_offset += (decompress.total_out() - before_out) as usize;
+                    match status {
+                        Status::Ok | Status::BufError => {
+                            if in_offset >= input.len() && out_offset < output.len() {
+                                break;
+                            }
+                            output.resize(output.len() + input.len().max(128) * 2 + 64, 0);
+                        }
+                        Status::StreamEnd => break,
+                    }
+                }
+                output.truncate(out_offset);
+                *data = output;
+                Ok(())
+            }
+        }
+    }
+}
+
 // ── PacketStream ─────────────────────────────────────────────────────────────
 
 /// Async SSH packet framing over any `tokio` I/O stream.
@@ -316,6 +428,12 @@ pub struct PacketStream<S> {
     codec: PacketCodec,
     tx_cipher: DirectionalCipher,
     rx_cipher: DirectionalCipher,
+    tx_compression: DirectionalCompression,
+    rx_compression: DirectionalCompression,
+    /// Negotiated compression algorithm for TX (stored to support delayed activation).
+    pending_tx_compression: Option<String>,
+    /// Negotiated compression algorithm for RX (stored to support delayed activation).
+    pending_rx_compression: Option<String>,
     /// SSH protocol sequence number for outgoing packets (incremented per packet, all modes).
     tx_seq: u32,
     /// SSH protocol sequence number for incoming packets (incremented per packet, all modes).
@@ -329,6 +447,10 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
             codec: PacketCodec::with_defaults(),
             tx_cipher: DirectionalCipher::None,
             rx_cipher: DirectionalCipher::None,
+            tx_compression: DirectionalCompression::None,
+            rx_compression: DirectionalCompression::None,
+            pending_tx_compression: None,
+            pending_rx_compression: None,
             tx_seq: 0,
             rx_seq: 0,
         }
@@ -357,6 +479,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
             &neg.mac_server_to_client,
             &keys.mac_key_s2c,
         );
+        // Store compression algorithms for delayed activation after auth.
+        self.pending_tx_compression = Some(neg.compression_client_to_server.clone());
+        self.pending_rx_compression = Some(neg.compression_server_to_client.clone());
     }
 
     /// Enable AEAD encryption for the **server** side after NEWKEYS.
@@ -379,6 +504,9 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
             &neg.mac_client_to_server,
             &keys.mac_key_c2s,
         );
+        // Store compression algorithms for delayed activation after auth.
+        self.pending_tx_compression = Some(neg.compression_server_to_client.clone());
+        self.pending_rx_compression = Some(neg.compression_client_to_server.clone());
     }
 
     /// Enable only the TX (outgoing) cipher for the server after sending NEWKEYS.
@@ -393,6 +521,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
             &neg.mac_server_to_client,
             &keys.mac_key_s2c,
         );
+        self.pending_tx_compression = Some(neg.compression_server_to_client.clone());
     }
 
     /// Enable only the RX (incoming) cipher for the server after receiving client NEWKEYS.
@@ -407,6 +536,24 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
             &neg.mac_client_to_server,
             &keys.mac_key_c2s,
         );
+        self.pending_rx_compression = Some(neg.compression_client_to_server.clone());
+    }
+
+    /// Activate delayed compression (`zlib@openssh.com`) after user authentication succeeds.
+    ///
+    /// Must be called after `enable_*_encryption()` which stores the negotiated
+    /// compression algorithm names.  No-op if compression is `"none"`.
+    pub fn activate_compression(&mut self) {
+        if let Some(alg) = self.pending_tx_compression.take() {
+            if alg == "zlib@openssh.com" {
+                self.tx_compression = DirectionalCompression::new_zlib();
+            }
+        }
+        if let Some(alg) = self.pending_rx_compression.take() {
+            if alg == "zlib@openssh.com" {
+                self.rx_compression = DirectionalCompression::new_zlib();
+            }
+        }
     }
 
     /// Read lines until one starts with "SSH-" (the version banner).
@@ -545,11 +692,23 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
             }
         };
         self.rx_seq = seq.wrapping_add(1);
-        result
+        // Apply decompression after decryption if active.
+        match result {
+            Ok(mut frame) => {
+                self.rx_compression.decompress_payload(&mut frame.payload)?;
+                Ok(frame)
+            }
+            err => err,
+        }
     }
 
     /// Encode `frame` and write it to the stream.
     pub async fn write_packet(&mut self, frame: &PacketFrame) -> Result<(), RusshError> {
+        // Apply compression before encryption if active.
+        let mut payload = frame.payload.clone();
+        self.tx_compression.compress_payload(&mut payload)?;
+        let frame = &PacketFrame::new(payload);
+
         let seq = self.tx_seq;
         let result = match &mut self.tx_cipher {
             DirectionalCipher::None => {
@@ -1017,6 +1176,7 @@ impl SshClientConnection {
             match msg {
                 UserAuthMessage::Success => {
                     info!(user = %user, "password auth succeeded");
+                    self.stream.activate_compression();
                     return Ok(());
                 }
                 UserAuthMessage::Failure { .. } => {
@@ -1029,6 +1189,107 @@ impl SshClientConnection {
                 UserAuthMessage::Banner { .. } => {}
                 _ => {
                     return Err(protocol_err("unexpected auth response message"));
+                }
+            }
+        }
+    }
+
+    /// Begin keyboard-interactive authentication (RFC 4256).
+    ///
+    /// Sends the initial request and reads back the first
+    /// `KeyboardInteractiveInfoRequest`.  Returns the prompts as
+    /// `(prompt_text, echo)` pairs for the caller to display and collect
+    /// answers for.  An empty vec means the server sent zero prompts
+    /// (unusual but valid — the caller should still call
+    /// [`respond_keyboard_interactive`] with an empty response list).
+    ///
+    /// Returns `Err` if the server immediately rejects the method or
+    /// sends an unexpected message.
+    pub async fn authenticate_keyboard_interactive(
+        &mut self,
+    ) -> Result<Vec<(String, bool)>, RusshError> {
+        let user = self.session.config.user.clone();
+        debug!(user = %user, "starting keyboard-interactive auth");
+        let request = UserAuthRequest::KeyboardInteractive {
+            user: user.clone(),
+            service: "ssh-connection".to_owned(),
+            language_tag: String::new(),
+            submethods: String::new(),
+        };
+        let frame = self.session.send_userauth_request(request)?;
+        self.stream.write_packet(&frame).await?;
+
+        loop {
+            let response_frame = self.stream.read_packet().await?;
+            let msg = UserAuthMessage::from_frame(&response_frame)?;
+            debug!(msg_type = ?std::mem::discriminant(&msg), "kbd-interactive auth response");
+            self.session.receive_userauth_message(msg.clone())?;
+            match msg {
+                UserAuthMessage::KeyboardInteractiveInfoRequest { prompts, .. } => {
+                    return Ok(prompts);
+                }
+                UserAuthMessage::Success => {
+                    // Server accepted without prompts (e.g. PAM with no challenges).
+                    info!(user = %user, "keyboard-interactive auth succeeded (no prompts)");
+                    return Ok(Vec::new());
+                }
+                UserAuthMessage::Failure { .. } => {
+                    warn!(user = %user, "keyboard-interactive auth rejected");
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Auth,
+                        "keyboard-interactive authentication rejected",
+                    ));
+                }
+                UserAuthMessage::Banner { .. } => {}
+                _ => {
+                    return Err(protocol_err("unexpected keyboard-interactive response"));
+                }
+            }
+        }
+    }
+
+    /// Send responses to a keyboard-interactive challenge.
+    ///
+    /// After calling [`authenticate_keyboard_interactive`], collect answers
+    /// from the user and pass them here.  The server may respond with
+    /// `Success`, `Failure`, or *another* `InfoRequest` (multi-round).
+    ///
+    /// On success returns `Ok(None)`.  If the server asks another round
+    /// of questions, returns `Ok(Some(prompts))`.
+    pub async fn respond_keyboard_interactive(
+        &mut self,
+        responses: Vec<String>,
+    ) -> Result<Option<Vec<(String, bool)>>, RusshError> {
+        let user = self.session.config.user.clone();
+        debug!(user = %user, responses_count = responses.len(), "sending kbd-interactive responses");
+        let msg = UserAuthMessage::KeyboardInteractiveInfoResponse { responses };
+        let frame = msg.to_frame()?;
+        self.stream.write_packet(&frame).await?;
+
+        loop {
+            let response_frame = self.stream.read_packet().await?;
+            let reply = UserAuthMessage::from_frame(&response_frame)?;
+            debug!(msg_type = ?std::mem::discriminant(&reply), "kbd-interactive reply");
+            self.session.receive_userauth_message(reply.clone())?;
+            match reply {
+                UserAuthMessage::Success => {
+                    info!(user = %user, "keyboard-interactive auth succeeded");
+                    self.stream.activate_compression();
+                    return Ok(None);
+                }
+                UserAuthMessage::Failure { .. } => {
+                    warn!(user = %user, "keyboard-interactive auth failed");
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Auth,
+                        "keyboard-interactive authentication rejected",
+                    ));
+                }
+                UserAuthMessage::KeyboardInteractiveInfoRequest { prompts, .. } => {
+                    return Ok(Some(prompts));
+                }
+                UserAuthMessage::Banner { .. } => {}
+                _ => {
+                    return Err(protocol_err("unexpected keyboard-interactive response"));
                 }
             }
         }
@@ -1079,6 +1340,7 @@ impl SshClientConnection {
             match msg {
                 UserAuthMessage::Success => {
                     info!(user = %user, "pubkey auth succeeded");
+                    self.stream.activate_compression();
                     return Ok(());
                 }
                 UserAuthMessage::Failure { .. } => {
@@ -1145,7 +1407,10 @@ impl SshClientConnection {
             let msg = UserAuthMessage::from_frame(&response_frame)?;
             self.session.receive_userauth_message(msg.clone())?;
             match msg {
-                UserAuthMessage::Success => return Ok(()),
+                UserAuthMessage::Success => {
+                    self.stream.activate_compression();
+                    return Ok(());
+                }
                 UserAuthMessage::Failure { .. } => {
                     return Err(RusshError::new(
                         RusshErrorCategory::Auth,
@@ -1223,6 +1488,7 @@ impl SshClientConnection {
                 match msg {
                     UserAuthMessage::Success => {
                         success = true;
+                        self.stream.activate_compression();
                         break;
                     }
                     UserAuthMessage::Failure { .. } => break,
@@ -1684,6 +1950,195 @@ impl SshClientConnection {
         Ok(())
     }
 
+    /// Open a `direct-tcpip` channel to `host:port` through this SSH connection.
+    ///
+    /// Returns `(local_id, remote_id)` once the server confirms the channel.
+    /// Use this for local port forwarding (`-L`).
+    pub async fn open_direct_tcpip(
+        &mut self,
+        host: &str,
+        port: u16,
+        originator_host: &str,
+        originator_port: u16,
+    ) -> Result<(u32, u32), RusshError> {
+        debug!(host, port, "opening direct-tcpip channel");
+        let extra_data = ForwardHandle::build_direct_tcpip_open_extra(
+            host,
+            u32::from(port),
+            originator_host,
+            u32::from(originator_port),
+        );
+        let (local_id, mut open_msg) =
+            self.channel_manager.open_channel(ChannelKind::DirectTcpIp {
+                host: host.to_owned(),
+                port,
+            });
+
+        if let ChannelMessage::Open {
+            extra_data: ref mut ed,
+            ..
+        } = open_msg
+        {
+            *ed = extra_data;
+        }
+
+        self.stream.write_packet(&open_msg.to_frame()?).await?;
+
+        let remote_id = loop {
+            let frame = self.read_channel_packet().await?;
+            let ch = ChannelMessage::from_bytes(&frame.payload)?;
+            match &ch {
+                ChannelMessage::OpenConfirmation {
+                    recipient_channel,
+                    sender_channel,
+                    ..
+                } if *recipient_channel == local_id => {
+                    let rid = *sender_channel;
+                    self.channel_manager.accept_confirmation(local_id, &ch)?;
+                    debug!(local_id, remote_id = rid, "direct-tcpip channel confirmed");
+                    break rid;
+                }
+                ChannelMessage::OpenFailure { description, .. } => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Channel,
+                        format!("direct-tcpip channel open refused: {description}"),
+                    ));
+                }
+                _ => {}
+            }
+        };
+
+        Ok((local_id, remote_id))
+    }
+
+    /// Write data to an open channel as `SSH_MSG_CHANNEL_DATA`.
+    pub async fn channel_write(&mut self, remote_id: u32, data: &[u8]) -> Result<(), RusshError> {
+        let frame = channel_data_frame(remote_id, data);
+        self.stream.write_packet(&frame).await
+    }
+
+    /// Read data from the next `SSH_MSG_CHANNEL_DATA` arriving on `local_id`.
+    ///
+    /// Processes window-adjust and other channel messages through the
+    /// channel manager while waiting. Returns `Ok(data)` on data,
+    /// or an empty `Vec` on EOF/Close.
+    pub async fn channel_read(&mut self, local_id: u32) -> Result<Vec<u8>, RusshError> {
+        loop {
+            let frame = self.read_channel_packet().await?;
+            let ch = ChannelMessage::from_bytes(&frame.payload)?;
+            let responses = self.channel_manager.process(&ch)?;
+            for response in responses {
+                self.stream.write_packet(&response.to_frame()?).await?;
+            }
+            match ch {
+                ChannelMessage::Data {
+                    recipient_channel,
+                    data,
+                } if recipient_channel == local_id => {
+                    return Ok(data);
+                }
+                ChannelMessage::Eof { recipient_channel }
+                | ChannelMessage::Close { recipient_channel }
+                    if recipient_channel == local_id =>
+                {
+                    return Ok(vec![]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Drive bidirectional I/O between a TCP stream and an SSH channel.
+    ///
+    /// Used for local port forwarding: reads from `tcp` are sent as channel
+    /// data to `remote_id`; channel data arriving on `local_id` is written
+    /// to `tcp`. Returns when either side closes.
+    pub async fn relay_tcp_channel(
+        &mut self,
+        local_id: u32,
+        remote_id: u32,
+        tcp: &mut TcpStream,
+    ) -> Result<(), RusshError> {
+        let (mut tcp_rx, mut tcp_tx) = tcp.split();
+        let mut buf = vec![0u8; 32768];
+
+        loop {
+            tokio::select! {
+                n = tcp_rx.read(&mut buf) => {
+                    let n = match n {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let frame = channel_data_frame(remote_id, &buf[..n]);
+                    if self.stream.write_packet(&frame).await.is_err() {
+                        break;
+                    }
+                }
+                frame_res = self.stream.read_packet() => {
+                    let frame = match frame_res {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                    match ChannelMessage::from_bytes(&frame.payload) {
+                        Ok(ChannelMessage::Data { recipient_channel, data })
+                            if recipient_channel == local_id =>
+                        {
+                            if tcp_tx.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(ChannelMessage::WindowAdjust { .. }) => {
+                            // Process window adjust through the channel manager
+                            if let Ok(ch) = ChannelMessage::from_bytes(&frame.payload) {
+                                let _ = self.channel_manager.process(&ch);
+                            }
+                        }
+                        Ok(ChannelMessage::Eof { recipient_channel })
+                        | Ok(ChannelMessage::Close { recipient_channel })
+                            if recipient_channel == local_id =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Request SSH agent forwarding on an open session channel.
+    ///
+    /// Sends a `"auth-agent-req@openssh.com"` channel request with
+    /// `want_reply = true` and waits for the server's success/failure response.
+    pub async fn request_agent_forwarding(&mut self, channel_id: u32) -> Result<(), RusshError> {
+        debug!(channel_id, "requesting agent forwarding");
+        let req = ChannelMessage::Request {
+            recipient_channel: channel_id,
+            want_reply: true,
+            request: ChannelRequest::Unknown {
+                request_type: "auth-agent-req@openssh.com".to_string(),
+                data: vec![],
+            },
+        };
+        self.stream.write_packet(&req.to_frame()?).await?;
+
+        loop {
+            let frame = self.read_channel_packet().await?;
+            let ch = ChannelMessage::from_bytes(&frame.payload)?;
+            match ch {
+                ChannelMessage::Success { .. } => {
+                    info!(channel_id, "agent forwarding accepted");
+                    return Ok(());
+                }
+                ChannelMessage::Failure { .. } => {
+                    return Err(protocol_err("agent forwarding request rejected by server"));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Send `SSH_MSG_DISCONNECT` and flush the connection.
     pub async fn disconnect(&mut self) -> Result<(), RusshError> {
         self.session.close("client disconnect");
@@ -2105,6 +2560,7 @@ impl SshServerConnection {
                 self.stream.write_packet(&reply.to_frame()?).await?;
                 if let Some(user) = session.authenticated_user() {
                     info!(user = %user, "authentication successful");
+                    self.stream.activate_compression();
                     break;
                 }
             }
@@ -2195,6 +2651,7 @@ impl SshServerConnection {
                             pty_size: None,
                             pty_term: None,
                             env: Vec::new(),
+                            agent_forwarding_requested: false,
                         },
                     );
                     let confirm = ChannelMessage::OpenConfirmation {
@@ -2358,6 +2815,19 @@ impl SshServerConnection {
                             // Per RFC 4254 §6.7, window-change MUST NOT
                             // have want_reply set, so we do not send a
                             // response.
+                        }
+
+                        ChannelRequest::Unknown {
+                            ref request_type, ..
+                        } if request_type == "auth-agent-req@openssh.com" => {
+                            debug!("agent forwarding requested");
+                            state.agent_forwarding_requested = true;
+                            if want_reply {
+                                let ok = ChannelMessage::Success {
+                                    recipient_channel: client_ch,
+                                };
+                                self.stream.write_packet(&ok.to_frame()?).await?;
+                            }
                         }
 
                         ChannelRequest::Unknown {
@@ -2829,6 +3299,61 @@ impl SshServerConnection {
     }
 }
 
+// ── Agent forwarding relay ───────────────────────────────────────────────────
+
+/// Relay SSH agent protocol between an `auth-agent@openssh.com` channel and
+/// a local Unix domain socket (`SSH_AUTH_SOCK`).
+///
+/// Reads data from the channel and writes it to the Unix socket, and vice
+/// versa, until one side sends EOF or the socket closes.
+#[cfg(unix)]
+pub async fn relay_agent_channel<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut PacketStream<S>,
+    channel_id: u32,
+    auth_sock: &str,
+) -> Result<(), RusshError> {
+    use tokio::net::UnixStream;
+
+    let mut sock = UnixStream::connect(auth_sock).await.map_err(|e| {
+        RusshError::new(
+            RusshErrorCategory::Io,
+            format!("failed to connect to SSH_AUTH_SOCK ({auth_sock}): {e}"),
+        )
+    })?;
+
+    let mut buf = vec![0u8; 16384];
+    loop {
+        tokio::select! {
+            result = stream.read_packet() => {
+                let frame = result?;
+                let msg = ChannelMessage::from_bytes(&frame.payload)?;
+                match msg {
+                    ChannelMessage::Data { data, .. } => {
+                        sock.write_all(&data).await.map_err(io_err)?;
+                    }
+                    ChannelMessage::Eof { .. } | ChannelMessage::Close { .. } => break,
+                    _ => {}
+                }
+            }
+            result = sock.read(&mut buf) => {
+                let n = result.map_err(io_err)?;
+                if n == 0 {
+                    // Socket closed; send EOF on the channel.
+                    let eof = ChannelMessage::Eof { recipient_channel: channel_id };
+                    stream.write_packet(&eof.to_frame()?).await?;
+                    break;
+                }
+                let data_msg = ChannelMessage::Data {
+                    recipient_channel: channel_id,
+                    data: buf[..n].to_vec(),
+                };
+                stream.write_packet(&data_msg.to_frame()?).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── ServerChannelState ───────────────────────────────────────────────────────
 
 struct ServerChannelState {
@@ -2846,6 +3371,8 @@ struct ServerChannelState {
     pty_term: Option<String>,
     /// Environment variables sent by the client via env channel requests.
     env: Vec<(String, String)>,
+    /// Whether the client has requested SSH agent forwarding on this channel.
+    agent_forwarding_requested: bool,
 }
 
 // ── SshServer ────────────────────────────────────────────────────────────────
@@ -3091,5 +3618,261 @@ mod tests {
         } else {
             panic!("unexpected decoded variant");
         }
+    }
+
+    // ── open_direct_tcpip / channel_write / channel_read tests ───────────
+
+    #[test]
+    fn open_direct_tcpip_builds_correct_frame() {
+        use russh_channel::{ChannelKind, ChannelManager, ChannelMessage, ForwardHandle};
+
+        let mut cm = ChannelManager::new();
+        let (local_id, mut open_msg) = cm.open_channel(ChannelKind::DirectTcpIp {
+            host: "db.internal".to_owned(),
+            port: 5432,
+        });
+
+        let extra =
+            ForwardHandle::build_direct_tcpip_open_extra("db.internal", 5432, "127.0.0.1", 0);
+        if let ChannelMessage::Open {
+            ref mut extra_data,
+            ref channel_type,
+            sender_channel,
+            initial_window_size,
+            maximum_packet_size,
+        } = open_msg
+        {
+            assert_eq!(channel_type, "direct-tcpip");
+            assert_eq!(sender_channel, local_id);
+            assert!(initial_window_size > 0);
+            assert!(maximum_packet_size > 0);
+            *extra_data = extra.clone();
+        } else {
+            panic!("expected ChannelMessage::Open");
+        }
+
+        // Verify the extra_data wire format:
+        // [4-byte len]["db.internal"][4-byte port=5432][4-byte len]["127.0.0.1"][4-byte port=0]
+        let mut off = 0;
+        let host_len = u32::from_be_bytes([extra[0], extra[1], extra[2], extra[3]]) as usize;
+        off += 4;
+        assert_eq!(&extra[off..off + host_len], b"db.internal");
+        off += host_len;
+        let port_val =
+            u32::from_be_bytes([extra[off], extra[off + 1], extra[off + 2], extra[off + 3]]);
+        assert_eq!(port_val, 5432);
+        off += 4;
+        let orig_len =
+            u32::from_be_bytes([extra[off], extra[off + 1], extra[off + 2], extra[off + 3]])
+                as usize;
+        off += 4;
+        assert_eq!(&extra[off..off + orig_len], b"127.0.0.1");
+        off += orig_len;
+        let orig_port =
+            u32::from_be_bytes([extra[off], extra[off + 1], extra[off + 2], extra[off + 3]]);
+        assert_eq!(orig_port, 0);
+
+        // Verify the full message can be serialized.
+        let frame = open_msg.to_frame().expect("encode direct-tcpip open");
+        // Byte 0 must be SSH_MSG_CHANNEL_OPEN (90).
+        assert_eq!(frame.payload[0], 90);
+    }
+
+    #[test]
+    fn channel_data_frame_encodes_correctly() {
+        let data = b"hello world";
+        let frame = channel_data_frame(42, data);
+        let p = &frame.payload;
+        // Byte 0: SSH_MSG_CHANNEL_DATA (94)
+        assert_eq!(p[0], 94);
+        // Bytes 1..5: recipient channel
+        let ch = u32::from_be_bytes([p[1], p[2], p[3], p[4]]);
+        assert_eq!(ch, 42);
+        // Bytes 5..9: data length
+        let len = u32::from_be_bytes([p[5], p[6], p[7], p[8]]) as usize;
+        assert_eq!(len, data.len());
+        // Bytes 9..: data
+        assert_eq!(&p[9..9 + len], data);
+    }
+
+    #[test]
+    fn compression_round_trip() {
+        let original = b"Hello, SSH compression! This is a test payload for zlib@openssh.com delayed compression.";
+        let mut data = original.to_vec();
+
+        let mut tx = DirectionalCompression::new_zlib();
+        tx.compress_payload(&mut data).expect("compress");
+        // Compressed data should differ from the original.
+        assert_ne!(data, original.as_slice());
+
+        let mut rx = DirectionalCompression::new_zlib();
+        rx.decompress_payload(&mut data).expect("decompress");
+        assert_eq!(data, original.as_slice());
+    }
+
+    #[test]
+    fn compression_none_is_passthrough() {
+        let original = b"payload that should not change";
+        let mut data = original.to_vec();
+
+        let mut none_tx = DirectionalCompression::None;
+        none_tx.compress_payload(&mut data).expect("compress none");
+        assert_eq!(data, original.as_slice());
+
+        let mut none_rx = DirectionalCompression::None;
+        none_rx
+            .decompress_payload(&mut data)
+            .expect("decompress none");
+        assert_eq!(data, original.as_slice());
+    }
+
+    #[test]
+    fn algorithm_set_includes_compression() {
+        use russh_core::AlgorithmSet;
+        let defaults = AlgorithmSet::secure_defaults();
+        assert!(defaults.compression.contains(&"none".to_string()));
+        assert!(
+            defaults
+                .compression
+                .contains(&"zlib@openssh.com".to_string())
+        );
+    }
+
+    #[test]
+    fn compression_stateful_across_packets() {
+        let mut tx = DirectionalCompression::new_zlib();
+        let mut rx = DirectionalCompression::new_zlib();
+
+        // Compress and decompress multiple packets through the same stream.
+        for i in 0..5 {
+            let original = format!("packet number {i} with repeated data aaaaaaaaaa").into_bytes();
+            let mut data = original.clone();
+            tx.compress_payload(&mut data).expect("compress");
+            rx.decompress_payload(&mut data).expect("decompress");
+            assert_eq!(data, original);
+        }
+    }
+
+    #[test]
+    fn keyboard_interactive_request_round_trips() {
+        let request = UserAuthRequest::KeyboardInteractive {
+            user: "alice".to_owned(),
+            service: "ssh-connection".to_owned(),
+            language_tag: String::new(),
+            submethods: String::new(),
+        };
+        let msg = UserAuthMessage::Request(request.clone());
+        let frame = msg.to_frame().expect("encode kbd-interactive request");
+        let decoded = UserAuthMessage::from_frame(&frame).expect("decode kbd-interactive request");
+        if let UserAuthMessage::Request(UserAuthRequest::KeyboardInteractive {
+            user,
+            service,
+            language_tag,
+            submethods,
+        }) = decoded
+        {
+            assert_eq!(user, "alice");
+            assert_eq!(service, "ssh-connection");
+            assert_eq!(language_tag, "");
+            assert_eq!(submethods, "");
+        } else {
+            panic!("expected KeyboardInteractive request, got {decoded:?}");
+        }
+    }
+
+    #[test]
+    fn keyboard_interactive_info_response_round_trips() {
+        let msg = UserAuthMessage::KeyboardInteractiveInfoResponse {
+            responses: vec!["s3cret".to_owned(), "42".to_owned()],
+        };
+        let frame = msg.to_frame().expect("encode info response");
+        let decoded = UserAuthMessage::from_frame(&frame).expect("decode info response");
+        if let UserAuthMessage::KeyboardInteractiveInfoResponse { responses } = decoded {
+            assert_eq!(responses, vec!["s3cret", "42"]);
+        } else {
+            panic!("expected InfoResponse, got {decoded:?}");
+        }
+    }
+
+    #[test]
+    fn keyboard_interactive_info_request_round_trips() {
+        let msg = UserAuthMessage::KeyboardInteractiveInfoRequest {
+            name: "PAM".to_owned(),
+            instruction: "Enter your credentials".to_owned(),
+            language_tag: String::new(),
+            prompts: vec![
+                ("Password: ".to_owned(), false),
+                ("Token: ".to_owned(), true),
+            ],
+        };
+        let frame = msg.to_frame().expect("encode info request");
+        let decoded = UserAuthMessage::from_frame(&frame).expect("decode info request");
+        if let UserAuthMessage::KeyboardInteractiveInfoRequest {
+            name,
+            instruction,
+            prompts,
+            ..
+        } = decoded
+        {
+            assert_eq!(name, "PAM");
+            assert_eq!(instruction, "Enter your credentials");
+            assert_eq!(prompts.len(), 2);
+            assert_eq!(prompts[0], ("Password: ".to_owned(), false));
+            assert_eq!(prompts[1], ("Token: ".to_owned(), true));
+        } else {
+            panic!("expected InfoRequest, got {decoded:?}");
+        }
+    }
+
+    /// Verify that an `auth-agent-req@openssh.com` channel request
+    /// encodes to the expected SSH wire format and round-trips through
+    /// `ChannelMessage` encode/decode.
+    #[test]
+    fn agent_forwarding_request_encodes_correctly() {
+        use russh_channel::{ChannelMessage, ChannelRequest};
+
+        let msg = ChannelMessage::Request {
+            recipient_channel: 3,
+            want_reply: true,
+            request: ChannelRequest::Unknown {
+                request_type: "auth-agent-req@openssh.com".to_string(),
+                data: vec![],
+            },
+        };
+        let bytes = msg.to_bytes().expect("encode agent forwarding request");
+        let decoded = ChannelMessage::from_bytes(&bytes).expect("decode agent forwarding request");
+
+        if let ChannelMessage::Request {
+            recipient_channel,
+            want_reply,
+            request: ChannelRequest::Unknown { request_type, data },
+        } = decoded
+        {
+            assert_eq!(recipient_channel, 3);
+            assert!(want_reply, "auth-agent-req must have want_reply=true");
+            assert_eq!(request_type, "auth-agent-req@openssh.com");
+            assert!(data.is_empty());
+        } else {
+            panic!("unexpected decoded variant");
+        }
+    }
+
+    /// Verify that `ServerChannelState` tracks the `agent_forwarding_requested` flag.
+    #[test]
+    fn server_channel_state_tracks_agent_forwarding() {
+        let mut state = ServerChannelState {
+            is_sftp: false,
+            scp_root: None,
+            sftp_server: None,
+            sftp_framer: SftpFramer::new(),
+            pty_requested: false,
+            pty_size: None,
+            pty_term: None,
+            env: Vec::new(),
+            agent_forwarding_requested: false,
+        };
+        assert!(!state.agent_forwarding_requested);
+        state.agent_forwarding_requested = true;
+        assert!(state.agent_forwarding_requested);
     }
 }

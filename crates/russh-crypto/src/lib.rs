@@ -84,6 +84,11 @@ impl CryptoPolicy {
         &self.algorithms
     }
 
+    /// Mutable access to the algorithm set for CLI/config overrides.
+    pub fn algorithms_mut(&mut self) -> &mut AlgorithmSet {
+        &mut self.algorithms
+    }
+
     #[must_use]
     pub fn allow_legacy(&self) -> bool {
         self.allow_legacy

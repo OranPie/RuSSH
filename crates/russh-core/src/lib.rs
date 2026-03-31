@@ -93,6 +93,7 @@ pub struct AlgorithmSet {
     pub host_key: Vec<String>,
     pub ciphers: Vec<String>,
     pub macs: Vec<String>,
+    pub compression: Vec<String>,
 }
 
 impl AlgorithmSet {
@@ -119,6 +120,7 @@ impl AlgorithmSet {
                 "hmac-sha2-256-etm@openssh.com".to_string(),
                 "hmac-sha2-512-etm@openssh.com".to_string(),
             ],
+            compression: vec!["none".to_string(), "zlib@openssh.com".to_string()],
         }
     }
 }

@@ -97,6 +97,18 @@ impl AuthMethod {
             Self::KeyboardInteractive => "keyboard-interactive",
         }
     }
+
+    /// Parse an SSH method name into an `AuthMethod`.
+    /// Returns `None` for unrecognised names.
+    #[must_use]
+    pub fn from_ssh_name(name: &str) -> Option<Self> {
+        match name {
+            "publickey" => Some(Self::PublicKey),
+            "password" => Some(Self::Password),
+            "keyboard-interactive" => Some(Self::KeyboardInteractive),
+            _ => None,
+        }
+    }
 }
 
 /// Typed authentication events for observability.
@@ -2297,5 +2309,41 @@ mod tests {
         let cert = OpenSshCertificate::parse(&blob).expect("should still parse");
         cert.verify_ca_signature()
             .expect_err("tampered cert should fail signature verification");
+    }
+
+    #[test]
+    fn auth_method_from_ssh_name_known() {
+        assert_eq!(
+            AuthMethod::from_ssh_name("publickey"),
+            Some(AuthMethod::PublicKey)
+        );
+        assert_eq!(
+            AuthMethod::from_ssh_name("password"),
+            Some(AuthMethod::Password)
+        );
+        assert_eq!(
+            AuthMethod::from_ssh_name("keyboard-interactive"),
+            Some(AuthMethod::KeyboardInteractive)
+        );
+    }
+
+    #[test]
+    fn auth_method_from_ssh_name_unknown() {
+        assert_eq!(AuthMethod::from_ssh_name("gssapi-with-mic"), None);
+        assert_eq!(AuthMethod::from_ssh_name(""), None);
+    }
+
+    #[test]
+    fn auth_method_round_trips() {
+        for method in [
+            AuthMethod::PublicKey,
+            AuthMethod::Password,
+            AuthMethod::KeyboardInteractive,
+        ] {
+            assert_eq!(
+                AuthMethod::from_ssh_name(method.as_ssh_name()),
+                Some(method)
+            );
+        }
     }
 }
