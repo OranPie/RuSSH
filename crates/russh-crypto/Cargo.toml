@@ -16,12 +16,15 @@ test-utils = []
 [dependencies]
 russh-core = { path = "../russh-core" }
 aes-gcm.workspace = true
+aes.workspace = true
+ctr.workspace = true
 chacha20poly1305.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 x25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 p256.workspace = true
+rsa.workspace = true
 getrandom.workspace = true
 rand_core.workspace = true
 zeroize.workspace = true

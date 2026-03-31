@@ -796,8 +796,11 @@ impl ClientSession {
             remote: peer.banner,
         });
 
-        let negotiated =
-            negotiate_algorithms(self.config.transport.policy.algorithms(), &peer.algorithms)?;
+        let negotiated = negotiate_algorithms(
+            self.config.transport.policy.algorithms(),
+            &peer.algorithms,
+            false,
+        )?;
         self.events.push(TransportEvent::AlgorithmNegotiated {
             kex: negotiated.kex.clone(),
             cipher_client_to_server: negotiated.cipher_client_to_server.clone(),
@@ -982,7 +985,7 @@ impl ClientSession {
                     )
                     .with_client_extensions();
                     let negotiated =
-                        negotiate_algorithms_from_proposals(&local, proposal.as_ref())?;
+                        negotiate_algorithms_from_proposals(&local, proposal.as_ref(), false)?;
                     self.negotiated = Some(negotiated);
                     self.remote_kexinit_received = true;
                     self.events.push(TransportEvent::KeyExchangeInitReceived);
@@ -1595,8 +1598,11 @@ impl ServerSession {
             ));
         }
 
-        let negotiated =
-            negotiate_algorithms(self.config.transport.policy.algorithms(), client_algorithms)?;
+        let negotiated = negotiate_algorithms(
+            self.config.transport.policy.algorithms(),
+            client_algorithms,
+            true,
+        )?;
         self.state = SessionState::AlgorithmsNegotiated;
         self.negotiated = Some(negotiated);
 
@@ -1639,7 +1645,8 @@ impl ServerSession {
                     self.config.transport.policy.algorithms().clone(),
                 )
                 .with_server_extensions();
-                let negotiated = negotiate_algorithms_from_proposals(&local, proposal.as_ref())?;
+                let negotiated =
+                    negotiate_algorithms_from_proposals(&local, proposal.as_ref(), true)?;
                 self.negotiated = Some(negotiated);
 
                 if self.config.host_key_seed.is_some() {
@@ -1771,8 +1778,7 @@ impl ServerSession {
                     false,
                     is_dh_kex(&kex_alg),
                 );
-                let signature =
-                    sign_server_exchange_hash(&seed, &host_key_alg, &exchange_hash)?;
+                let signature = sign_server_exchange_hash(&seed, &host_key_alg, &exchange_hash)?;
                 let keys = derive_session_keys(&shared_secret_mpint, &exchange_hash, None);
                 self.session_keys = Some(keys);
                 self.kex_context = None;
@@ -2301,14 +2307,22 @@ fn is_supported_banner(banner: &str) -> bool {
 fn negotiate_algorithms(
     local: &AlgorithmSet,
     remote: &AlgorithmSet,
+    we_are_server: bool,
 ) -> Result<NegotiatedAlgorithms, RusshError> {
+    // RFC 4253 §7.1: "the first algorithm on the client's name-list
+    // that is also on the server's name-list MUST be chosen."
+    let (client, server) = if we_are_server {
+        (remote, local)
+    } else {
+        (local, remote)
+    };
     Ok(NegotiatedAlgorithms {
-        kex: pick_algorithm(&local.kex, &remote.kex, "kex")?,
-        host_key: pick_algorithm(&local.host_key, &remote.host_key, "host key")?,
-        cipher_client_to_server: pick_algorithm(&local.ciphers, &remote.ciphers, "cipher c2s")?,
-        cipher_server_to_client: pick_algorithm(&local.ciphers, &remote.ciphers, "cipher s2c")?,
-        mac_client_to_server: pick_algorithm(&local.macs, &remote.macs, "mac c2s")?,
-        mac_server_to_client: pick_algorithm(&local.macs, &remote.macs, "mac s2c")?,
+        kex: pick_algorithm(&client.kex, &server.kex, "kex")?,
+        host_key: pick_algorithm(&client.host_key, &server.host_key, "host key")?,
+        cipher_client_to_server: pick_algorithm(&client.ciphers, &server.ciphers, "cipher c2s")?,
+        cipher_server_to_client: pick_algorithm(&client.ciphers, &server.ciphers, "cipher s2c")?,
+        mac_client_to_server: pick_algorithm(&client.macs, &server.macs, "mac c2s")?,
+        mac_server_to_client: pick_algorithm(&client.macs, &server.macs, "mac s2c")?,
         compression_client_to_server: "none".to_string(),
         compression_server_to_client: "none".to_string(),
         strict_kex: false,
@@ -2320,42 +2334,49 @@ fn negotiate_algorithms(
 fn negotiate_algorithms_from_proposals(
     local: &KexInitProposal,
     remote: &KexInitProposal,
+    we_are_server: bool,
 ) -> Result<NegotiatedAlgorithms, RusshError> {
+    // RFC 4253 §7.1: iterate the client's algorithm lists first.
+    let (client, server) = if we_are_server {
+        (remote, local)
+    } else {
+        (local, remote)
+    };
     Ok(NegotiatedAlgorithms {
-        kex: pick_algorithm(&local.kex_algorithms, &remote.kex_algorithms, "kex")?,
+        kex: pick_algorithm(&client.kex_algorithms, &server.kex_algorithms, "kex")?,
         host_key: pick_algorithm(
-            &local.host_key_algorithms,
-            &remote.host_key_algorithms,
+            &client.host_key_algorithms,
+            &server.host_key_algorithms,
             "host key",
         )?,
         cipher_client_to_server: pick_algorithm(
-            &local.ciphers_client_to_server,
-            &remote.ciphers_client_to_server,
+            &client.ciphers_client_to_server,
+            &server.ciphers_client_to_server,
             "cipher c2s",
         )?,
         cipher_server_to_client: pick_algorithm(
-            &local.ciphers_server_to_client,
-            &remote.ciphers_server_to_client,
+            &client.ciphers_server_to_client,
+            &server.ciphers_server_to_client,
             "cipher s2c",
         )?,
         mac_client_to_server: pick_algorithm(
-            &local.macs_client_to_server,
-            &remote.macs_client_to_server,
+            &client.macs_client_to_server,
+            &server.macs_client_to_server,
             "mac c2s",
         )?,
         mac_server_to_client: pick_algorithm(
-            &local.macs_server_to_client,
-            &remote.macs_server_to_client,
+            &client.macs_server_to_client,
+            &server.macs_server_to_client,
             "mac s2c",
         )?,
         compression_client_to_server: pick_algorithm(
-            &local.compression_client_to_server,
-            &remote.compression_client_to_server,
+            &client.compression_client_to_server,
+            &server.compression_client_to_server,
             "compression c2s",
         )?,
         compression_server_to_client: pick_algorithm(
-            &local.compression_server_to_client,
-            &remote.compression_server_to_client,
+            &client.compression_server_to_client,
+            &server.compression_server_to_client,
             "compression s2c",
         )?,
         strict_kex: (local.strict_kex_c && remote.strict_kex_s)
@@ -2725,10 +2746,7 @@ fn is_dh_kex(kex_alg: &str) -> bool {
     kex_alg.starts_with("diffie-hellman-")
 }
 
-fn get_server_host_key_blob(
-    seed: &[u8; 32],
-    host_key_alg: &str,
-) -> Result<Vec<u8>, RusshError> {
+fn get_server_host_key_blob(seed: &[u8; 32], host_key_alg: &str) -> Result<Vec<u8>, RusshError> {
     match host_key_alg {
         "ssh-ed25519" => Ok(Ed25519Signer::from_seed(seed).public_key_blob()),
         "ecdsa-sha2-nistp256" => Ok(EcdsaP256Signer::from_bytes(seed)?.public_key_blob()),
@@ -3016,7 +3034,7 @@ mod tests {
             "hmac-sha2-512-etm@openssh.com".to_string(),
         ];
 
-        let negotiated = super::negotiate_algorithms_from_proposals(&local, &remote)
+        let negotiated = super::negotiate_algorithms_from_proposals(&local, &remote, false)
             .expect("proposal negotiation should succeed");
 
         assert_eq!(

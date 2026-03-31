@@ -1167,7 +1167,8 @@ mod interop_tests {
         };
 
         // Wait for sshd to be ready.
-        let ready = super::wait_for_tcp_ready(port, Some(&mut sshd), std::time::Duration::from_secs(3));
+        let ready =
+            super::wait_for_tcp_ready(port, Some(&mut sshd), std::time::Duration::from_secs(3));
         if !ready {
             let _ = sshd.kill();
             let _ = std::fs::remove_dir_all(&tmp);

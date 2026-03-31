@@ -102,6 +102,7 @@ impl AlgorithmSet {
             kex: vec![
                 "curve25519-sha256".to_string(),
                 "ecdh-sha2-nistp256".to_string(),
+                "diffie-hellman-group14-sha256".to_string(),
             ],
             host_key: vec![
                 "ssh-ed25519".to_string(),
@@ -109,8 +110,15 @@ impl AlgorithmSet {
                 "rsa-sha2-256".to_string(),
                 "rsa-sha2-512".to_string(),
             ],
-            ciphers: vec!["aes256-gcm@openssh.com".to_string()],
-            macs: vec!["hmac-sha2-256-etm@openssh.com".to_string()],
+            ciphers: vec![
+                "aes256-gcm@openssh.com".to_string(),
+                "aes256-ctr".to_string(),
+                "aes128-ctr".to_string(),
+            ],
+            macs: vec![
+                "hmac-sha2-256-etm@openssh.com".to_string(),
+                "hmac-sha2-512-etm@openssh.com".to_string(),
+            ],
         }
     }
 }

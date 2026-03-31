@@ -327,9 +327,9 @@ impl MacAlgorithm for HmacSha512 {
 // ============================================================
 
 use aes_gcm::{
+    Aes128Gcm, Aes256Gcm, KeyInit,
     aead::generic_array::GenericArray,
     aead::{Aead, Payload},
-    Aes128Gcm, Aes256Gcm, KeyInit,
 };
 use chacha20poly1305::ChaCha20Poly1305;
 
@@ -520,6 +520,96 @@ impl AeadCipher for ChaCha20Poly1305Cipher {
 }
 
 // ============================================================
+// AES-CTR stream ciphers (non-AEAD, used with ETM MACs)
+// ============================================================
+
+/// A non-AEAD stream cipher for encrypt-then-MAC mode.
+pub trait StreamCipher: Sized {
+    fn key_len() -> usize;
+    fn iv_len() -> usize;
+    fn mac_key_len() -> usize;
+    fn mac_len() -> usize;
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, RusshError>;
+    fn encrypt_in_place(&mut self, data: &mut [u8]);
+    fn decrypt_in_place(&mut self, data: &mut [u8]);
+}
+
+type Aes256Ctr = ctr::Ctr64BE<aes::Aes256>;
+type Aes128Ctr = ctr::Ctr64BE<aes::Aes128>;
+
+pub struct Aes256CtrCipher {
+    cipher: Aes256Ctr,
+}
+
+pub struct Aes128CtrCipher {
+    cipher: Aes128Ctr,
+}
+
+impl StreamCipher for Aes256CtrCipher {
+    fn key_len() -> usize {
+        32
+    }
+    fn iv_len() -> usize {
+        16
+    }
+    fn mac_key_len() -> usize {
+        32
+    }
+    fn mac_len() -> usize {
+        32
+    }
+
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, RusshError> {
+        use ctr::cipher::KeyIvInit as _;
+        let cipher = Aes256Ctr::new_from_slices(key, iv)
+            .map_err(|_| crypto_error("AES-256-CTR key/IV length mismatch"))?;
+        Ok(Self { cipher })
+    }
+
+    fn encrypt_in_place(&mut self, data: &mut [u8]) {
+        use ctr::cipher::StreamCipher as _;
+        self.cipher.apply_keystream(data);
+    }
+
+    fn decrypt_in_place(&mut self, data: &mut [u8]) {
+        use ctr::cipher::StreamCipher as _;
+        self.cipher.apply_keystream(data);
+    }
+}
+
+impl StreamCipher for Aes128CtrCipher {
+    fn key_len() -> usize {
+        16
+    }
+    fn iv_len() -> usize {
+        16
+    }
+    fn mac_key_len() -> usize {
+        32
+    }
+    fn mac_len() -> usize {
+        32
+    }
+
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, RusshError> {
+        use ctr::cipher::KeyIvInit as _;
+        let cipher = Aes128Ctr::new_from_slices(key, iv)
+            .map_err(|_| crypto_error("AES-128-CTR key/IV length mismatch"))?;
+        Ok(Self { cipher })
+    }
+
+    fn encrypt_in_place(&mut self, data: &mut [u8]) {
+        use ctr::cipher::StreamCipher as _;
+        self.cipher.apply_keystream(data);
+    }
+
+    fn decrypt_in_place(&mut self, data: &mut [u8]) {
+        use ctr::cipher::StreamCipher as _;
+        self.cipher.apply_keystream(data);
+    }
+}
+
+// ============================================================
 // Key exchange
 // ============================================================
 
@@ -616,6 +706,71 @@ impl KeyExchangeAlgorithm for EcdhNistp256 {
     }
 }
 
+/// Diffie-Hellman group 14 with SHA-256 (diffie-hellman-group14-sha256).
+///
+/// Uses the 2048-bit MODP group from RFC 3526 §3.
+pub struct DhGroup14Sha256;
+
+/// RFC 3526 §3: 2048-bit MODP Group (group 14) prime, big-endian.
+const DH_GROUP14_PRIME: &[u8] = &[
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xC9, 0x0F, 0xDA, 0xA2, 0x21, 0x68, 0xC2, 0x34,
+    0xC4, 0xC6, 0x62, 0x8B, 0x80, 0xDC, 0x1C, 0xD1, 0x29, 0x02, 0x4E, 0x08, 0x8A, 0x67, 0xCC, 0x74,
+    0x02, 0x0B, 0xBE, 0xA6, 0x3B, 0x13, 0x9B, 0x22, 0x51, 0x4A, 0x08, 0x79, 0x8E, 0x34, 0x04, 0xDD,
+    0xEF, 0x95, 0x19, 0xB3, 0xCD, 0x3A, 0x43, 0x1B, 0x30, 0x2B, 0x0A, 0x6D, 0xF2, 0x5F, 0x14, 0x37,
+    0x4F, 0xE1, 0x35, 0x6D, 0x6D, 0x51, 0xC2, 0x45, 0xE4, 0x85, 0xB5, 0x76, 0x62, 0x5E, 0x7E, 0xC6,
+    0xF4, 0x4C, 0x42, 0xE9, 0xA6, 0x37, 0xED, 0x6B, 0x0B, 0xFF, 0x5C, 0xB6, 0xF4, 0x06, 0xB7, 0xED,
+    0xEE, 0x38, 0x6B, 0xFB, 0x5A, 0x89, 0x9F, 0xA5, 0xAE, 0x9F, 0x24, 0x11, 0x7C, 0x4B, 0x1F, 0xE6,
+    0x49, 0x28, 0x66, 0x51, 0xEC, 0xE4, 0x5B, 0x3D, 0xC2, 0x00, 0x7C, 0xB8, 0xA1, 0x63, 0xBF, 0x05,
+    0x98, 0xDA, 0x48, 0x36, 0x1C, 0x55, 0xD3, 0x9A, 0x69, 0x16, 0x3F, 0xA8, 0xFD, 0x24, 0xCF, 0x5F,
+    0x83, 0x65, 0x5D, 0x23, 0xDC, 0xA3, 0xAD, 0x96, 0x1C, 0x62, 0xF3, 0x56, 0x20, 0x85, 0x52, 0xBB,
+    0x9E, 0xD5, 0x29, 0x07, 0x70, 0x96, 0x96, 0x6D, 0x67, 0x0C, 0x35, 0x4E, 0x4A, 0xBC, 0x98, 0x04,
+    0xF1, 0x74, 0x6C, 0x08, 0xCA, 0x18, 0x21, 0x7C, 0x32, 0x90, 0x5E, 0x46, 0x2E, 0x36, 0xCE, 0x3B,
+    0xE3, 0x9E, 0x77, 0x2C, 0x18, 0x0E, 0x86, 0x03, 0x9B, 0x27, 0x83, 0xA2, 0xEC, 0x07, 0xA2, 0x8F,
+    0xB5, 0xC5, 0x5D, 0xF0, 0x6F, 0x4C, 0x52, 0xC9, 0xDE, 0x2B, 0xCB, 0xF6, 0x95, 0x58, 0x17, 0x18,
+    0x39, 0x95, 0x49, 0x7C, 0xEA, 0x95, 0x6A, 0xE5, 0x15, 0xD2, 0x26, 0x18, 0x98, 0xFA, 0x05, 0x10,
+    0x15, 0x72, 0x8E, 0x5A, 0x8A, 0xAC, 0xAA, 0x68, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+];
+
+impl KeyExchangeAlgorithm for DhGroup14Sha256 {
+    fn generate_keypair(rng: &mut dyn RandomSource) -> KexKeyPair {
+        let p = rsa::BigUint::from_bytes_be(DH_GROUP14_PRIME);
+        let g = rsa::BigUint::from(2u32);
+
+        // Generate random exponent x in [2, p-2]
+        let mut x_bytes = [0u8; 256];
+        rng.fill_bytes(&mut x_bytes);
+        let x = rsa::BigUint::from_bytes_be(&x_bytes) % (&p - 2u32) + 2u32;
+
+        // Public value: e = g^x mod p
+        let e = g.modpow(&x, &p);
+
+        KexKeyPair {
+            public_key: e.to_bytes_be(),
+            secret: Zeroizing::new(x.to_bytes_be()),
+        }
+    }
+
+    fn compute_shared_secret(
+        local_secret: &[u8],
+        remote_public: &[u8],
+    ) -> Result<KexResult, RusshError> {
+        let p = rsa::BigUint::from_bytes_be(DH_GROUP14_PRIME);
+        let x = rsa::BigUint::from_bytes_be(local_secret);
+        let f = rsa::BigUint::from_bytes_be(remote_public);
+
+        // Validate: 1 < f < p-1
+        if f <= rsa::BigUint::from(1u32) || f >= (&p - 1u32) {
+            return Err(crypto_error("DH public value out of safe range"));
+        }
+
+        // Shared secret: K = f^x mod p
+        let k = f.modpow(&x, &p);
+        Ok(KexResult {
+            shared_secret: Zeroizing::new(k.to_bytes_be()),
+        })
+    }
+}
+
 // ============================================================
 // Signing / verification
 // ============================================================
@@ -708,6 +863,265 @@ impl Verifier for Ed25519Verifier {
     fn algorithm_name(&self) -> &'static str {
         "ssh-ed25519"
     }
+}
+
+// ============================================================
+// ECDSA-P256 signing / verification
+// ============================================================
+
+pub struct EcdsaP256Signer {
+    key: p256::ecdsa::SigningKey,
+}
+
+impl EcdsaP256Signer {
+    /// Generate a new ECDSA-P256 signing key from the provided RNG.
+    pub fn generate(rng: &mut dyn RandomSource) -> Self {
+        let mut adapter = DynRngAdapter { inner: rng };
+        let key = p256::ecdsa::SigningKey::random(&mut adapter);
+        Self { key }
+    }
+
+    /// Construct from raw 32-byte secret scalar.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RusshError> {
+        p256::ecdsa::SigningKey::from_bytes(bytes.into())
+            .map(|key| Self { key })
+            .map_err(|_| crypto_error("invalid ECDSA-P256 secret key"))
+    }
+
+    pub fn verifier(&self) -> EcdsaP256Verifier {
+        EcdsaP256Verifier {
+            key: *self.key.verifying_key(),
+        }
+    }
+}
+
+impl Signer for EcdsaP256Signer {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, RusshError> {
+        use p256::ecdsa::signature::Signer as _;
+        let sig: p256::ecdsa::Signature = self.key.sign(message);
+        // SSH wire format for ECDSA: the signature is DER-encoded (r, s)
+        // but SSH uses a custom format: string "ecdsa-sha2-nistp256" + string (mpint r + mpint s)
+        // We return the raw (r || s) fixed-size representation (64 bytes) which callers
+        // wrap into SSH wire format.
+        Ok(sig.to_bytes().to_vec())
+    }
+
+    fn public_key_blob(&self) -> Vec<u8> {
+        // SSH wire format: string "ecdsa-sha2-nistp256" + string "nistp256" + string <SEC1 uncompressed point>
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&encode_ssh_string(b"ecdsa-sha2-nistp256"));
+        blob.extend_from_slice(&encode_ssh_string(b"nistp256"));
+        let point = self.key.verifying_key().to_encoded_point(false);
+        blob.extend_from_slice(&encode_ssh_string(point.as_bytes()));
+        blob
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        "ecdsa-sha2-nistp256"
+    }
+}
+
+pub struct EcdsaP256Verifier {
+    key: p256::ecdsa::VerifyingKey,
+}
+
+impl EcdsaP256Verifier {
+    /// Construct from an uncompressed SEC1 public key point (65 bytes: 0x04 || x || y).
+    pub fn from_sec1_bytes(bytes: &[u8]) -> Result<Self, RusshError> {
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(bytes)
+            .map(|key| Self { key })
+            .map_err(|_| crypto_error("invalid ECDSA-P256 public key"))
+    }
+}
+
+impl Verifier for EcdsaP256Verifier {
+    fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), RusshError> {
+        use p256::ecdsa::signature::Verifier as _;
+        // SSH ECDSA signatures are (r || s), each 32 bytes for P-256
+        if signature.len() != 64 {
+            return Err(crypto_error("ECDSA-P256 signature must be 64 bytes"));
+        }
+        let sig = p256::ecdsa::Signature::from_bytes(signature.into())
+            .map_err(|_| crypto_error("invalid ECDSA-P256 signature encoding"))?;
+        self.key
+            .verify(message, &sig)
+            .map_err(|_| crypto_error("ECDSA-P256 signature verification failed"))
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        "ecdsa-sha2-nistp256"
+    }
+}
+
+// ============================================================
+// RSA signing / verification (rsa-sha2-256, rsa-sha2-512)
+// ============================================================
+
+pub struct RsaSigner {
+    key: rsa::RsaPrivateKey,
+}
+
+impl RsaSigner {
+    /// Generate a new 3072-bit RSA key from the provided RNG.
+    pub fn generate(rng: &mut dyn RandomSource) -> Result<Self, RusshError> {
+        let mut adapter = DynRngAdapter { inner: rng };
+        let key = rsa::RsaPrivateKey::new(&mut adapter, 3072)
+            .map_err(|_| crypto_error("RSA key generation failed"))?;
+        Ok(Self { key })
+    }
+
+    /// Construct from DER-encoded PKCS#1 private key bytes.
+    pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, RusshError> {
+        use rsa::pkcs1::DecodeRsaPrivateKey as _;
+        let key = rsa::RsaPrivateKey::from_pkcs1_der(der)
+            .map_err(|_| crypto_error("invalid RSA PKCS#1 DER private key"))?;
+        use rsa::traits::PublicKeyParts as _;
+        let bits = key.n().bits();
+        if bits < 2048 {
+            return Err(crypto_error("RSA key must be at least 2048 bits"));
+        }
+        Ok(Self { key })
+    }
+
+    /// Return the public key for verification.
+    pub fn verifier_sha256(&self) -> RsaVerifier {
+        RsaVerifier {
+            key: self.key.to_public_key(),
+            sha512: false,
+        }
+    }
+
+    pub fn verifier_sha512(&self) -> RsaVerifier {
+        RsaVerifier {
+            key: self.key.to_public_key(),
+            sha512: true,
+        }
+    }
+
+    /// SSH wire-format public key blob for this RSA key.
+    pub fn public_key_blob(&self) -> Vec<u8> {
+        rsa_public_key_blob(&self.key.to_public_key())
+    }
+
+    fn sign_sha256(&self, message: &[u8]) -> Result<Vec<u8>, RusshError> {
+        use sha2::Digest as _;
+        let hash = sha2::Sha256::digest(message);
+        self.key
+            .sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hash)
+            .map_err(|_| crypto_error("RSA-SHA256 signing failed"))
+    }
+
+    fn sign_sha512(&self, message: &[u8]) -> Result<Vec<u8>, RusshError> {
+        use sha2::Digest as _;
+        let hash = sha2::Sha512::digest(message);
+        self.key
+            .sign(rsa::Pkcs1v15Sign::new::<sha2::Sha512>(), &hash)
+            .map_err(|_| crypto_error("RSA-SHA512 signing failed"))
+    }
+}
+
+/// Sign with rsa-sha2-256.
+pub struct RsaSha256Signer(pub RsaSigner);
+
+impl Signer for RsaSha256Signer {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, RusshError> {
+        self.0.sign_sha256(message)
+    }
+
+    fn public_key_blob(&self) -> Vec<u8> {
+        self.0.public_key_blob()
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        "rsa-sha2-256"
+    }
+}
+
+/// Sign with rsa-sha2-512.
+pub struct RsaSha512Signer(pub RsaSigner);
+
+impl Signer for RsaSha512Signer {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, RusshError> {
+        self.0.sign_sha512(message)
+    }
+
+    fn public_key_blob(&self) -> Vec<u8> {
+        self.0.public_key_blob()
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        "rsa-sha2-512"
+    }
+}
+
+pub struct RsaVerifier {
+    key: rsa::RsaPublicKey,
+    sha512: bool,
+}
+
+impl RsaVerifier {
+    /// Construct from SSH wire-format public key blob (string "ssh-rsa" + mpint e + mpint n).
+    pub fn from_ssh_blob(blob: &[u8]) -> Result<Self, RusshError> {
+        let mut offset = 0;
+        let algo = decode_ssh_string(blob, &mut offset)?;
+        if algo != b"ssh-rsa" {
+            return Err(crypto_error("expected ssh-rsa key type in blob"));
+        }
+        let e_bytes = decode_ssh_string(blob, &mut offset)?;
+        let n_bytes = decode_ssh_string(blob, &mut offset)?;
+        let e = rsa::BigUint::from_bytes_be(&e_bytes);
+        let n = rsa::BigUint::from_bytes_be(&n_bytes);
+        let key = rsa::RsaPublicKey::new(n, e)
+            .map_err(|_| crypto_error("invalid RSA public key components"))?;
+        use rsa::traits::PublicKeyParts as _;
+        if key.n().bits() < 2048 {
+            return Err(crypto_error("RSA key must be at least 2048 bits"));
+        }
+        Ok(Self { key, sha512: false })
+    }
+
+    /// Set hash algorithm to SHA-512 (for rsa-sha2-512).
+    #[must_use]
+    pub fn with_sha512(mut self) -> Self {
+        self.sha512 = true;
+        self
+    }
+}
+
+impl Verifier for RsaVerifier {
+    fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), RusshError> {
+        if self.sha512 {
+            use sha2::Digest as _;
+            let hash = sha2::Sha512::digest(message);
+            self.key
+                .verify(rsa::Pkcs1v15Sign::new::<sha2::Sha512>(), &hash, signature)
+                .map_err(|_| crypto_error("RSA-SHA512 signature verification failed"))
+        } else {
+            use sha2::Digest as _;
+            let hash = sha2::Sha256::digest(message);
+            self.key
+                .verify(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, signature)
+                .map_err(|_| crypto_error("RSA-SHA256 signature verification failed"))
+        }
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        if self.sha512 {
+            "rsa-sha2-512"
+        } else {
+            "rsa-sha2-256"
+        }
+    }
+}
+
+/// Build SSH wire-format public key blob for an RSA public key.
+fn rsa_public_key_blob(key: &rsa::RsaPublicKey) -> Vec<u8> {
+    use rsa::traits::PublicKeyParts as _;
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&encode_ssh_string(b"ssh-rsa"));
+    blob.extend_from_slice(&encode_mpint(&key.e().to_bytes_be()));
+    blob.extend_from_slice(&encode_mpint(&key.n().to_bytes_be()));
+    blob
 }
 
 // ============================================================
@@ -936,6 +1350,36 @@ mod tests {
         assert_eq!(pt, b"secret");
     }
 
+    // ---- AES-CTR stream ciphers ----
+
+    #[test]
+    fn aes256_ctr_encrypt_decrypt_roundtrip() {
+        let key = [0x42u8; 32];
+        let iv = [0x01u8; 16];
+        let plaintext = b"hello aes-256-ctr world!";
+        let mut data = plaintext.to_vec();
+        let mut enc = Aes256CtrCipher::new(&key, &iv).unwrap();
+        enc.encrypt_in_place(&mut data);
+        assert_ne!(&data, plaintext);
+        let mut dec = Aes256CtrCipher::new(&key, &iv).unwrap();
+        dec.decrypt_in_place(&mut data);
+        assert_eq!(&data, plaintext);
+    }
+
+    #[test]
+    fn aes128_ctr_encrypt_decrypt_roundtrip() {
+        let key = [0x42u8; 16];
+        let iv = [0x01u8; 16];
+        let plaintext = b"hello aes-128-ctr!";
+        let mut data = plaintext.to_vec();
+        let mut enc = Aes128CtrCipher::new(&key, &iv).unwrap();
+        enc.encrypt_in_place(&mut data);
+        assert_ne!(&data, plaintext);
+        let mut dec = Aes128CtrCipher::new(&key, &iv).unwrap();
+        dec.decrypt_in_place(&mut data);
+        assert_eq!(&data, plaintext);
+    }
+
     // ---- Key exchange: Curve25519 ----
 
     #[test]
@@ -975,6 +1419,34 @@ mod tests {
         assert_eq!(alice_shared.shared_secret.len(), 32);
     }
 
+    // ---- Key exchange: DH group14 ----
+
+    #[test]
+    fn dh_group14_kex_produces_shared_secret() {
+        let mut rng = LcgRandom::seeded(10);
+        let alice = DhGroup14Sha256::generate_keypair(&mut rng);
+        let mut rng2 = LcgRandom::seeded(11);
+        let bob = DhGroup14Sha256::generate_keypair(&mut rng2);
+
+        let alice_shared =
+            DhGroup14Sha256::compute_shared_secret(alice.secret_bytes(), &bob.public_key).unwrap();
+        let bob_shared =
+            DhGroup14Sha256::compute_shared_secret(bob.secret_bytes(), &alice.public_key).unwrap();
+
+        assert_eq!(alice_shared.shared_secret, bob_shared.shared_secret);
+        assert!(!alice_shared.shared_secret.is_empty());
+    }
+
+    #[test]
+    fn dh_group14_rejects_out_of_range_public() {
+        let mut rng = LcgRandom::seeded(12);
+        let alice = DhGroup14Sha256::generate_keypair(&mut rng);
+        // Public value of 1 is invalid
+        assert!(DhGroup14Sha256::compute_shared_secret(alice.secret_bytes(), &[1]).is_err());
+        // Public value of 0 is invalid
+        assert!(DhGroup14Sha256::compute_shared_secret(alice.secret_bytes(), &[0]).is_err());
+    }
+
     // ---- Ed25519 signing ----
 
     #[test]
@@ -1007,6 +1479,96 @@ mod tests {
         assert_eq!(blob.len(), 51);
         assert_eq!(&blob[4..15], b"ssh-ed25519");
         assert_eq!(u32::from_be_bytes(blob[15..19].try_into().unwrap()), 32u32);
+    }
+
+    // ---- RSA signing ----
+
+    #[test]
+    fn rsa_sha256_sign_verify_roundtrip() {
+        let mut rng = OsRng;
+        let signer = RsaSigner::generate(&mut rng).unwrap();
+        let sha256_signer = RsaSha256Signer(signer);
+        let verifier = sha256_signer.0.verifier_sha256();
+        let msg = b"rsa test message";
+        let sig = sha256_signer.sign(msg).unwrap();
+        assert!(verifier.verify(msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn rsa_sha512_sign_verify_roundtrip() {
+        let mut rng = OsRng;
+        let signer = RsaSigner::generate(&mut rng).unwrap();
+        let sha512_signer = RsaSha512Signer(signer);
+        let verifier = sha512_signer.0.verifier_sha512();
+        let msg = b"rsa-512 test";
+        let sig = sha512_signer.sign(msg).unwrap();
+        assert!(verifier.verify(msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn rsa_wrong_signature_rejected() {
+        let mut rng = OsRng;
+        let signer = RsaSigner::generate(&mut rng).unwrap();
+        let sha256_signer = RsaSha256Signer(signer);
+        let verifier = sha256_signer.0.verifier_sha256();
+        let mut sig = sha256_signer.sign(b"data").unwrap();
+        sig[0] ^= 0xff;
+        assert!(verifier.verify(b"data", &sig).is_err());
+    }
+
+    #[test]
+    fn rsa_public_key_blob_roundtrip() {
+        let mut rng = OsRng;
+        let signer = RsaSigner::generate(&mut rng).unwrap();
+        let blob = signer.public_key_blob();
+        let mut offset = 0;
+        let algo = decode_ssh_string(&blob, &mut offset).unwrap();
+        assert_eq!(algo, b"ssh-rsa");
+        // Verify we can reconstruct a verifier from the blob
+        let verifier = RsaVerifier::from_ssh_blob(&blob).unwrap();
+        let sha256_signer = RsaSha256Signer(signer);
+        let msg = b"blob roundtrip";
+        let sig = sha256_signer.sign(msg).unwrap();
+        assert!(verifier.verify(msg, &sig).is_ok());
+    }
+
+    // ---- ECDSA-P256 signing ----
+
+    #[test]
+    fn ecdsa_p256_sign_verify_roundtrip() {
+        let mut rng = LcgRandom::seeded(200);
+        let signer = EcdsaP256Signer::generate(&mut rng);
+        let verifier = signer.verifier();
+        let msg = b"ecdsa test message";
+        let sig = signer.sign(msg).unwrap();
+        assert_eq!(sig.len(), 64);
+        assert!(verifier.verify(msg, &sig).is_ok());
+    }
+
+    #[test]
+    fn ecdsa_p256_wrong_signature_rejected() {
+        let mut rng = LcgRandom::seeded(201);
+        let signer = EcdsaP256Signer::generate(&mut rng);
+        let verifier = signer.verifier();
+        let mut sig = signer.sign(b"hello ecdsa").unwrap();
+        sig[0] ^= 0xff;
+        assert!(verifier.verify(b"hello ecdsa", &sig).is_err());
+    }
+
+    #[test]
+    fn ecdsa_p256_public_key_blob_format() {
+        let mut rng = LcgRandom::seeded(202);
+        let signer = EcdsaP256Signer::generate(&mut rng);
+        let blob = signer.public_key_blob();
+        let mut offset = 0;
+        let algo = decode_ssh_string(&blob, &mut offset).unwrap();
+        assert_eq!(algo, b"ecdsa-sha2-nistp256");
+        let curve = decode_ssh_string(&blob, &mut offset).unwrap();
+        assert_eq!(curve, b"nistp256");
+        let point = decode_ssh_string(&blob, &mut offset).unwrap();
+        assert_eq!(point.len(), 65);
+        assert_eq!(point[0], 0x04); // uncompressed SEC1 point
+        assert_eq!(offset, blob.len());
     }
 
     // ---- SSH encoding helpers ----

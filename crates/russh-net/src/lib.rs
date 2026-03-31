@@ -213,8 +213,6 @@ enum DirectionalCipher {
         cipher: Box<dyn CtrCipherOps + Send>,
         mac: MacKind,
         mac_key: Vec<u8>,
-        /// Sequence number for MAC computation (incremented per packet).
-        sequence_number: u32,
     },
 }
 
@@ -244,14 +242,15 @@ impl DirectionalCipher {
                         cipher: Box::new(cipher),
                         mac,
                         mac_key: mac_key.to_vec(),
-                        sequence_number: 0,
                     }
                 } else {
                     Self::None
                 }
             }
             "aes128-ctr" => {
-                if let Ok(cipher) = Aes128CtrCipher::new(key, iv) {
+                // AES-128 uses a 16-byte key; key derivation produces 32 bytes.
+                let key128 = if key.len() > 16 { &key[..16] } else { key };
+                if let Ok(cipher) = Aes128CtrCipher::new(key128, iv) {
                     let mac = match mac_name {
                         "hmac-sha2-512-etm@openssh.com" => MacKind::Sha512,
                         _ => MacKind::Sha256,
@@ -260,7 +259,6 @@ impl DirectionalCipher {
                         cipher: Box::new(cipher),
                         mac,
                         mac_key: mac_key.to_vec(),
-                        sequence_number: 0,
                     }
                 } else {
                     Self::None
@@ -291,6 +289,10 @@ pub struct PacketStream<S> {
     codec: PacketCodec,
     tx_cipher: DirectionalCipher,
     rx_cipher: DirectionalCipher,
+    /// SSH protocol sequence number for outgoing packets (incremented per packet, all modes).
+    tx_seq: u32,
+    /// SSH protocol sequence number for incoming packets (incremented per packet, all modes).
+    rx_seq: u32,
 }
 
 impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
@@ -300,6 +302,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
             codec: PacketCodec::with_defaults(),
             tx_cipher: DirectionalCipher::None,
             rx_cipher: DirectionalCipher::None,
+            tx_seq: 0,
+            rx_seq: 0,
         }
     }
 
@@ -308,30 +312,74 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
     /// Client → server direction uses `key_c2s` / `iv_c2s`;
     /// server → client direction uses `key_s2c` / `iv_s2c`.
     pub fn enable_client_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
-        self.tx_cipher =
-            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s, &neg.mac_client_to_server, &keys.mac_key_c2s);
-        self.rx_cipher =
-            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c, &neg.mac_server_to_client, &keys.mac_key_s2c);
+        if neg.strict_kex {
+            self.tx_seq = 0;
+            self.rx_seq = 0;
+        }
+        self.tx_cipher = DirectionalCipher::new(
+            &neg.cipher_client_to_server,
+            &keys.key_c2s,
+            &keys.iv_c2s,
+            &neg.mac_client_to_server,
+            &keys.mac_key_c2s,
+        );
+        self.rx_cipher = DirectionalCipher::new(
+            &neg.cipher_server_to_client,
+            &keys.key_s2c,
+            &keys.iv_s2c,
+            &neg.mac_server_to_client,
+            &keys.mac_key_s2c,
+        );
     }
 
     /// Enable AEAD encryption for the **server** side after NEWKEYS.
     pub fn enable_server_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
-        self.tx_cipher =
-            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c, &neg.mac_server_to_client, &keys.mac_key_s2c);
-        self.rx_cipher =
-            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s, &neg.mac_client_to_server, &keys.mac_key_c2s);
+        if neg.strict_kex {
+            self.tx_seq = 0;
+            self.rx_seq = 0;
+        }
+        self.tx_cipher = DirectionalCipher::new(
+            &neg.cipher_server_to_client,
+            &keys.key_s2c,
+            &keys.iv_s2c,
+            &neg.mac_server_to_client,
+            &keys.mac_key_s2c,
+        );
+        self.rx_cipher = DirectionalCipher::new(
+            &neg.cipher_client_to_server,
+            &keys.key_c2s,
+            &keys.iv_c2s,
+            &neg.mac_client_to_server,
+            &keys.mac_key_c2s,
+        );
     }
 
     /// Enable only the TX (outgoing) cipher for the server after sending NEWKEYS.
     pub fn enable_server_tx_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
-        self.tx_cipher =
-            DirectionalCipher::new(&neg.cipher_server_to_client, &keys.key_s2c, &keys.iv_s2c, &neg.mac_server_to_client, &keys.mac_key_s2c);
+        if neg.strict_kex {
+            self.tx_seq = 0;
+        }
+        self.tx_cipher = DirectionalCipher::new(
+            &neg.cipher_server_to_client,
+            &keys.key_s2c,
+            &keys.iv_s2c,
+            &neg.mac_server_to_client,
+            &keys.mac_key_s2c,
+        );
     }
 
     /// Enable only the RX (incoming) cipher for the server after receiving client NEWKEYS.
     pub fn enable_server_rx_encryption(&mut self, keys: &SessionKeys, neg: &NegotiatedAlgorithms) {
-        self.rx_cipher =
-            DirectionalCipher::new(&neg.cipher_client_to_server, &keys.key_c2s, &keys.iv_c2s, &neg.mac_client_to_server, &keys.mac_key_c2s);
+        if neg.strict_kex {
+            self.rx_seq = 0;
+        }
+        self.rx_cipher = DirectionalCipher::new(
+            &neg.cipher_client_to_server,
+            &keys.key_c2s,
+            &keys.iv_c2s,
+            &neg.mac_client_to_server,
+            &keys.mac_key_c2s,
+        );
     }
 
     /// Read lines until one starts with "SSH-" (the version banner).
@@ -368,7 +416,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
 
     /// Read exactly one SSH binary packet and return its `PacketFrame`.
     pub async fn read_packet(&mut self) -> Result<PacketFrame, RusshError> {
-        match &mut self.rx_cipher {
+        let seq = self.rx_seq;
+        let result = match &mut self.rx_cipher {
             DirectionalCipher::None => {
                 let mut len_buf = [0u8; 4];
                 self.inner.read_exact(&mut len_buf).await.map_err(io_err)?;
@@ -425,7 +474,6 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                 cipher,
                 mac,
                 mac_key,
-                sequence_number,
             } => {
                 // ETM: packet_length is plaintext, body is encrypted, MAC follows
                 let mut len_buf = [0u8; 4];
@@ -449,13 +497,11 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
 
                 // Verify MAC over (seqnum || packet_length || encrypted_body)
                 let mut mac_data = Vec::new();
-                mac_data.extend_from_slice(&sequence_number.to_be_bytes());
+                mac_data.extend_from_slice(&seq.to_be_bytes());
                 mac_data.extend_from_slice(&len_buf);
                 mac_data.extend_from_slice(&encrypted_body);
-                mac.verify(mac_key, &mac_data, &mac_tag).map_err(|e| {
-                    RusshError::new(RusshErrorCategory::Crypto, e.to_string())
-                })?;
-                *sequence_number = sequence_number.wrapping_add(1);
+                mac.verify(mac_key, &mac_data, &mac_tag)
+                    .map_err(|e| RusshError::new(RusshErrorCategory::Crypto, e.to_string()))?;
 
                 // Decrypt
                 cipher.decrypt_in_place(&mut encrypted_body);
@@ -470,12 +516,15 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                 }
                 Ok(PacketFrame::new(encrypted_body[1..payload_end].to_vec()))
             }
-        }
+        };
+        self.rx_seq = seq.wrapping_add(1);
+        result
     }
 
     /// Encode `frame` and write it to the stream.
     pub async fn write_packet(&mut self, frame: &PacketFrame) -> Result<(), RusshError> {
-        match &mut self.tx_cipher {
+        let seq = self.tx_seq;
+        let result = match &mut self.tx_cipher {
             DirectionalCipher::None => {
                 let bytes = self.codec.encode(frame)?;
                 self.inner.write_all(&bytes).await.map_err(io_err)
@@ -517,7 +566,6 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                 cipher,
                 mac,
                 mac_key,
-                sequence_number,
             } => {
                 const BLOCK: usize = 16;
                 let payload = &frame.payload;
@@ -543,19 +591,19 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
 
                 // Compute MAC over (seqnum || packet_length || encrypted_body)
                 let mut mac_data = Vec::new();
-                mac_data.extend_from_slice(&sequence_number.to_be_bytes());
+                mac_data.extend_from_slice(&seq.to_be_bytes());
                 mac_data.extend_from_slice(&packet_length);
                 mac_data.extend_from_slice(&plaintext);
                 let tag = mac.sign(mac_key, &mac_data);
-
-                *sequence_number = sequence_number.wrapping_add(1);
 
                 // Wire: [4-byte length] [encrypted body] [MAC tag]
                 self.inner.write_all(&packet_length).await.map_err(io_err)?;
                 self.inner.write_all(&plaintext).await.map_err(io_err)?;
                 self.inner.write_all(&tag).await.map_err(io_err)
             }
-        }
+        };
+        self.tx_seq = seq.wrapping_add(1);
+        result
     }
 
     /// Write raw bytes (e.g. a pre-encoded message).
@@ -1414,7 +1462,9 @@ impl SshClientConnection {
                 }
             }
         }
-        output.flush().await
+        output
+            .flush()
+            .await
             .map_err(|e| RusshError::new(RusshErrorCategory::Io, e.to_string()))?;
         info!(exit_code, "shell session ended");
         Ok(exit_code)
@@ -2353,8 +2403,10 @@ impl SshServerConnection {
                                     std::fs::write(&dest, file_bytes)
                                 };
                                 if let Err(error) = write_result {
-                                    response =
-                                        scp_status_data(0x01, &format!("scp write failed: {error}"));
+                                    response = scp_status_data(
+                                        0x01,
+                                        &format!("scp write failed: {error}"),
+                                    );
                                 }
                             }
                             Err(error) => {
@@ -2502,7 +2554,9 @@ impl SshServerConnection {
                     Ok(status) => status.map(|s| s.code().unwrap_or(0) as u32).unwrap_or(0),
                     Err(_) => {
                         let _ = child.start_kill();
-                        match tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await {
+                        match tokio::time::timeout(std::time::Duration::from_secs(1), child.wait())
+                            .await
+                        {
                             Ok(status) => status.map(|s| s.code().unwrap_or(0) as u32).unwrap_or(0),
                             Err(_) => 0,
                         }

@@ -30,8 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{
-    EcdsaP256Verifier, Ed25519Verifier, RsaVerifier, Verifier, constant_time_eq,
-    decode_ssh_string, encode_ssh_string,
+    EcdsaP256Verifier, Ed25519Verifier, RsaVerifier, Verifier, constant_time_eq, decode_ssh_string,
+    encode_ssh_string,
 };
 
 /// Client authentication request variants.
