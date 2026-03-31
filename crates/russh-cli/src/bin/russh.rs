@@ -1060,7 +1060,7 @@ mod tests {
     fn auth_method_ordering_from_preferred() {
         // Simulate what main() does: convert preferred_authentications strings
         // into AuthMethod values, filtering out unrecognised ones.
-        let prefs = vec![
+        let prefs = [
             "password".to_string(),
             "publickey".to_string(),
             "bogus".to_string(),
@@ -1069,7 +1069,7 @@ mod tests {
             .iter()
             .filter_map(|s| AuthMethod::from_ssh_name(s))
             .collect();
-        assert_eq!(methods, vec![AuthMethod::Password, AuthMethod::PublicKey]);
+        assert_eq!(methods, [AuthMethod::Password, AuthMethod::PublicKey]);
     }
 
     #[test]
@@ -1078,7 +1078,7 @@ mod tests {
         assert!(args.o_options.preferred_authentications.is_none());
         // The default order built in main() is:
         // publickey → keyboard-interactive → password.
-        let defaults = vec![
+        let defaults = [
             AuthMethod::PublicKey,
             AuthMethod::KeyboardInteractive,
             AuthMethod::Password,
