@@ -27,7 +27,7 @@ use russh_crypto::Ed25519Signer;
 use russh_net::{SshClient, SshClientConnection};
 use russh_observability::{Severity, StderrLogger, VerboseLevel};
 use russh_transport::ClientConfig;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 fn usage() -> ! {
     eprintln!(
@@ -85,6 +85,8 @@ struct Args {
     o_options: OOptions,
     /// Local port forwarding specs: `(bind_host, bind_port, remote_host, remote_port)`.
     local_forwards: Vec<(String, u16, String, u16)>,
+    /// Remote port forwarding specs: `(bind_host, bind_port, local_host, local_port)`.
+    remote_forwards: Vec<(String, u16, String, u16)>,
     /// Whether to request SSH agent forwarding (`-A`).
     agent_forwarding: bool,
 }
@@ -179,6 +181,15 @@ fn parse_local_forward(spec: &str) -> Option<(String, u16, String, u16)> {
     }
 }
 
+/// Parse a `-R` spec: `[bind_address:]port:host:hostport`.
+///
+/// Same format as `-L`: the server listens on `bind_address:port` and forwards
+/// connections to `host:hostport` on the client side.
+/// Returns `(bind_host, bind_port, local_host, local_port)`.
+fn parse_remote_forward(spec: &str) -> Option<(String, u16, String, u16)> {
+    parse_local_forward(spec)
+}
+
 fn parse_args() -> Args {
     parse_args_from(std::env::args().skip(1).collect())
 }
@@ -199,6 +210,7 @@ fn parse_args_from(argv: Vec<String>) -> Args {
     let mut config_file: Option<PathBuf> = None;
     let mut o_opts = OOptions::default();
     let mut local_forwards: Vec<(String, u16, String, u16)> = Vec::new();
+    let mut remote_forwards: Vec<(String, u16, String, u16)> = Vec::new();
     let mut agent_forwarding = false;
 
     let mut i = 0;
@@ -258,6 +270,17 @@ fn parse_args_from(argv: Vec<String>) -> Args {
                     }
                 }
             }
+            "-R" => {
+                i += 1;
+                if let Some(spec) = argv.get(i) {
+                    if let Some(fwd) = parse_remote_forward(spec) {
+                        remote_forwards.push(fwd);
+                    } else {
+                        eprintln!("error: invalid -R spec: {spec}");
+                        process::exit(1);
+                    }
+                }
+            }
             s if s.starts_with("-o") => {
                 let opt = if s.len() > 2 {
                     s[2..].trim().to_string()
@@ -310,6 +333,7 @@ fn parse_args_from(argv: Vec<String>) -> Args {
         config_file,
         o_options: o_opts,
         local_forwards,
+        remote_forwards,
         agent_forwarding,
     }
 }
@@ -707,13 +731,15 @@ async fn main() {
     log.log(Severity::Info, "authenticated");
 
     // ──────────────────────────────────────────────────────────
-    // Local port forwarding (-L) without a command: forward-only mode.
-    // Each listener accepts one connection at a time serially.
+    // Port forwarding without a command: forward-only mode.
     // ──────────────────────────────────────────────────────────
-    if !args.local_forwards.is_empty() && args.command.is_empty() {
+    let has_forwards = !args.local_forwards.is_empty() || !args.remote_forwards.is_empty();
+    if has_forwards && args.command.is_empty() {
         let conn = Arc::new(tokio::sync::Mutex::new(conn));
 
         let mut handles = Vec::new();
+
+        // Local forwards (-L): listen locally, open direct-tcpip channels.
         for (bind_host, bind_port, remote_host, remote_port) in args.local_forwards.clone() {
             let conn = Arc::clone(&conn);
             let log_fwd = StderrLogger::new(log_level, "russh");
@@ -761,6 +787,61 @@ async fn main() {
                         }
                         Err(e) => {
                             log_fwd.log(Severity::Warn, &format!("direct-tcpip open failed: {e}"));
+                        }
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Remote forwards (-R): request server to listen, accept forwarded channels.
+        for (bind_host, bind_port, local_host, local_port) in args.remote_forwards.clone() {
+            let conn = Arc::clone(&conn);
+            let log_fwd = StderrLogger::new(log_level, "russh");
+            let handle = tokio::spawn(async move {
+                let mut locked = conn.lock().await;
+                let actual_port = match locked.request_remote_forward(&bind_host, bind_port).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("russh: remote forward {bind_host}:{bind_port} rejected: {e}");
+                        return;
+                    }
+                };
+                log_fwd.log(
+                    Severity::Info,
+                    &format!(
+                        "remote forward {bind_host}:{actual_port} → {local_host}:{local_port}"
+                    ),
+                );
+                // Accept forwarded-tcpip channels and relay to local target.
+                loop {
+                    let channel = locked.accept_forwarded_channel().await;
+                    match channel {
+                        Ok((local_id, remote_id)) => {
+                            let target = format!("{local_host}:{local_port}");
+                            match TcpStream::connect(&target).await {
+                                Ok(mut tcp) => {
+                                    if let Err(e) = locked
+                                        .relay_tcp_channel(local_id, remote_id, &mut tcp)
+                                        .await
+                                    {
+                                        log_fwd.log(Severity::Warn, &format!("relay error: {e}"));
+                                    }
+                                }
+                                Err(e) => {
+                                    log_fwd.log(
+                                        Severity::Warn,
+                                        &format!("cannot connect to {target}: {e}"),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log_fwd.log(
+                                Severity::Warn,
+                                &format!("forwarded channel accept error: {e}"),
+                            );
+                            break;
                         }
                     }
                 }

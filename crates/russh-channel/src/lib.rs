@@ -1020,6 +1020,89 @@ impl ForwardHandle {
         write_u32(&mut out, originator_port);
         out
     }
+
+    /// Build the extra-data section for a `forwarded-tcpip` CHANNEL_OPEN (RFC 4254 §7.2).
+    ///
+    /// Wire: `string(connected_address) + uint32(connected_port)
+    ///        + string(originator_address) + uint32(originator_port)`
+    #[must_use]
+    pub fn build_forwarded_tcpip_open_extra(
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_string(&mut out, connected_address.as_bytes());
+        write_u32(&mut out, connected_port);
+        write_string(&mut out, originator_address.as_bytes());
+        write_u32(&mut out, originator_port);
+        out
+    }
+
+    /// Parse the extra-data from a `forwarded-tcpip` CHANNEL_OPEN.
+    ///
+    /// Returns `(connected_address, connected_port, originator_address, originator_port)`.
+    pub fn parse_forwarded_tcpip_extra(
+        data: &[u8],
+    ) -> Result<(String, u32, String, u32), RusshError> {
+        let mut off = 0;
+        let connected_address = {
+            let bytes = read_bytes(data, &mut off)?;
+            String::from_utf8(bytes).map_err(|_| {
+                RusshError::new(
+                    RusshErrorCategory::Protocol,
+                    "invalid UTF-8 in connected_address",
+                )
+            })?
+        };
+        let connected_port = read_u32(data, &mut off)?;
+        let originator_address = {
+            let bytes = read_bytes(data, &mut off)?;
+            String::from_utf8(bytes).map_err(|_| {
+                RusshError::new(
+                    RusshErrorCategory::Protocol,
+                    "invalid UTF-8 in originator_address",
+                )
+            })?
+        };
+        let originator_port = read_u32(data, &mut off)?;
+        Ok((
+            connected_address,
+            connected_port,
+            originator_address,
+            originator_port,
+        ))
+    }
+
+    /// Build the data payload for a `tcpip-forward` global request (RFC 4254 §7.1).
+    ///
+    /// Wire: `string(bind_address) + uint32(bind_port)`
+    #[must_use]
+    pub fn build_tcpip_forward_data(bind_address: &str, bind_port: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_string(&mut out, bind_address.as_bytes());
+        write_u32(&mut out, bind_port);
+        out
+    }
+
+    /// Parse the data payload from a `tcpip-forward` global request.
+    ///
+    /// Returns `(bind_address, bind_port)`.
+    pub fn parse_tcpip_forward_data(data: &[u8]) -> Result<(String, u32), RusshError> {
+        let mut off = 0;
+        let bind_address = {
+            let bytes = read_bytes(data, &mut off)?;
+            String::from_utf8(bytes).map_err(|_| {
+                RusshError::new(
+                    RusshErrorCategory::Protocol,
+                    "invalid UTF-8 in bind_address",
+                )
+            })?
+        };
+        let bind_port = read_u32(data, &mut off)?;
+        Ok((bind_address, bind_port))
+    }
 }
 
 #[cfg(test)]

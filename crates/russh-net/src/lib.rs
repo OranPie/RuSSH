@@ -2139,6 +2139,104 @@ impl SshClientConnection {
         }
     }
 
+    /// Request the server to listen on `bind_host:bind_port` and forward
+    /// incoming connections back to the client (`-R` remote port forwarding).
+    ///
+    /// Sends a `tcpip-forward` global request (RFC 4254 §7.1). If
+    /// `bind_port` is 0 the server picks a port and returns it in the
+    /// `REQUEST_SUCCESS` payload.
+    pub async fn request_remote_forward(
+        &mut self,
+        bind_host: &str,
+        bind_port: u16,
+    ) -> Result<u16, RusshError> {
+        debug!(bind_host, bind_port, "requesting tcpip-forward");
+        let data = ForwardHandle::build_tcpip_forward_data(bind_host, u32::from(bind_port));
+        // Build SSH_MSG_GLOBAL_REQUEST: [80 | string("tcpip-forward") | want_reply(1) | data]
+        let mut payload = Vec::new();
+        payload.push(80); // SSH_MSG_GLOBAL_REQUEST
+        let name = b"tcpip-forward";
+        payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        payload.extend_from_slice(name);
+        payload.push(1); // want_reply = true
+        payload.extend_from_slice(&data);
+        self.stream.write_packet(&PacketFrame::new(payload)).await?;
+
+        // Wait for REQUEST_SUCCESS (81) or REQUEST_FAILURE (82).
+        loop {
+            let frame = self.read_channel_packet().await?;
+            match frame.payload.first().copied() {
+                Some(81) => {
+                    // REQUEST_SUCCESS — if bind_port was 0, extract allocated port.
+                    let actual_port = if bind_port == 0 && frame.payload.len() >= 5 {
+                        u32::from_be_bytes([
+                            frame.payload[1],
+                            frame.payload[2],
+                            frame.payload[3],
+                            frame.payload[4],
+                        ]) as u16
+                    } else {
+                        bind_port
+                    };
+                    info!(bind_host, actual_port, "remote forward accepted");
+                    return Ok(actual_port);
+                }
+                Some(82) => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Channel,
+                        format!("remote forward request rejected for {bind_host}:{bind_port}"),
+                    ));
+                }
+                _ => {
+                    // Process other channel messages while waiting.
+                    if let Ok(ch) = ChannelMessage::from_bytes(&frame.payload) {
+                        let _ = self.channel_manager.process(&ch);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait for the server to open a `forwarded-tcpip` channel and accept it.
+    ///
+    /// Returns `(local_id, remote_id)` once the channel is confirmed.
+    pub async fn accept_forwarded_channel(&mut self) -> Result<(u32, u32), RusshError> {
+        loop {
+            let frame = self.read_channel_packet().await?;
+            let ch = ChannelMessage::from_bytes(&frame.payload)?;
+            match &ch {
+                ChannelMessage::Open {
+                    channel_type,
+                    sender_channel,
+                    initial_window_size,
+                    maximum_packet_size,
+                    ..
+                } if channel_type == "forwarded-tcpip" => {
+                    let remote_id = *sender_channel;
+                    // Allocate a local channel ID by opening a placeholder channel.
+                    let (local_id, _) =
+                        self.channel_manager
+                            .open_channel(ChannelKind::ForwardedTcpIp {
+                                host: String::new(),
+                                port: 0,
+                            });
+                    let confirm = ChannelMessage::OpenConfirmation {
+                        recipient_channel: remote_id,
+                        sender_channel: local_id,
+                        initial_window_size: *initial_window_size,
+                        maximum_packet_size: *maximum_packet_size,
+                    };
+                    self.stream.write_packet(&confirm.to_frame()?).await?;
+                    debug!(local_id, remote_id, "accepted forwarded-tcpip channel");
+                    return Ok((local_id, remote_id));
+                }
+                _ => {
+                    let _ = self.channel_manager.process(&ch);
+                }
+            }
+        }
+    }
+
     /// Send `SSH_MSG_DISCONNECT` and flush the connection.
     pub async fn disconnect(&mut self) -> Result<(), RusshError> {
         self.session.close("client disconnect");
@@ -2579,339 +2677,564 @@ impl SshServerConnection {
         let mut server_channels: std::collections::HashMap<u32, ServerChannelState> =
             std::collections::HashMap::new();
         let mut next_server_id: u32 = 0;
+        let mut remote_forward_listeners: Vec<(TcpListener, String, u16)> = Vec::new();
 
         loop {
-            let frame = match self.stream.read_packet().await {
-                Ok(f) => f,
-                // Treat connection-level IO errors (peer closed) as a clean session end.
-                Err(e) if e.category() == russh_core::RusshErrorCategory::Io => break,
-                Err(e) => return Err(e),
+            // Multiplex between reading SSH packets and accepting TCP
+            // connections on remote-forward listeners.
+            enum LoopEvent {
+                Packet(Result<PacketFrame, RusshError>),
+                ForwardAccept(usize, std::io::Result<(TcpStream, std::net::SocketAddr)>),
+            }
+
+            let event = if remote_forward_listeners.is_empty() {
+                LoopEvent::Packet(self.stream.read_packet().await)
+            } else {
+                tokio::select! {
+                    biased;
+                    frame = self.stream.read_packet() => LoopEvent::Packet(frame),
+                    result = accept_any(&remote_forward_listeners) => {
+                        let (idx, res) = result;
+                        LoopEvent::ForwardAccept(idx, res)
+                    }
+                }
             };
 
-            // Check for disconnect.
-            if frame.message_type() == Some(1) {
-                break;
-            }
+            match event {
+                LoopEvent::ForwardAccept(idx, accept_result) => {
+                    let (_, ref bind_host, bind_port) = remote_forward_listeners[idx];
+                    let bind_host = bind_host.clone();
 
-            // Handle SSH_MSG_GLOBAL_REQUEST (80): reply REQUEST_SUCCESS for
-            // keepalive@openssh.com, REQUEST_FAILURE for everything else.
-            if frame.message_type() == Some(80) {
-                let (request_name, want_reply) = parse_global_request(&frame.payload);
-                debug!(request_name, want_reply, "GLOBAL_REQUEST");
-                if want_reply {
-                    let reply = if request_name == "keepalive@openssh.com" {
-                        81 // SSH_MSG_REQUEST_SUCCESS
-                    } else {
-                        82 // SSH_MSG_REQUEST_FAILURE
-                    };
-                    let reply_frame = PacketFrame::new(vec![reply]);
-                    let _ = self.stream.write_packet(&reply_frame).await;
-                }
-                continue;
-            }
-
-            // Handle SSH_MSG_IGNORE (2) and SSH_MSG_DEBUG (4).
-            match frame.message_type() {
-                Some(2) | Some(4) => {
-                    trace!(
-                        msg_type = frame.message_type(),
-                        "ignoring transport msg in channel loop"
-                    );
-                    continue;
-                }
-                _ => {}
-            }
-
-            // Parse as channel message.
-            let msg = match ChannelMessage::from_bytes(&frame.payload) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!(error = %e, msg_type = frame.message_type(), "failed to parse channel message, skipping");
-                    continue;
-                }
-            };
-            match msg {
-                ChannelMessage::Open {
-                    sender_channel: client_ch,
-                    initial_window_size,
-                    maximum_packet_size,
-                    ..
-                } => {
-                    let our_id = next_server_id;
-                    next_server_id += 1;
-                    debug!(client_ch, our_id, "channel opened");
-                    server_channels.insert(
-                        client_ch,
-                        ServerChannelState {
-                            is_sftp: false,
-                            scp_root: None,
-                            sftp_server: None,
-                            sftp_framer: SftpFramer::new(),
-                            pty_requested: false,
-                            pty_size: None,
-                            pty_term: None,
-                            env: Vec::new(),
-                            agent_forwarding_requested: false,
-                        },
-                    );
-                    let confirm = ChannelMessage::OpenConfirmation {
-                        recipient_channel: client_ch,
-                        sender_channel: our_id,
-                        initial_window_size,
-                        maximum_packet_size,
-                    };
-                    self.stream.write_packet(&confirm.to_frame()?).await?;
-                }
-
-                ChannelMessage::Request {
-                    recipient_channel,
-                    want_reply,
-                    request,
-                } => {
-                    let state = match server_channels.get_mut(&recipient_channel) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let client_ch = recipient_channel;
-                    match request {
-                        ChannelRequest::Exec { command } => {
-                            info!(command = %command, "exec request");
-                            if want_reply {
-                                let ok = ChannelMessage::Success {
-                                    recipient_channel: client_ch,
-                                };
-                                self.stream.write_packet(&ok.to_frame()?).await?;
+                    match accept_result {
+                        Ok((mut tcp_stream, peer_addr)) => {
+                            debug!(
+                                bind_host = %bind_host, bind_port,
+                                originator = %peer_addr,
+                                "accepted connection on remote forward listener"
+                            );
+                            let our_id = next_server_id;
+                            next_server_id += 1;
+                            let extra_data = ForwardHandle::build_forwarded_tcpip_open_extra(
+                                &bind_host,
+                                u32::from(bind_port),
+                                &peer_addr.ip().to_string(),
+                                u32::from(peer_addr.port()),
+                            );
+                            let open_msg = ChannelMessage::Open {
+                                channel_type: "forwarded-tcpip".to_string(),
+                                sender_channel: our_id,
+                                initial_window_size: 2 * 1024 * 1024,
+                                maximum_packet_size: 32768,
+                                extra_data,
+                            };
+                            if self
+                                .stream
+                                .write_packet(&open_msg.to_frame()?)
+                                .await
+                                .is_err()
+                            {
+                                continue;
                             }
-                            // Handle scp receive
-                            if command.starts_with("scp -t") {
-                                let root = handler.scp_root();
-                                state.scp_root = root;
-                                // Send initial ACK.
-                                let ack = ChannelMessage::Data {
-                                    recipient_channel: client_ch,
-                                    data: vec![0x00],
+                            let client_ch = loop {
+                                let f = match self.stream.read_packet().await {
+                                    Ok(f) => f,
+                                    Err(_) => break None,
                                 };
-                                self.stream.write_packet(&ack.to_frame()?).await?;
+                                match ChannelMessage::from_bytes(&f.payload) {
+                                    Ok(ChannelMessage::OpenConfirmation {
+                                        recipient_channel,
+                                        sender_channel,
+                                        ..
+                                    }) if recipient_channel == our_id => {
+                                        break Some(sender_channel);
+                                    }
+                                    Ok(ChannelMessage::OpenFailure { .. }) => break None,
+                                    _ => {}
+                                }
+                            };
+                            if let Some(client_ch) = client_ch {
+                                let _ = self
+                                    .relay_server_tcp_channel(our_id, client_ch, &mut tcp_stream)
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "forward listener accept error");
+                        }
+                    }
+                }
+                LoopEvent::Packet(Err(e)) if e.category() == russh_core::RusshErrorCategory::Io => {
+                    break;
+                }
+                LoopEvent::Packet(Err(e)) => return Err(e),
+                LoopEvent::Packet(Ok(frame)) => {
+                    // Check for disconnect.
+                    if frame.message_type() == Some(1) {
+                        break;
+                    }
+
+                    // Handle SSH_MSG_GLOBAL_REQUEST (80).
+                    if frame.message_type() == Some(80) {
+                        let (request_name, want_reply) = parse_global_request(&frame.payload);
+                        debug!(request_name, want_reply, "GLOBAL_REQUEST");
+
+                        if request_name == "tcpip-forward" {
+                            let name_len = u32::from_be_bytes([
+                                frame.payload[1],
+                                frame.payload[2],
+                                frame.payload[3],
+                                frame.payload[4],
+                            ]) as usize;
+                            let data_start = 5 + name_len + 1;
+                            let data = &frame.payload[data_start..];
+                            match ForwardHandle::parse_tcpip_forward_data(data) {
+                                Ok((bind_host, bind_port)) => {
+                                    let bind_addr = if bind_host.is_empty()
+                                        || bind_host == "0.0.0.0"
+                                    {
+                                        "0.0.0.0"
+                                    } else if bind_host == "localhost" || bind_host == "127.0.0.1" {
+                                        "127.0.0.1"
+                                    } else {
+                                        &bind_host
+                                    };
+                                    let bp = bind_port as u16;
+                                    match TcpListener::bind(format!("{bind_addr}:{bp}")).await {
+                                        Ok(listener) => {
+                                            let actual_port = listener
+                                                .local_addr()
+                                                .map(|a| a.port())
+                                                .unwrap_or(bp);
+                                            info!(
+                                                bind_addr,
+                                                requested_port = bp,
+                                                actual_port,
+                                                "tcpip-forward: listener bound"
+                                            );
+                                            if want_reply {
+                                                let mut rp = vec![81u8];
+                                                if bp == 0 {
+                                                    write_u32(&mut rp, u32::from(actual_port));
+                                                }
+                                                let _ = self
+                                                    .stream
+                                                    .write_packet(&PacketFrame::new(rp))
+                                                    .await;
+                                            }
+                                            remote_forward_listeners.push((
+                                                listener,
+                                                bind_host.clone(),
+                                                actual_port,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "tcpip-forward: bind failed");
+                                            if want_reply {
+                                                let _ = self
+                                                    .stream
+                                                    .write_packet(&PacketFrame::new(vec![82]))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "tcpip-forward: parse failed");
+                                    if want_reply {
+                                        let _ = self
+                                            .stream
+                                            .write_packet(&PacketFrame::new(vec![82]))
+                                            .await;
+                                    }
+                                }
+                            }
+                        } else if want_reply {
+                            let reply = if request_name == "keepalive@openssh.com" {
+                                81
                             } else {
-                                let output = handler.exec(&command);
-                                if !output.is_empty() {
-                                    let data_msg = ChannelMessage::Data {
-                                        recipient_channel: client_ch,
-                                        data: output,
-                                    };
-                                    self.stream.write_packet(&data_msg.to_frame()?).await?;
-                                }
-                                let eof = ChannelMessage::Eof {
-                                    recipient_channel: client_ch,
-                                };
-                                self.stream.write_packet(&eof.to_frame()?).await?;
-                                let exit_status = ChannelMessage::Request {
-                                    recipient_channel: client_ch,
-                                    want_reply: false,
-                                    request: ChannelRequest::ExitStatus { exit_status: 0 },
-                                };
-                                self.stream.write_packet(&exit_status.to_frame()?).await?;
-                                let close = ChannelMessage::Close {
-                                    recipient_channel: client_ch,
-                                };
-                                self.stream.write_packet(&close.to_frame()?).await?;
-                            }
+                                82
+                            };
+                            let _ = self
+                                .stream
+                                .write_packet(&PacketFrame::new(vec![reply]))
+                                .await;
                         }
+                        continue;
+                    }
 
-                        ChannelRequest::SubSystem { name } if name == "sftp" => {
-                            info!("SFTP subsystem requested");
-                            if want_reply {
-                                if let Some(root) = handler.sftp_root() {
-                                    state.is_sftp = true;
-                                    state.sftp_server = Some(SftpFileServer::new(&root));
-                                    let ok = ChannelMessage::Success {
-                                        recipient_channel: client_ch,
-                                    };
-                                    self.stream.write_packet(&ok.to_frame()?).await?;
-                                } else {
-                                    let fail = ChannelMessage::Failure {
-                                        recipient_channel: client_ch,
-                                    };
-                                    self.stream.write_packet(&fail.to_frame()?).await?;
-                                }
-                            }
+                    // Handle SSH_MSG_IGNORE (2) and SSH_MSG_DEBUG (4).
+                    match frame.message_type() {
+                        Some(2) | Some(4) => {
+                            trace!(
+                                msg_type = frame.message_type(),
+                                "ignoring transport msg in channel loop"
+                            );
+                            continue;
                         }
+                        _ => {}
+                    }
 
-                        ChannelRequest::Env { name, value } => {
-                            debug!(env_name = %name, "client sent env var");
-                            state.env.push((name, value));
-                            if want_reply {
-                                let ok = ChannelMessage::Success {
-                                    recipient_channel: client_ch,
-                                };
-                                self.stream.write_packet(&ok.to_frame()?).await?;
-                            }
+                    // Parse as channel message.
+                    let msg = match ChannelMessage::from_bytes(&frame.payload) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!(error = %e, msg_type = frame.message_type(), "failed to parse channel message, skipping");
+                            continue;
                         }
-
-                        ChannelRequest::PtyReq {
-                            term,
-                            width_chars,
-                            height_rows,
+                    };
+                    match msg {
+                        ChannelMessage::Open {
+                            sender_channel: client_ch,
+                            initial_window_size,
+                            maximum_packet_size,
                             ..
                         } => {
-                            info!(term = %term, cols = width_chars, rows = height_rows, "PTY requested");
-                            state.pty_requested = true;
-                            state.pty_term = Some(term);
-                            state.pty_size = Some((
-                                u16::try_from(width_chars).unwrap_or(80),
-                                u16::try_from(height_rows).unwrap_or(24),
-                            ));
-                            if want_reply {
-                                let ok = ChannelMessage::Success {
-                                    recipient_channel: client_ch,
-                                };
-                                self.stream.write_packet(&ok.to_frame()?).await?;
-                            }
-                        }
-
-                        ChannelRequest::Shell => {
-                            info!("shell request");
-                            if let Some(shell) = handler.shell_command() {
-                                if want_reply {
-                                    let ok = ChannelMessage::Success {
-                                        recipient_channel: client_ch,
-                                    };
-                                    self.stream.write_packet(&ok.to_frame()?).await?;
-                                }
-                                let pty_size = state.pty_size;
-                                let pty_term = state.pty_term.clone();
-                                let env = state.env.clone();
-                                info!(shell = %shell, pty = pty_size.is_some(), "spawning shell");
-                                self.run_shell_channel(client_ch, &shell, pty_size, pty_term, env)
-                                    .await?;
-                            } else {
-                                warn!("shell request denied (no shell configured)");
-                                if want_reply {
-                                    let fail = ChannelMessage::Failure {
-                                        recipient_channel: client_ch,
-                                    };
-                                    self.stream.write_packet(&fail.to_frame()?).await?;
-                                }
-                            }
-                        }
-
-                        ChannelRequest::WindowChange {
-                            width_chars,
-                            height_rows,
-                            width_pixels,
-                            height_pixels,
-                        } => {
-                            debug!(
-                                cols = width_chars,
-                                rows = height_rows,
-                                px_w = width_pixels,
-                                px_h = height_pixels,
-                                "window-change request"
+                            let our_id = next_server_id;
+                            next_server_id += 1;
+                            debug!(client_ch, our_id, "channel opened");
+                            server_channels.insert(
+                                client_ch,
+                                ServerChannelState {
+                                    is_sftp: false,
+                                    scp_root: None,
+                                    sftp_server: None,
+                                    sftp_framer: SftpFramer::new(),
+                                    pty_requested: false,
+                                    pty_size: None,
+                                    pty_term: None,
+                                    env: Vec::new(),
+                                    agent_forwarding_requested: false,
+                                },
                             );
-                            state.pty_size = Some((
-                                u16::try_from(width_chars).unwrap_or(80),
-                                u16::try_from(height_rows).unwrap_or(24),
-                            ));
-                            // Per RFC 4254 §6.7, window-change MUST NOT
-                            // have want_reply set, so we do not send a
-                            // response.
+                            let confirm = ChannelMessage::OpenConfirmation {
+                                recipient_channel: client_ch,
+                                sender_channel: our_id,
+                                initial_window_size,
+                                maximum_packet_size,
+                            };
+                            self.stream.write_packet(&confirm.to_frame()?).await?;
                         }
 
-                        ChannelRequest::Unknown {
-                            ref request_type, ..
-                        } if request_type == "auth-agent-req@openssh.com" => {
-                            debug!("agent forwarding requested");
-                            state.agent_forwarding_requested = true;
-                            if want_reply {
-                                let ok = ChannelMessage::Success {
-                                    recipient_channel: client_ch,
-                                };
-                                self.stream.write_packet(&ok.to_frame()?).await?;
-                            }
-                        }
-
-                        ChannelRequest::Unknown {
-                            ref request_type, ..
+                        ChannelMessage::Request {
+                            recipient_channel,
+                            want_reply,
+                            request,
                         } => {
-                            debug!(request_type = %request_type, "unknown channel request");
-                            if want_reply {
-                                let fail = ChannelMessage::Failure {
-                                    recipient_channel: client_ch,
-                                };
-                                self.stream.write_packet(&fail.to_frame()?).await?;
+                            let state = match server_channels.get_mut(&recipient_channel) {
+                                Some(s) => s,
+                                None => continue,
+                            };
+                            let client_ch = recipient_channel;
+                            match request {
+                                ChannelRequest::Exec { command } => {
+                                    info!(command = %command, "exec request");
+                                    if want_reply {
+                                        let ok = ChannelMessage::Success {
+                                            recipient_channel: client_ch,
+                                        };
+                                        self.stream.write_packet(&ok.to_frame()?).await?;
+                                    }
+                                    // Handle scp receive
+                                    if command.starts_with("scp -t") {
+                                        let root = handler.scp_root();
+                                        state.scp_root = root;
+                                        // Send initial ACK.
+                                        let ack = ChannelMessage::Data {
+                                            recipient_channel: client_ch,
+                                            data: vec![0x00],
+                                        };
+                                        self.stream.write_packet(&ack.to_frame()?).await?;
+                                    } else {
+                                        let output = handler.exec(&command);
+                                        if !output.is_empty() {
+                                            let data_msg = ChannelMessage::Data {
+                                                recipient_channel: client_ch,
+                                                data: output,
+                                            };
+                                            self.stream.write_packet(&data_msg.to_frame()?).await?;
+                                        }
+                                        let eof = ChannelMessage::Eof {
+                                            recipient_channel: client_ch,
+                                        };
+                                        self.stream.write_packet(&eof.to_frame()?).await?;
+                                        let exit_status = ChannelMessage::Request {
+                                            recipient_channel: client_ch,
+                                            want_reply: false,
+                                            request: ChannelRequest::ExitStatus { exit_status: 0 },
+                                        };
+                                        self.stream.write_packet(&exit_status.to_frame()?).await?;
+                                        let close = ChannelMessage::Close {
+                                            recipient_channel: client_ch,
+                                        };
+                                        self.stream.write_packet(&close.to_frame()?).await?;
+                                    }
+                                }
+
+                                ChannelRequest::SubSystem { name } if name == "sftp" => {
+                                    info!("SFTP subsystem requested");
+                                    if want_reply {
+                                        if let Some(root) = handler.sftp_root() {
+                                            state.is_sftp = true;
+                                            state.sftp_server = Some(SftpFileServer::new(&root));
+                                            let ok = ChannelMessage::Success {
+                                                recipient_channel: client_ch,
+                                            };
+                                            self.stream.write_packet(&ok.to_frame()?).await?;
+                                        } else {
+                                            let fail = ChannelMessage::Failure {
+                                                recipient_channel: client_ch,
+                                            };
+                                            self.stream.write_packet(&fail.to_frame()?).await?;
+                                        }
+                                    }
+                                }
+
+                                ChannelRequest::Env { name, value } => {
+                                    debug!(env_name = %name, "client sent env var");
+                                    state.env.push((name, value));
+                                    if want_reply {
+                                        let ok = ChannelMessage::Success {
+                                            recipient_channel: client_ch,
+                                        };
+                                        self.stream.write_packet(&ok.to_frame()?).await?;
+                                    }
+                                }
+
+                                ChannelRequest::PtyReq {
+                                    term,
+                                    width_chars,
+                                    height_rows,
+                                    ..
+                                } => {
+                                    info!(term = %term, cols = width_chars, rows = height_rows, "PTY requested");
+                                    state.pty_requested = true;
+                                    state.pty_term = Some(term);
+                                    state.pty_size = Some((
+                                        u16::try_from(width_chars).unwrap_or(80),
+                                        u16::try_from(height_rows).unwrap_or(24),
+                                    ));
+                                    if want_reply {
+                                        let ok = ChannelMessage::Success {
+                                            recipient_channel: client_ch,
+                                        };
+                                        self.stream.write_packet(&ok.to_frame()?).await?;
+                                    }
+                                }
+
+                                ChannelRequest::Shell => {
+                                    info!("shell request");
+                                    if let Some(shell) = handler.shell_command() {
+                                        if want_reply {
+                                            let ok = ChannelMessage::Success {
+                                                recipient_channel: client_ch,
+                                            };
+                                            self.stream.write_packet(&ok.to_frame()?).await?;
+                                        }
+                                        let pty_size = state.pty_size;
+                                        let pty_term = state.pty_term.clone();
+                                        let env = state.env.clone();
+                                        info!(shell = %shell, pty = pty_size.is_some(), "spawning shell");
+                                        self.run_shell_channel(
+                                            client_ch, &shell, pty_size, pty_term, env,
+                                        )
+                                        .await?;
+                                    } else {
+                                        warn!("shell request denied (no shell configured)");
+                                        if want_reply {
+                                            let fail = ChannelMessage::Failure {
+                                                recipient_channel: client_ch,
+                                            };
+                                            self.stream.write_packet(&fail.to_frame()?).await?;
+                                        }
+                                    }
+                                }
+
+                                ChannelRequest::WindowChange {
+                                    width_chars,
+                                    height_rows,
+                                    width_pixels,
+                                    height_pixels,
+                                } => {
+                                    debug!(
+                                        cols = width_chars,
+                                        rows = height_rows,
+                                        px_w = width_pixels,
+                                        px_h = height_pixels,
+                                        "window-change request"
+                                    );
+                                    state.pty_size = Some((
+                                        u16::try_from(width_chars).unwrap_or(80),
+                                        u16::try_from(height_rows).unwrap_or(24),
+                                    ));
+                                    // Per RFC 4254 §6.7, window-change MUST NOT
+                                    // have want_reply set, so we do not send a
+                                    // response.
+                                }
+
+                                ChannelRequest::Unknown {
+                                    ref request_type, ..
+                                } if request_type == "auth-agent-req@openssh.com" => {
+                                    debug!("agent forwarding requested");
+                                    state.agent_forwarding_requested = true;
+                                    if want_reply {
+                                        let ok = ChannelMessage::Success {
+                                            recipient_channel: client_ch,
+                                        };
+                                        self.stream.write_packet(&ok.to_frame()?).await?;
+                                    }
+                                }
+
+                                ChannelRequest::Unknown {
+                                    ref request_type, ..
+                                } => {
+                                    debug!(request_type = %request_type, "unknown channel request");
+                                    if want_reply {
+                                        let fail = ChannelMessage::Failure {
+                                            recipient_channel: client_ch,
+                                        };
+                                        self.stream.write_packet(&fail.to_frame()?).await?;
+                                    }
+                                }
+
+                                _ => {
+                                    if want_reply {
+                                        let fail = ChannelMessage::Failure {
+                                            recipient_channel: client_ch,
+                                        };
+                                        self.stream.write_packet(&fail.to_frame()?).await?;
+                                    }
+                                }
                             }
                         }
 
-                        _ => {
-                            if want_reply {
-                                let fail = ChannelMessage::Failure {
-                                    recipient_channel: client_ch,
-                                };
-                                self.stream.write_packet(&fail.to_frame()?).await?;
+                        ChannelMessage::Data {
+                            recipient_channel,
+                            data,
+                        } => {
+                            let state = match server_channels.get_mut(&recipient_channel) {
+                                Some(s) => s,
+                                None => continue,
+                            };
+                            let client_ch = recipient_channel;
+
+                            if state.is_sftp {
+                                // SFTP subsystem: feed data into the per-channel framer, then
+                                // dispatch each complete packet to the per-channel SftpFileServer.
+                                if let Some(sftp_server) = state.sftp_server.as_mut() {
+                                    state.sftp_framer.feed(&data);
+                                    while let Some(request) = state.sftp_framer.next_packet()? {
+                                        let response = sftp_server.process(&request)?;
+                                        let resp_bytes = response.encode();
+                                        let resp_msg = ChannelMessage::Data {
+                                            recipient_channel: client_ch,
+                                            data: resp_bytes,
+                                        };
+                                        self.stream.write_packet(&resp_msg.to_frame()?).await?;
+                                    }
+                                }
+                            } else if let Some(scp_root) = state.scp_root.clone() {
+                                // SCP receive: parse and store the uploaded file.
+                                self.handle_scp_data(client_ch, &data, &scp_root).await?;
                             }
                         }
+
+                        ChannelMessage::Eof { recipient_channel } => {
+                            // Client is done sending; send EOF + CLOSE back to unblock the client.
+                            let _ = self
+                                .stream
+                                .write_packet(
+                                    &ChannelMessage::Eof { recipient_channel }.to_frame()?,
+                                )
+                                .await;
+                            let _ = self
+                                .stream
+                                .write_packet(
+                                    &ChannelMessage::Close { recipient_channel }.to_frame()?,
+                                )
+                                .await;
+                            server_channels.remove(&recipient_channel);
+                        }
+
+                        ChannelMessage::Close { recipient_channel } => {
+                            server_channels.remove(&recipient_channel);
+                        }
+
+                        ChannelMessage::WindowAdjust { .. } => {}
+
+                        _ => {}
                     }
-                }
 
-                ChannelMessage::Data {
-                    recipient_channel,
-                    data,
-                } => {
-                    let state = match server_channels.get_mut(&recipient_channel) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let client_ch = recipient_channel;
-
-                    if state.is_sftp {
-                        // SFTP subsystem: feed data into the per-channel framer, then
-                        // dispatch each complete packet to the per-channel SftpFileServer.
-                        if let Some(sftp_server) = state.sftp_server.as_mut() {
-                            state.sftp_framer.feed(&data);
-                            while let Some(request) = state.sftp_framer.next_packet()? {
-                                let response = sftp_server.process(&request)?;
-                                let resp_bytes = response.encode();
-                                let resp_msg = ChannelMessage::Data {
-                                    recipient_channel: client_ch,
-                                    data: resp_bytes,
-                                };
-                                self.stream.write_packet(&resp_msg.to_frame()?).await?;
-                            }
-                        }
-                    } else if let Some(scp_root) = state.scp_root.clone() {
-                        // SCP receive: parse and store the uploaded file.
-                        self.handle_scp_data(client_ch, &data, &scp_root).await?;
+                    // Stop if the session is closed.
+                    if session.state() == russh_transport::SessionState::Closed {
+                        break;
                     }
-                }
-
-                ChannelMessage::Eof { recipient_channel } => {
-                    // Client is done sending; send EOF + CLOSE back to unblock the client.
-                    let _ = self
-                        .stream
-                        .write_packet(&ChannelMessage::Eof { recipient_channel }.to_frame()?)
-                        .await;
-                    let _ = self
-                        .stream
-                        .write_packet(&ChannelMessage::Close { recipient_channel }.to_frame()?)
-                        .await;
-                    server_channels.remove(&recipient_channel);
-                }
-
-                ChannelMessage::Close { recipient_channel } => {
-                    server_channels.remove(&recipient_channel);
-                }
-
-                ChannelMessage::WindowAdjust { .. } => {}
-
-                _ => {}
-            }
-
-            // Stop if the session is closed.
-            if session.state() == russh_transport::SessionState::Closed {
-                break;
-            }
+                } // LoopEvent::Packet(Ok(frame))
+            } // match event
         }
 
+        Ok(())
+    }
+
+    /// Drive bidirectional I/O between a TCP stream and an SSH channel (server side).
+    async fn relay_server_tcp_channel(
+        &mut self,
+        _our_id: u32,
+        client_ch: u32,
+        tcp: &mut TcpStream,
+    ) -> Result<(), RusshError> {
+        let (mut tcp_rx, mut tcp_tx) = tcp.split();
+        let mut buf = vec![0u8; 32768];
+
+        loop {
+            tokio::select! {
+                n = tcp_rx.read(&mut buf) => {
+                    let n = match n {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let frame = channel_data_frame(client_ch, &buf[..n]);
+                    if self.stream.write_packet(&frame).await.is_err() {
+                        break;
+                    }
+                }
+                frame_res = self.stream.read_packet() => {
+                    let frame = match frame_res {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                    match ChannelMessage::from_bytes(&frame.payload) {
+                        Ok(ChannelMessage::Data { data, .. }) => {
+                            if tcp_tx.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(ChannelMessage::WindowAdjust { .. }) => {}
+                        Ok(ChannelMessage::Eof { .. })
+                        | Ok(ChannelMessage::Close { .. }) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Send EOF + CLOSE on the forwarded channel.
+        let _ = self
+            .stream
+            .write_packet(
+                &ChannelMessage::Eof {
+                    recipient_channel: client_ch,
+                }
+                .to_frame()?,
+            )
+            .await;
+        let _ = self
+            .stream
+            .write_packet(
+                &ChannelMessage::Close {
+                    recipient_channel: client_ch,
+                }
+                .to_frame()?,
+            )
+            .await;
         Ok(())
     }
 
@@ -3373,6 +3696,33 @@ struct ServerChannelState {
     env: Vec<(String, String)>,
     /// Whether the client has requested SSH agent forwarding on this channel.
     agent_forwarding_requested: bool,
+}
+
+// ── Remote-forward listener helper ───────────────────────────────────────────
+
+/// Accept a TCP connection on any of the given listeners.
+///
+/// Returns `(index, result)` where `index` is the position of the listener
+/// that accepted the connection.
+async fn accept_any(
+    listeners: &[(TcpListener, String, u16)],
+) -> (usize, std::io::Result<(TcpStream, std::net::SocketAddr)>) {
+    // Safety: this function is only called when listeners is non-empty.
+    assert!(!listeners.is_empty());
+
+    // Use poll_fn to poll all listeners concurrently.
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    poll_fn(|cx| {
+        for (i, (listener, _, _)) in listeners.iter().enumerate() {
+            if let Poll::Ready(result) = listener.poll_accept(cx) {
+                return Poll::Ready((i, result));
+            }
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 // ── SshServer ────────────────────────────────────────────────────────────────
