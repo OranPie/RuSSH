@@ -1559,6 +1559,566 @@ mod interop_tests {
         // Clean up temp pub file.
         let _ = std::fs::remove_file(&tmp_pub);
     }
+
+    // ── Helper: connect + authenticate + exec with custom ClientConfig ─────────
+
+    /// Connect to a fixture sshd, authenticate with Ed25519, run a command, and
+    /// return stdout.  Panics on any failure so callers can simply assert output.
+    async fn connect_exec_with_config(
+        fixture: &SshdFixture,
+        config: ClientConfig,
+        cmd: &str,
+    ) -> Vec<u8> {
+        let addr = format!("127.0.0.1:{}", fixture.port);
+        let mut conn = SshClientConnection::connect(&addr, config)
+            .await
+            .expect("connect to sshd");
+        let signer = Ed25519Signer::from_seed(&fixture.user_key_seed);
+        conn.authenticate_pubkey(&signer)
+            .await
+            .expect("pubkey auth");
+        let result = conn.exec(cmd).await.expect("exec");
+        assert_eq!(result.exit_code, Some(0), "command exited non-zero");
+        conn.disconnect().await.ok();
+        result.stdout
+    }
+
+    /// Build a `ClientConfig` with a specific algorithm override applied to the
+    /// default secure set.
+    fn config_with_algorithms(
+        username: &str,
+        mutate: impl FnOnce(&mut russh_core::AlgorithmSet),
+    ) -> ClientConfig {
+        let mut config = ClientConfig::secure_defaults(username);
+        config.strict_host_key_checking = false;
+        mutate(config.transport.policy.algorithms_mut());
+        config
+    }
+
+    // ── 1. Cipher × MAC test matrix ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cipher_aes256_gcm() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.ciphers = vec!["aes256-gcm@openssh.com".into()];
+            algos.macs = vec![];
+        });
+        let stdout = connect_exec_with_config(&fixture, config, "echo cipher-gcm-ok").await;
+        assert_eq!(stdout, b"cipher-gcm-ok\n");
+    }
+
+    #[tokio::test]
+    async fn cipher_aes256_ctr_mac_sha256_etm() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.ciphers = vec!["aes256-ctr".into()];
+            algos.macs = vec!["hmac-sha2-256-etm@openssh.com".into()];
+        });
+        let stdout =
+            connect_exec_with_config(&fixture, config, "echo aes256ctr-sha256etm-ok").await;
+        assert_eq!(stdout, b"aes256ctr-sha256etm-ok\n");
+    }
+
+    #[tokio::test]
+    async fn cipher_aes128_ctr_mac_sha256_etm() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.ciphers = vec!["aes128-ctr".into()];
+            algos.macs = vec!["hmac-sha2-256-etm@openssh.com".into()];
+        });
+        let stdout =
+            connect_exec_with_config(&fixture, config, "echo aes128ctr-sha256etm-ok").await;
+        assert_eq!(stdout, b"aes128ctr-sha256etm-ok\n");
+    }
+
+    #[tokio::test]
+    async fn cipher_aes256_ctr_mac_sha512_etm() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.ciphers = vec!["aes256-ctr".into()];
+            algos.macs = vec!["hmac-sha2-512-etm@openssh.com".into()];
+        });
+        let stdout =
+            connect_exec_with_config(&fixture, config, "echo aes256ctr-sha512etm-ok").await;
+        assert_eq!(stdout, b"aes256ctr-sha512etm-ok\n");
+    }
+
+    // ── 2. KEX algorithm tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kex_curve25519_sha256() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.kex = vec!["curve25519-sha256".into()];
+        });
+        let stdout = connect_exec_with_config(&fixture, config, "echo kex-c25519-ok").await;
+        assert_eq!(stdout, b"kex-c25519-ok\n");
+    }
+
+    #[tokio::test]
+    async fn kex_ecdh_sha2_nistp256() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.kex = vec!["ecdh-sha2-nistp256".into()];
+        });
+        let stdout = connect_exec_with_config(&fixture, config, "echo kex-ecdh-p256-ok").await;
+        assert_eq!(stdout, b"kex-ecdh-p256-ok\n");
+    }
+
+    #[tokio::test]
+    async fn kex_diffie_hellman_group14_sha256() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.kex = vec!["diffie-hellman-group14-sha256".into()];
+        });
+        let stdout = connect_exec_with_config(&fixture, config, "echo kex-dhg14-ok").await;
+        assert_eq!(stdout, b"kex-dhg14-ok\n");
+    }
+
+    // ── 3. Host key algorithm tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hostkey_ssh_ed25519() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.host_key = vec!["ssh-ed25519".into()];
+        });
+        let stdout = connect_exec_with_config(&fixture, config, "echo hostkey-ed25519-ok").await;
+        assert_eq!(stdout, b"hostkey-ed25519-ok\n");
+    }
+
+    #[tokio::test]
+    async fn hostkey_ecdsa_sha2_nistp256() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        // Spawn a custom sshd with an ECDSA host key.
+        let tmp = super::unique_temp_path("russh_hostkey_ecdsa");
+        std::fs::create_dir_all(&tmp).ok();
+
+        let host_key_path = tmp.join("ssh_host_ecdsa_key");
+        let ok = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "ecdsa",
+                "-b",
+                "256",
+                "-f",
+                host_key_path.to_str().unwrap(),
+                "-N",
+                "",
+                "-q",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        super::set_permissions_600(&host_key_path);
+
+        // Generate user key.
+        let mut seed = [0u8; 32];
+        russh_crypto::OsRng.fill_bytes(&mut seed);
+        let user_signer = Ed25519Signer::from_seed(&seed);
+        let auth_keys_path = tmp.join("authorized_keys");
+        let auth_line = format!(
+            "ssh-ed25519 {} test\n",
+            super::base64_standard(&user_signer.public_key_blob())
+        );
+        std::fs::write(&auth_keys_path, auth_line).ok();
+        super::set_permissions_600(&auth_keys_path);
+
+        let port = match super::free_port() {
+            Some(p) => p,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config_path = tmp.join("sshd_config");
+        let config_text = format!(
+            "Port {port}\nHostKey {hk}\nAuthorizedKeysFile {ak}\n\
+             PubkeyAuthentication yes\nPasswordAuthentication no\n\
+             ChallengeResponseAuthentication no\nKbdInteractiveAuthentication no\n\
+             UsePAM no\nStrictModes no\nPermitRootLogin yes\n\
+             AllowUsers {user}\nLogLevel ERROR\n",
+            hk = host_key_path.display(),
+            ak = auth_keys_path.display(),
+            user = username,
+        );
+        std::fs::write(&config_path, &config_text).ok();
+
+        let sshd_path = ["/usr/sbin/sshd", "/usr/bin/sshd"]
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .copied()
+            .unwrap_or("sshd");
+        let mut sshd = match std::process::Command::new(sshd_path)
+            .args(["-D", "-f", config_path.to_str().unwrap()])
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return;
+            }
+        };
+        if !super::wait_for_tcp_ready(port, Some(&mut sshd), std::time::Duration::from_secs(3)) {
+            let _ = sshd.kill();
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+
+        let mut config = ClientConfig::secure_defaults(&username);
+        config.strict_host_key_checking = false;
+        config.transport.policy.algorithms_mut().host_key = vec!["ecdsa-sha2-nistp256".into()];
+
+        let addr = format!("127.0.0.1:{port}");
+        let mut conn = SshClientConnection::connect(&addr, config)
+            .await
+            .expect("connect");
+        let signer = Ed25519Signer::from_seed(&seed);
+        conn.authenticate_pubkey(&signer)
+            .await
+            .expect("pubkey auth");
+        let result = conn.exec("echo hostkey-ecdsa-ok").await.expect("exec");
+        assert_eq!(result.stdout, b"hostkey-ecdsa-ok\n");
+        conn.disconnect().await.ok();
+
+        let _ = sshd.kill();
+        let _ = sshd.wait();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn hostkey_rsa_sha2_256() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        // Spawn a custom sshd with an RSA host key.
+        let tmp = super::unique_temp_path("russh_hostkey_rsa");
+        std::fs::create_dir_all(&tmp).ok();
+
+        let host_key_path = tmp.join("ssh_host_rsa_key");
+        let ok = std::process::Command::new("ssh-keygen")
+            .args([
+                "-t",
+                "rsa",
+                "-b",
+                "2048",
+                "-f",
+                host_key_path.to_str().unwrap(),
+                "-N",
+                "",
+                "-q",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        super::set_permissions_600(&host_key_path);
+
+        let mut seed = [0u8; 32];
+        russh_crypto::OsRng.fill_bytes(&mut seed);
+        let user_signer = Ed25519Signer::from_seed(&seed);
+        let auth_keys_path = tmp.join("authorized_keys");
+        let auth_line = format!(
+            "ssh-ed25519 {} test\n",
+            super::base64_standard(&user_signer.public_key_blob())
+        );
+        std::fs::write(&auth_keys_path, auth_line).ok();
+        super::set_permissions_600(&auth_keys_path);
+
+        let port = match super::free_port() {
+            Some(p) => p,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config_path = tmp.join("sshd_config");
+        let config_text = format!(
+            "Port {port}\nHostKey {hk}\nAuthorizedKeysFile {ak}\n\
+             PubkeyAuthentication yes\nPasswordAuthentication no\n\
+             ChallengeResponseAuthentication no\nKbdInteractiveAuthentication no\n\
+             UsePAM no\nStrictModes no\nPermitRootLogin yes\n\
+             AllowUsers {user}\nLogLevel ERROR\n\
+             HostKeyAlgorithms rsa-sha2-256\n",
+            hk = host_key_path.display(),
+            ak = auth_keys_path.display(),
+            user = username,
+        );
+        std::fs::write(&config_path, &config_text).ok();
+
+        let sshd_path = ["/usr/sbin/sshd", "/usr/bin/sshd"]
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .copied()
+            .unwrap_or("sshd");
+        let mut sshd = match std::process::Command::new(sshd_path)
+            .args(["-D", "-f", config_path.to_str().unwrap()])
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return;
+            }
+        };
+        if !super::wait_for_tcp_ready(port, Some(&mut sshd), std::time::Duration::from_secs(3)) {
+            let _ = sshd.kill();
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+
+        let mut config = ClientConfig::secure_defaults(&username);
+        config.strict_host_key_checking = false;
+        config.transport.policy.algorithms_mut().host_key = vec!["rsa-sha2-256".into()];
+
+        let addr = format!("127.0.0.1:{port}");
+        let mut conn = SshClientConnection::connect(&addr, config)
+            .await
+            .expect("connect");
+        let signer = Ed25519Signer::from_seed(&seed);
+        conn.authenticate_pubkey(&signer)
+            .await
+            .expect("pubkey auth");
+        let result = conn.exec("echo hostkey-rsa-ok").await.expect("exec");
+        assert_eq!(result.stdout, b"hostkey-rsa-ok\n");
+        conn.disconnect().await.ok();
+
+        let _ = sshd.kill();
+        let _ = sshd.wait();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── 4. Rekey stress test ──────────────────────────────────────────────────
+
+    /// Connect with a very low rekey threshold, transfer enough data to trigger
+    /// at least one rekey, and verify the session remains functional.
+    #[tokio::test]
+    async fn rekey_mid_transfer() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let mut config = ClientConfig::secure_defaults(&username);
+        config.strict_host_key_checking = false;
+        // Set a very low rekey threshold so that a modest data transfer forces
+        // at least one rekey.
+        config.transport.rekey_after_bytes = 4096;
+
+        let addr = format!("127.0.0.1:{}", fixture.port);
+        let mut conn = SshClientConnection::connect(&addr, config)
+            .await
+            .expect("connect");
+        let signer = Ed25519Signer::from_seed(&fixture.user_key_seed);
+        conn.authenticate_pubkey(&signer)
+            .await
+            .expect("pubkey auth");
+
+        // Run multiple exec rounds to push data well past the 4 KiB rekey
+        // threshold, verifying output integrity after rekey(s).
+        for i in 0..10 {
+            let tag = format!("rekey-round-{i}");
+            let result = conn
+                .exec(&format!("echo {tag}"))
+                .await
+                .expect("exec during rekey");
+            assert_eq!(
+                result.stdout,
+                format!("{tag}\n").as_bytes(),
+                "output mismatch after rekey on round {i}"
+            );
+            assert_eq!(result.exit_code, Some(0));
+        }
+
+        conn.disconnect().await.ok();
+    }
+
+    // ── 5. Compression test ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn compression_zlib_openssh() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let config = config_with_algorithms(&username, |algos| {
+            algos.compression = vec!["zlib@openssh.com".into()];
+        });
+        let stdout = connect_exec_with_config(&fixture, config, "echo compression-ok").await;
+        assert_eq!(stdout, b"compression-ok\n");
+    }
+
+    // ── 6. Auth method tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auth_pubkey_ed25519() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let mut config = ClientConfig::secure_defaults(&username);
+        config.strict_host_key_checking = false;
+
+        let addr = format!("127.0.0.1:{}", fixture.port);
+        let mut conn = SshClientConnection::connect(&addr, config)
+            .await
+            .expect("connect");
+        let signer = Ed25519Signer::from_seed(&fixture.user_key_seed);
+        conn.authenticate_pubkey(&signer)
+            .await
+            .expect("ed25519 pubkey auth");
+        let result = conn.exec("echo auth-pubkey-ok").await.expect("exec");
+        assert_eq!(result.stdout, b"auth-pubkey-ok\n");
+        assert_eq!(result.exit_code, Some(0));
+        conn.disconnect().await.ok();
+    }
+
+    /// Password authentication against the default SshdFixture (which disables
+    /// password auth).  Verifies that the client handles rejection gracefully.
+    #[tokio::test]
+    async fn auth_password_rejected() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let mut config = ClientConfig::secure_defaults(&username);
+        config.strict_host_key_checking = false;
+
+        let addr = format!("127.0.0.1:{}", fixture.port);
+        let mut conn = SshClientConnection::connect(&addr, config)
+            .await
+            .expect("connect");
+
+        // The fixture has password auth disabled, so this should be rejected.
+        let result = conn.authenticate_password("wrong-password").await;
+        assert!(
+            result.is_err(),
+            "password auth should fail when disabled on sshd"
+        );
+        conn.disconnect().await.ok();
+    }
+
+    /// Keyboard-interactive auth initiation against an sshd that has kbd-int
+    /// disabled.  The server should reject the auth method.
+    #[tokio::test]
+    async fn auth_keyboard_interactive_rejected() {
+        let _guard = super::interop_test_guard().await;
+        if !openssh_available() {
+            return;
+        }
+        let fixture = match SshdFixture::spawn() {
+            Some(f) => f,
+            None => return,
+        };
+        let username = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        let mut config = ClientConfig::secure_defaults(&username);
+        config.strict_host_key_checking = false;
+
+        let addr = format!("127.0.0.1:{}", fixture.port);
+        let mut conn = SshClientConnection::connect(&addr, config)
+            .await
+            .expect("connect");
+
+        // kbd-interactive is disabled in the default fixture.
+        let result = conn.authenticate_keyboard_interactive().await;
+        assert!(
+            result.is_err(),
+            "keyboard-interactive auth should fail when disabled on sshd"
+        );
+        conn.disconnect().await.ok();
+    }
 }
 
 /// Decode a standard Base64 string (RFC 4648) into bytes.
