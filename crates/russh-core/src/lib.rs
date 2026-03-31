@@ -112,8 +112,11 @@ impl AlgorithmSet {
                 "rsa-sha2-512".to_string(),
             ],
             ciphers: vec![
+                "chacha20-poly1305@openssh.com".to_string(),
                 "aes256-gcm@openssh.com".to_string(),
+                "aes128-gcm@openssh.com".to_string(),
                 "aes256-ctr".to_string(),
+                "aes192-ctr".to_string(),
                 "aes128-ctr".to_string(),
             ],
             macs: vec![

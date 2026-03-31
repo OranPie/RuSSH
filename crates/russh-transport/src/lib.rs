@@ -2688,8 +2688,8 @@ fn derive_session_keys(
         session_id: sid.to_vec(),
         iv_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'A', sid, 16),
         iv_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'B', sid, 16),
-        key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'C', sid, 32),
-        key_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'D', sid, 32),
+        key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'C', sid, 64),
+        key_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'D', sid, 64),
         mac_key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'E', sid, 32),
         mac_key_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'F', sid, 32),
     }

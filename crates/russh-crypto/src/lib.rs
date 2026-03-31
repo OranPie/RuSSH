@@ -525,6 +525,343 @@ impl AeadCipher for ChaCha20Poly1305Cipher {
 }
 
 // ============================================================
+// Raw Poly1305 MAC (donna-32 style, RFC 7539 §2.5)
+// ============================================================
+
+/// Compute raw Poly1305 MAC over arbitrary-length data.
+///
+/// This correctly handles partial final blocks (appends 0x01 after data
+/// with hibit=0), unlike the `poly1305` crate's `UniversalHash::update_padded`
+/// which zero-pads partial blocks and always sets hibit=2^128.
+///
+/// Based on the poly1305-donna-32 reference implementation.
+fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
+    fn u32_le(b: &[u8]) -> u32 {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    // Clamp r (first 16 bytes of key)
+    let r0 = u32_le(&key[0..4]) & 0x03ff_ffff;
+    let r1 = (u32_le(&key[3..7]) >> 2) & 0x03ff_ff03;
+    let r2 = (u32_le(&key[6..10]) >> 4) & 0x03ff_c0ff;
+    let r3 = (u32_le(&key[9..13]) >> 6) & 0x03f0_3fff;
+    let r4 = (u32_le(&key[12..16]) >> 8) & 0x000f_ffff;
+
+    // Precompute s_i = r_i * 5 for lazy reduction (2^130 ≡ 5 mod p)
+    let s1 = r1 * 5;
+    let s2 = r2 * 5;
+    let s3 = r3 * 5;
+    let s4 = r4 * 5;
+
+    // Pad (second 16 bytes of key)
+    let pad = [
+        u32_le(&key[16..20]),
+        u32_le(&key[20..24]),
+        u32_le(&key[24..28]),
+        u32_le(&key[28..32]),
+    ];
+
+    // Accumulator in radix 2^26
+    let (mut h0, mut h1, mut h2, mut h3, mut h4): (u32, u32, u32, u32, u32) = (0, 0, 0, 0, 0);
+
+    let mut pos = 0;
+    while pos < msg.len() {
+        let remaining = msg.len() - pos;
+        let block_len = remaining.min(16);
+
+        // Read block into a 17-byte buffer (extra byte for partial-block 0x01)
+        let mut b = [0u8; 17];
+        b[..block_len].copy_from_slice(&msg[pos..pos + block_len]);
+
+        let hibit: u32;
+        if block_len == 16 {
+            // Full block: add 2^128 via hibit (= 1 << 24 in limb 4)
+            hibit = 1 << 24;
+        } else {
+            // Partial block: append 0x01 after data, no hibit
+            b[block_len] = 1;
+            hibit = 0;
+        }
+
+        // Add block to h (radix 2^26 decomposition)
+        h0 += u32_le(&b[0..4]) & 0x03ff_ffff;
+        h1 += (u32_le(&b[3..7]) >> 2) & 0x03ff_ffff;
+        h2 += (u32_le(&b[6..10]) >> 4) & 0x03ff_ffff;
+        h3 += (u32_le(&b[9..13]) >> 6) & 0x03ff_ffff;
+        h4 += (u32_le(&b[12..16]) >> 8) | hibit;
+
+        // h *= r (schoolbook with lazy reduction via s_i = 5 * r_i)
+        let d0 = (h0 as u64) * (r0 as u64)
+            + (h1 as u64) * (s4 as u64)
+            + (h2 as u64) * (s3 as u64)
+            + (h3 as u64) * (s2 as u64)
+            + (h4 as u64) * (s1 as u64);
+        let d1 = (h0 as u64) * (r1 as u64)
+            + (h1 as u64) * (r0 as u64)
+            + (h2 as u64) * (s4 as u64)
+            + (h3 as u64) * (s3 as u64)
+            + (h4 as u64) * (s2 as u64);
+        let d2 = (h0 as u64) * (r2 as u64)
+            + (h1 as u64) * (r1 as u64)
+            + (h2 as u64) * (r0 as u64)
+            + (h3 as u64) * (s4 as u64)
+            + (h4 as u64) * (s3 as u64);
+        let d3 = (h0 as u64) * (r3 as u64)
+            + (h1 as u64) * (r2 as u64)
+            + (h2 as u64) * (r1 as u64)
+            + (h3 as u64) * (r0 as u64)
+            + (h4 as u64) * (s4 as u64);
+        let d4 = (h0 as u64) * (r4 as u64)
+            + (h1 as u64) * (r3 as u64)
+            + (h2 as u64) * (r2 as u64)
+            + (h3 as u64) * (r1 as u64)
+            + (h4 as u64) * (r0 as u64);
+
+        // Partial reduction (carry propagation)
+        let mut c: u32;
+        c = (d0 >> 26) as u32;
+        h0 = d0 as u32 & 0x03ff_ffff;
+        let d1 = d1 + c as u64;
+        c = (d1 >> 26) as u32;
+        h1 = d1 as u32 & 0x03ff_ffff;
+        let d2 = d2 + c as u64;
+        c = (d2 >> 26) as u32;
+        h2 = d2 as u32 & 0x03ff_ffff;
+        let d3 = d3 + c as u64;
+        c = (d3 >> 26) as u32;
+        h3 = d3 as u32 & 0x03ff_ffff;
+        let d4 = d4 + c as u64;
+        c = (d4 >> 26) as u32;
+        h4 = d4 as u32 & 0x03ff_ffff;
+        h0 += c * 5;
+        c = h0 >> 26;
+        h0 &= 0x03ff_ffff;
+        h1 += c;
+
+        pos += block_len;
+    }
+
+    // Full carry
+    let mut c: u32;
+    c = h1 >> 26;
+    h1 &= 0x03ff_ffff;
+    h2 += c;
+    c = h2 >> 26;
+    h2 &= 0x03ff_ffff;
+    h3 += c;
+    c = h3 >> 26;
+    h3 &= 0x03ff_ffff;
+    h4 += c;
+    c = h4 >> 26;
+    h4 &= 0x03ff_ffff;
+    h0 += c * 5;
+    c = h0 >> 26;
+    h0 &= 0x03ff_ffff;
+    h1 += c;
+
+    // Compute h - p = h + 5 - 2^130 (to check if h >= p)
+    let mut g0 = h0.wrapping_add(5);
+    c = g0 >> 26;
+    g0 &= 0x03ff_ffff;
+    let mut g1 = h1.wrapping_add(c);
+    c = g1 >> 26;
+    g1 &= 0x03ff_ffff;
+    let mut g2 = h2.wrapping_add(c);
+    c = g2 >> 26;
+    g2 &= 0x03ff_ffff;
+    let mut g3 = h3.wrapping_add(c);
+    c = g3 >> 26;
+    g3 &= 0x03ff_ffff;
+    let g4 = h4.wrapping_add(c).wrapping_sub(1 << 26);
+
+    // Select h if h < p (g4 underflowed → bit 31 set), else g
+    let mask = (g4 >> 31).wrapping_sub(1); // 0xffffffff if h>=p, 0 if h<p
+    g0 &= mask;
+    g1 &= mask;
+    g2 &= mask;
+    g3 &= mask;
+    let nmask = !mask;
+    h0 = (h0 & nmask) | g0;
+    h1 = (h1 & nmask) | g1;
+    h2 = (h2 & nmask) | g2;
+    h3 = (h3 & nmask) | g3;
+
+    // Reassemble h into 4 × u32 (128-bit, radix 2^32)
+    h0 |= h1 << 26;
+    h1 = (h1 >> 6) | (h2 << 20);
+    h2 = (h2 >> 12) | (h3 << 14);
+    h3 = (h3 >> 18) | (h4 << 8);
+
+    // mac = (h + pad) mod 2^128
+    let mut f: u64;
+    f = h0 as u64 + pad[0] as u64;
+    h0 = f as u32;
+    f = h1 as u64 + pad[1] as u64 + (f >> 32);
+    h1 = f as u32;
+    f = h2 as u64 + pad[2] as u64 + (f >> 32);
+    h2 = f as u32;
+    f = h3 as u64 + pad[3] as u64 + (f >> 32);
+    h3 = f as u32;
+
+    let mut tag = [0u8; 16];
+    tag[0..4].copy_from_slice(&h0.to_le_bytes());
+    tag[4..8].copy_from_slice(&h1.to_le_bytes());
+    tag[8..12].copy_from_slice(&h2.to_le_bytes());
+    tag[12..16].copy_from_slice(&h3.to_le_bytes());
+    tag
+}
+
+// ============================================================
+// SSH-specific ChaCha20-Poly1305 (two-key construction)
+// ============================================================
+
+/// SSH `chacha20-poly1305@openssh.com` cipher.
+///
+/// Uses a 64-byte key split into K₂ (payload, first 32 bytes) and
+/// K₁ (header, last 32 bytes). The packet length is encrypted with
+/// raw ChaCha20 using K₁. The payload is encrypted with ChaCha20 using
+/// K₂ (counter=1). A Poly1305 tag is computed with a one-time key
+/// derived from K₂ (counter=0) over `encrypted_length || encrypted_payload`.
+///
+/// This is NOT the IETF ChaCha20-Poly1305 AEAD — it's a custom SSH
+/// construction with different MAC input formatting.
+pub struct SshChaCha20Poly1305 {
+    /// K₂: payload encryption + Poly1305 key derivation
+    payload_key: [u8; 32],
+    /// K₁: length encryption
+    header_key: [u8; 32],
+}
+
+impl SshChaCha20Poly1305 {
+    /// Create from a 64-byte key: K₂ = key[0..32], K₁ = key[32..64].
+    pub fn new(key: &[u8]) -> Result<Self, RusshError> {
+        if key.len() < 64 {
+            return Err(crypto_error("SSH ChaCha20-Poly1305 requires 64-byte key"));
+        }
+        let mut payload_key = [0u8; 32];
+        payload_key.copy_from_slice(&key[..32]);
+        let mut header_key = [0u8; 32];
+        header_key.copy_from_slice(&key[32..64]);
+        Ok(Self {
+            payload_key,
+            header_key,
+        })
+    }
+
+    fn make_nonce(seq: u32) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&(seq as u64).to_be_bytes());
+        nonce
+    }
+
+    /// Encrypt the 4-byte packet length using K₁ + ChaCha20.
+    pub fn encrypt_length(&self, seq: u32, length: &mut [u8; 4]) {
+        use chacha20::cipher::{KeyIvInit, StreamCipher as _};
+        let nonce = Self::make_nonce(seq);
+        let mut cipher = chacha20::ChaCha20::new(
+            chacha20::Key::from_slice(&self.header_key),
+            chacha20::Nonce::from_slice(&nonce),
+        );
+        cipher.apply_keystream(length);
+    }
+
+    /// Decrypt the 4-byte packet length using K₁ (same as encrypt).
+    pub fn decrypt_length(&self, seq: u32, length: &mut [u8; 4]) {
+        self.encrypt_length(seq, length);
+    }
+
+    /// Derive Poly1305 one-time key from K₂ at counter=0.
+    fn derive_poly_key(&self, seq: u32) -> [u8; 32] {
+        use chacha20::cipher::{KeyIvInit, StreamCipher as _};
+        let nonce = Self::make_nonce(seq);
+        let mut cipher = chacha20::ChaCha20::new(
+            chacha20::Key::from_slice(&self.payload_key),
+            chacha20::Nonce::from_slice(&nonce),
+        );
+        let mut poly_key = [0u8; 32];
+        cipher.apply_keystream(&mut poly_key);
+        poly_key
+    }
+
+    /// Encrypt payload using K₂ at counter=1. Returns ciphertext (same length).
+    fn encrypt_payload(&self, seq: u32, plaintext: &[u8]) -> Vec<u8> {
+        use chacha20::cipher::{KeyIvInit, StreamCipher as _, StreamCipherSeek};
+        let nonce = Self::make_nonce(seq);
+        let mut cipher = chacha20::ChaCha20::new(
+            chacha20::Key::from_slice(&self.payload_key),
+            chacha20::Nonce::from_slice(&nonce),
+        );
+        // Seek to block 1 (64 bytes into keystream; block 0 used for poly key)
+        cipher.seek(64u32);
+        let mut ct = plaintext.to_vec();
+        cipher.apply_keystream(&mut ct);
+        ct
+    }
+
+    /// Decrypt payload (same operation as encrypt).
+    fn decrypt_payload(&self, seq: u32, ciphertext: &[u8]) -> Vec<u8> {
+        self.encrypt_payload(seq, ciphertext)
+    }
+
+    /// Encrypt payload and compute Poly1305 tag.
+    /// Returns ciphertext || 16-byte tag.
+    pub fn seal(
+        &self,
+        seq: u32,
+        encrypted_length: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, RusshError> {
+        let poly_key = self.derive_poly_key(seq);
+        let ciphertext = self.encrypt_payload(seq, plaintext);
+
+        // Poly1305 tag over raw (encrypted_length || ciphertext)
+        let mut mac_input = Vec::with_capacity(encrypted_length.len() + ciphertext.len());
+        mac_input.extend_from_slice(encrypted_length);
+        mac_input.extend_from_slice(&ciphertext);
+
+        let tag = poly1305_mac(&poly_key, &mac_input);
+
+        let mut result = ciphertext;
+        result.extend_from_slice(&tag);
+        Ok(result)
+    }
+
+    /// Verify Poly1305 tag and decrypt payload.
+    pub fn open(
+        &self,
+        seq: u32,
+        encrypted_length: &[u8],
+        ciphertext_with_tag: &[u8],
+    ) -> Result<Vec<u8>, RusshError> {
+        if ciphertext_with_tag.len() < 16 {
+            return Err(crypto_error("ciphertext too short for Poly1305 tag"));
+        }
+        let (ciphertext, tag_bytes) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - 16);
+
+        let poly_key = self.derive_poly_key(seq);
+
+        // Poly1305 over raw (encrypted_length || ciphertext)
+        let mut mac_input = Vec::with_capacity(encrypted_length.len() + ciphertext.len());
+        mac_input.extend_from_slice(encrypted_length);
+        mac_input.extend_from_slice(ciphertext);
+
+        let expected = poly1305_mac(&poly_key, &mac_input);
+
+        // Constant-time comparison
+        if !bool::from(subtle::ConstantTimeEq::ct_eq(
+            expected.as_slice(),
+            tag_bytes,
+        )) {
+            return Err(crypto_error(
+                "SSH ChaCha20-Poly1305 MAC verification failed",
+            ));
+        }
+
+        Ok(self.decrypt_payload(seq, ciphertext))
+    }
+}
+
+// ============================================================
 // AES-CTR stream ciphers (non-AEAD, used with ETM MACs)
 // ============================================================
 
@@ -540,10 +877,15 @@ pub trait StreamCipher: Sized {
 }
 
 type Aes256Ctr = ctr::Ctr64BE<aes::Aes256>;
+type Aes192Ctr = ctr::Ctr64BE<aes::Aes192>;
 type Aes128Ctr = ctr::Ctr64BE<aes::Aes128>;
 
 pub struct Aes256CtrCipher {
     cipher: Aes256Ctr,
+}
+
+pub struct Aes192CtrCipher {
+    cipher: Aes192Ctr,
 }
 
 pub struct Aes128CtrCipher {
@@ -568,6 +910,38 @@ impl StreamCipher for Aes256CtrCipher {
         use ctr::cipher::KeyIvInit as _;
         let cipher = Aes256Ctr::new_from_slices(key, iv)
             .map_err(|_| crypto_error("AES-256-CTR key/IV length mismatch"))?;
+        Ok(Self { cipher })
+    }
+
+    fn encrypt_in_place(&mut self, data: &mut [u8]) {
+        use ctr::cipher::StreamCipher as _;
+        self.cipher.apply_keystream(data);
+    }
+
+    fn decrypt_in_place(&mut self, data: &mut [u8]) {
+        use ctr::cipher::StreamCipher as _;
+        self.cipher.apply_keystream(data);
+    }
+}
+
+impl StreamCipher for Aes192CtrCipher {
+    fn key_len() -> usize {
+        24
+    }
+    fn iv_len() -> usize {
+        16
+    }
+    fn mac_key_len() -> usize {
+        32
+    }
+    fn mac_len() -> usize {
+        32
+    }
+
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, RusshError> {
+        use ctr::cipher::KeyIvInit as _;
+        let cipher = Aes192Ctr::new_from_slices(key, iv)
+            .map_err(|_| crypto_error("AES-192-CTR key/IV length mismatch"))?;
         Ok(Self { cipher })
     }
 
@@ -1647,5 +2021,75 @@ mod tests {
         let a = derive_key_sha256(b"K", b"H", b'A', b"S", 16);
         let b = derive_key_sha256(b"K", b"H", b'B', b"S", 16);
         assert_ne!(a, b);
+    }
+
+    // ---- SSH ChaCha20-Poly1305 ----
+
+    #[test]
+    fn poly1305_rfc7539_test_vector() {
+        // RFC 7539 §2.5.2 test vector
+        let key: [u8; 32] = [
+            0x85, 0xd6, 0xbe, 0x78, 0x57, 0x55, 0x6d, 0x33, 0x7f, 0x44, 0x52, 0xfe, 0x42, 0xd5,
+            0x06, 0xa8, 0x01, 0x03, 0x80, 0x8a, 0xfb, 0x0d, 0xb2, 0xfd, 0x4a, 0xbf, 0xf6, 0xaf,
+            0x41, 0x49, 0xf5, 0x1b,
+        ];
+        let msg = b"Cryptographic Forum Research Group";
+        let expected: [u8; 16] = [
+            0xa8, 0x06, 0x1d, 0xc1, 0x30, 0x51, 0x36, 0xc6, 0xc2, 0x2b, 0x8b, 0xaf, 0x0c, 0x01,
+            0x27, 0xa9,
+        ];
+
+        let tag = poly1305_mac(&key, msg);
+        assert_eq!(
+            tag, expected,
+            "poly1305_mac does not match RFC 7539 test vector"
+        );
+    }
+
+    #[test]
+    fn ssh_chacha20_poly1305_roundtrip() {
+        let key = [0x42u8; 64];
+        let cipher = SshChaCha20Poly1305::new(&key).unwrap();
+
+        let plaintext = b"Hello, SSH world!";
+
+        // Build padded payload like the real packet path
+        let body_len = 1 + plaintext.len();
+        let remainder = body_len % 8;
+        let padding_len = if remainder == 0 { 8 } else { 8 - remainder };
+        let mut payload = Vec::with_capacity(body_len + padding_len);
+        payload.push(padding_len as u8);
+        payload.extend_from_slice(plaintext);
+        payload.extend(std::iter::repeat_n(0u8, padding_len));
+
+        let mut enc_length = (payload.len() as u32).to_be_bytes();
+        cipher.encrypt_length(0, &mut enc_length);
+
+        let ct_and_tag = cipher.seal(0, &enc_length, &payload).unwrap();
+
+        // Decrypt
+        let mut dec_length = enc_length;
+        cipher.decrypt_length(0, &mut dec_length);
+        assert_eq!(dec_length, (payload.len() as u32).to_be_bytes());
+
+        let recovered = cipher.open(0, &enc_length, &ct_and_tag).unwrap();
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn ssh_chacha20_poly1305_tamper_detected() {
+        let key = [0x42u8; 64];
+        let cipher = SshChaCha20Poly1305::new(&key).unwrap();
+
+        let payload = vec![4u8, 1, 2, 3, 4, 5, 6, 7]; // 8 bytes
+        let mut enc_length = (payload.len() as u32).to_be_bytes();
+        cipher.encrypt_length(0, &mut enc_length);
+
+        let mut ct_and_tag = cipher.seal(0, &enc_length, &payload).unwrap();
+        // Flip a bit in ciphertext
+        ct_and_tag[0] ^= 0x01;
+
+        let result = cipher.open(0, &enc_length, &ct_and_tag);
+        assert!(result.is_err(), "tampered ciphertext should fail MAC check");
     }
 }

@@ -49,8 +49,9 @@ use russh_auth::{
 use russh_channel::{ChannelKind, ChannelManager, ChannelMessage, ChannelRequest, ForwardHandle};
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{
-    AeadCipher, Aes128CtrCipher, Aes256CtrCipher, Aes256GcmCipher, HmacSha256, HmacSha512,
-    MacAlgorithm, Signer, StreamCipher,
+    AeadCipher, Aes128CtrCipher, Aes128GcmCipher, Aes192CtrCipher, Aes256CtrCipher,
+    Aes256GcmCipher, HmacSha256, HmacSha512, MacAlgorithm, Signer, SshChaCha20Poly1305,
+    StreamCipher,
 };
 use russh_scp::build_scp_file_upload;
 use russh_sftp::{SftpFileServer, SftpFramer, SftpWirePacket};
@@ -238,6 +239,13 @@ enum DirectionalCipher {
         /// Current 12-byte nonce: first 4 bytes fixed, last 8 bytes counter.
         nonce: [u8; 12],
     },
+    Aes128Gcm {
+        cipher: Box<Aes128GcmCipher>,
+        nonce: [u8; 12],
+    },
+    ChaCha20Poly1305 {
+        cipher: Box<SshChaCha20Poly1305>,
+    },
     AesCtr {
         cipher: Box<dyn CtrCipherOps + Send>,
         mac: MacKind,
@@ -249,8 +257,17 @@ impl DirectionalCipher {
     /// Build a cipher from the negotiated algorithm name, key material, IV, and MAC.
     fn new(cipher_name: &str, key: &[u8], iv: &[u8], mac_name: &str, mac_key: &[u8]) -> Self {
         match cipher_name {
+            "chacha20-poly1305@openssh.com" => {
+                if let Ok(cipher) = SshChaCha20Poly1305::new(key) {
+                    return Self::ChaCha20Poly1305 {
+                        cipher: Box::new(cipher),
+                    };
+                }
+                Self::None
+            }
             "aes256-gcm@openssh.com" => {
-                if let Ok(cipher) = Aes256GcmCipher::new(key) {
+                let key256 = if key.len() > 32 { &key[..32] } else { key };
+                if let Ok(cipher) = Aes256GcmCipher::new(key256) {
                     let mut nonce = [0u8; 12];
                     let copy_len = iv.len().min(12);
                     nonce[..copy_len].copy_from_slice(&iv[..copy_len]);
@@ -261,8 +278,22 @@ impl DirectionalCipher {
                 }
                 Self::None
             }
+            "aes128-gcm@openssh.com" => {
+                let key128 = if key.len() > 16 { &key[..16] } else { key };
+                if let Ok(cipher) = Aes128GcmCipher::new(key128) {
+                    let mut nonce = [0u8; 12];
+                    let copy_len = iv.len().min(12);
+                    nonce[..copy_len].copy_from_slice(&iv[..copy_len]);
+                    return Self::Aes128Gcm {
+                        cipher: Box::new(cipher),
+                        nonce,
+                    };
+                }
+                Self::None
+            }
             "aes256-ctr" => {
-                if let Ok(cipher) = Aes256CtrCipher::new(key, iv) {
+                let key256 = if key.len() > 32 { &key[..32] } else { key };
+                if let Ok(cipher) = Aes256CtrCipher::new(key256, iv) {
                     let mac = match mac_name {
                         "hmac-sha2-512-etm@openssh.com" => MacKind::Sha512,
                         _ => MacKind::Sha256,
@@ -280,6 +311,23 @@ impl DirectionalCipher {
                 // AES-128 uses a 16-byte key; key derivation produces 32 bytes.
                 let key128 = if key.len() > 16 { &key[..16] } else { key };
                 if let Ok(cipher) = Aes128CtrCipher::new(key128, iv) {
+                    let mac = match mac_name {
+                        "hmac-sha2-512-etm@openssh.com" => MacKind::Sha512,
+                        _ => MacKind::Sha256,
+                    };
+                    Self::AesCtr {
+                        cipher: Box::new(cipher),
+                        mac,
+                        mac_key: mac_key.to_vec(),
+                    }
+                } else {
+                    Self::None
+                }
+            }
+            "aes192-ctr" => {
+                // AES-192 uses a 24-byte key; key derivation produces 32 bytes.
+                let key192 = if key.len() > 24 { &key[..24] } else { key };
+                if let Ok(cipher) = Aes192CtrCipher::new(key192, iv) {
                     let mac = match mac_name {
                         "hmac-sha2-512-etm@openssh.com" => MacKind::Sha512,
                         _ => MacKind::Sha256,
@@ -635,12 +683,75 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                 DirectionalCipher::increment_nonce(nonce);
 
                 if plaintext.is_empty() {
-                    return Err(protocol_err("AES-GCM decrypted to empty plaintext"));
+                    return Err(protocol_err("AEAD decrypted to empty plaintext"));
                 }
                 let padding_len = plaintext[0] as usize;
                 let payload_end = plaintext.len().saturating_sub(padding_len);
                 if payload_end == 0 {
-                    return Err(protocol_err("AES-GCM padding exceeds plaintext length"));
+                    return Err(protocol_err("AEAD padding exceeds plaintext length"));
+                }
+                Ok(PacketFrame::new(plaintext[1..payload_end].to_vec()))
+            }
+            DirectionalCipher::Aes128Gcm { cipher, nonce } => {
+                let mut len_buf = [0u8; 4];
+                self.inner.read_exact(&mut len_buf).await.map_err(io_err)?;
+                let pkt_len = u32::from_be_bytes(len_buf) as usize;
+
+                if pkt_len > PacketCodec::DEFAULT_MAX_PACKET_SIZE + 512 {
+                    return Err(protocol_err("incoming packet length too large"));
+                }
+
+                let mut ct_and_tag = vec![0u8; pkt_len + 16];
+                self.inner
+                    .read_exact(&mut ct_and_tag)
+                    .await
+                    .map_err(io_err)?;
+
+                let plaintext = cipher
+                    .open(nonce, &len_buf, &ct_and_tag)
+                    .map_err(|e| RusshError::new(RusshErrorCategory::Crypto, e.to_string()))?;
+                DirectionalCipher::increment_nonce(nonce);
+
+                if plaintext.is_empty() {
+                    return Err(protocol_err("AEAD decrypted to empty plaintext"));
+                }
+                let padding_len = plaintext[0] as usize;
+                let payload_end = plaintext.len().saturating_sub(padding_len);
+                if payload_end == 0 {
+                    return Err(protocol_err("AEAD padding exceeds plaintext length"));
+                }
+                Ok(PacketFrame::new(plaintext[1..payload_end].to_vec()))
+            }
+            DirectionalCipher::ChaCha20Poly1305 { cipher } => {
+                // SSH chacha20-poly1305: packet length is ENCRYPTED.
+                // Wire: [4-byte encrypted length] [ciphertext] [16-byte tag]
+                let mut len_buf = [0u8; 4];
+                self.inner.read_exact(&mut len_buf).await.map_err(io_err)?;
+                let encrypted_len = len_buf;
+                cipher.decrypt_length(seq, &mut len_buf);
+                let pkt_len = u32::from_be_bytes(len_buf) as usize;
+
+                if pkt_len > PacketCodec::DEFAULT_MAX_PACKET_SIZE + 512 {
+                    return Err(protocol_err("incoming packet length too large"));
+                }
+
+                let mut ct_and_tag = vec![0u8; pkt_len + 16];
+                self.inner
+                    .read_exact(&mut ct_and_tag)
+                    .await
+                    .map_err(io_err)?;
+
+                let plaintext = cipher
+                    .open(seq, &encrypted_len, &ct_and_tag)
+                    .map_err(|e| RusshError::new(RusshErrorCategory::Crypto, e.to_string()))?;
+
+                if plaintext.is_empty() {
+                    return Err(protocol_err("AEAD decrypted to empty plaintext"));
+                }
+                let padding_len = plaintext[0] as usize;
+                let payload_end = plaintext.len().saturating_sub(padding_len);
+                if payload_end == 0 {
+                    return Err(protocol_err("AEAD padding exceeds plaintext length"));
                 }
                 Ok(PacketFrame::new(plaintext[1..payload_end].to_vec()))
             }
@@ -716,8 +827,8 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                 self.inner.write_all(&bytes).await.map_err(io_err)
             }
             DirectionalCipher::Aes256Gcm { cipher, nonce } => {
-                // Build plaintext: [padding_len (1 byte)] [payload] [padding]
-                // Plaintext length must be a multiple of 16 (AES block size).
+                // AEAD wire format:
+                // [4-byte packet_length (plaintext AAD)] [ciphertext] [16-byte tag]
                 const BLOCK: usize = 16;
                 let payload = &frame.payload;
                 let body_len = 1 + payload.len(); // padding_len byte + payload
@@ -741,7 +852,69 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> PacketStream<S> {
                     .map_err(|e| RusshError::new(RusshErrorCategory::Crypto, e.to_string()))?;
                 DirectionalCipher::increment_nonce(nonce);
 
-                // Wire: [4-byte length (AAD)] [ciphertext] [16-byte tag]
+                self.inner.write_all(&packet_length).await.map_err(io_err)?;
+                self.inner
+                    .write_all(&ciphertext_and_tag)
+                    .await
+                    .map_err(io_err)
+            }
+            DirectionalCipher::Aes128Gcm { cipher, nonce } => {
+                const BLOCK: usize = 16;
+                let payload = &frame.payload;
+                let body_len = 1 + payload.len();
+                let remainder = body_len % BLOCK;
+                let mut padding_len = if remainder == 0 {
+                    BLOCK
+                } else {
+                    BLOCK - remainder
+                };
+                if padding_len < 4 {
+                    padding_len += BLOCK;
+                }
+                let mut plaintext = Vec::with_capacity(body_len + padding_len);
+                plaintext.push(padding_len as u8);
+                plaintext.extend_from_slice(payload);
+                plaintext.extend(std::iter::repeat_n(0u8, padding_len));
+
+                let packet_length = (plaintext.len() as u32).to_be_bytes();
+                let ciphertext_and_tag = cipher
+                    .seal(nonce, &packet_length, &plaintext)
+                    .map_err(|e| RusshError::new(RusshErrorCategory::Crypto, e.to_string()))?;
+                DirectionalCipher::increment_nonce(nonce);
+
+                self.inner.write_all(&packet_length).await.map_err(io_err)?;
+                self.inner
+                    .write_all(&ciphertext_and_tag)
+                    .await
+                    .map_err(io_err)
+            }
+            DirectionalCipher::ChaCha20Poly1305 { cipher } => {
+                // SSH chacha20-poly1305: encrypt length, then AEAD payload.
+                const BLOCK: usize = 8;
+                let payload = &frame.payload;
+                let body_len = 1 + payload.len();
+                let remainder = body_len % BLOCK;
+                let mut padding_len = if remainder == 0 {
+                    BLOCK
+                } else {
+                    BLOCK - remainder
+                };
+                if padding_len < 4 {
+                    padding_len += BLOCK;
+                }
+                let mut plaintext = Vec::with_capacity(body_len + padding_len);
+                plaintext.push(padding_len as u8);
+                plaintext.extend_from_slice(payload);
+                plaintext.extend(std::iter::repeat_n(0u8, padding_len));
+
+                let mut packet_length = (plaintext.len() as u32).to_be_bytes();
+                cipher.encrypt_length(seq, &mut packet_length);
+
+                let ciphertext_and_tag = cipher
+                    .seal(seq, &packet_length, &plaintext)
+                    .map_err(|e| RusshError::new(RusshErrorCategory::Crypto, e.to_string()))?;
+
+                // Wire: [encrypted length] [ciphertext] [16-byte tag]
                 self.inner.write_all(&packet_length).await.map_err(io_err)?;
                 self.inner
                     .write_all(&ciphertext_and_tag)

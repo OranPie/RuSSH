@@ -19,6 +19,7 @@ aes-gcm.workspace = true
 aes.workspace = true
 ctr.workspace = true
 chacha20poly1305.workspace = true
+chacha20.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 x25519-dalek.workspace = true
