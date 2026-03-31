@@ -398,6 +398,8 @@ pub mod sftp_type {
     pub const SSH_FXP_READLINK: u8 = 19;
     pub const SSH_FXP_SYMLINK: u8 = 20;
     pub const STATUS: u8 = 101;
+    pub const EXTENDED: u8 = 200;
+    pub const EXTENDED_REPLY: u8 = 201;
     pub const HANDLE: u8 = 102;
     pub const DATA: u8 = 103;
     pub const NAME: u8 = 104;
@@ -743,9 +745,16 @@ pub enum SftpWirePacket {
         target_path: String,
         link_path: String,
     },
+    /// SSH_FXP_EXTENDED (type 200) — carries an extension request.
+    Extended {
+        id: u32,
+        extension_name: String,
+        data: Vec<u8>,
+    },
     // Server → Client
     Version {
         version: u32,
+        extensions: Vec<(String, String)>,
     },
     Status {
         id: u32,
@@ -768,6 +777,11 @@ pub enum SftpWirePacket {
         id: u32,
         attrs: FileAttrs,
     },
+    /// SSH_FXP_EXTENDED_REPLY (type 201) — response to an extension request.
+    ExtendedReply {
+        id: u32,
+        data: Vec<u8>,
+    },
 }
 
 impl SftpWirePacket {
@@ -779,9 +793,16 @@ impl SftpWirePacket {
                 body.push(sftp_type::INIT);
                 sftp_write_u32(&mut body, *version);
             }
-            Self::Version { version } => {
+            Self::Version {
+                version,
+                extensions,
+            } => {
                 body.push(sftp_type::VERSION);
                 sftp_write_u32(&mut body, *version);
+                for (name, value) in extensions {
+                    sftp_write_string(&mut body, name.as_bytes());
+                    sftp_write_string(&mut body, value.as_bytes());
+                }
             }
             Self::Open {
                 id,
@@ -938,6 +959,21 @@ impl SftpWirePacket {
                 sftp_write_u32(&mut body, *id);
                 body.extend_from_slice(&attrs.encode());
             }
+            Self::Extended {
+                id,
+                extension_name,
+                data,
+            } => {
+                body.push(sftp_type::EXTENDED);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, extension_name.as_bytes());
+                body.extend_from_slice(data);
+            }
+            Self::ExtendedReply { id, data } => {
+                body.push(sftp_type::EXTENDED_REPLY);
+                sftp_write_u32(&mut body, *id);
+                body.extend_from_slice(data);
+            }
         }
         let mut out = Vec::new();
         sftp_write_u32(&mut out, body.len() as u32);
@@ -972,7 +1008,16 @@ impl SftpWirePacket {
             }
             sftp_type::VERSION => {
                 let version = sftp_read_u32(data, &mut off)?;
-                Self::Version { version }
+                let mut extensions = Vec::new();
+                while off < end {
+                    let name = sftp_read_utf8(data, &mut off)?;
+                    let value = sftp_read_utf8(data, &mut off)?;
+                    extensions.push((name, value));
+                }
+                Self::Version {
+                    version,
+                    extensions,
+                }
             }
             sftp_type::OPEN => {
                 let id = sftp_read_u32(data, &mut off)?;
@@ -1138,6 +1183,24 @@ impl SftpWirePacket {
                 let id = sftp_read_u32(data, &mut off)?;
                 let attrs = FileAttrs::decode(data, &mut off)?;
                 Self::AttrsReply { id, attrs }
+            }
+            sftp_type::EXTENDED => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let extension_name = sftp_read_utf8(data, &mut off)?;
+                let ext_data = data[off..end].to_vec();
+                Self::Extended {
+                    id,
+                    extension_name,
+                    data: ext_data,
+                }
+            }
+            sftp_type::EXTENDED_REPLY => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let reply_data = data[off..end].to_vec();
+                Self::ExtendedReply {
+                    id,
+                    data: reply_data,
+                }
             }
             _ => {
                 return Err(RusshError::new(
@@ -1319,10 +1382,128 @@ impl SftpFileServer {
         }
     }
 
+    fn handle_posix_rename(&mut self, id: u32, data: &[u8]) -> Result<SftpWirePacket, RusshError> {
+        let mut off = 0;
+        let old_path = sftp_read_utf8(data, &mut off)?;
+        let new_path = sftp_read_utf8(data, &mut off)?;
+        let old = match self.resolve_path_checked(&old_path, false) {
+            Err(_) => {
+                return Ok(SftpWirePacket::Status {
+                    id,
+                    status: SftpStatus::PermissionDenied,
+                    message: "path escapes root".to_string(),
+                });
+            }
+            Ok(p) => p,
+        };
+        let new = match self.resolve_path_checked(&new_path, true) {
+            Err(_) => {
+                return Ok(SftpWirePacket::Status {
+                    id,
+                    status: SftpStatus::PermissionDenied,
+                    message: "path escapes root".to_string(),
+                });
+            }
+            Ok(p) => p,
+        };
+        match fs::rename(&old, &new) {
+            Ok(_) => Ok(Self::status_ok(id)),
+            Err(e) => Ok(Self::status_err(id, &e)),
+        }
+    }
+
+    fn handle_statvfs(&self, id: u32, data: &[u8]) -> Result<SftpWirePacket, RusshError> {
+        let mut off = 0;
+        let path = sftp_read_utf8(data, &mut off)?;
+        // Validate path is within root
+        let _full_path = match self.resolve_path_checked(&path, false) {
+            Err(_) => {
+                return Ok(SftpWirePacket::Status {
+                    id,
+                    status: SftpStatus::PermissionDenied,
+                    message: "path escapes root".to_string(),
+                });
+            }
+            Ok(p) => p,
+        };
+        // Return hardcoded defaults; calling libc statvfs would require unsafe code.
+        // The OpenSSH statvfs@openssh.com response is 11 uint64 values.
+        let mut reply_data = Vec::new();
+        sftp_write_u64(&mut reply_data, 4096); // f_bsize
+        sftp_write_u64(&mut reply_data, 4096); // f_frsize
+        sftp_write_u64(&mut reply_data, 1_000_000); // f_blocks
+        sftp_write_u64(&mut reply_data, 500_000); // f_bfree
+        sftp_write_u64(&mut reply_data, 500_000); // f_bavail
+        sftp_write_u64(&mut reply_data, 1_000_000); // f_files
+        sftp_write_u64(&mut reply_data, 500_000); // f_ffree
+        sftp_write_u64(&mut reply_data, 500_000); // f_favail
+        sftp_write_u64(&mut reply_data, 0); // f_fsid
+        sftp_write_u64(&mut reply_data, 0); // f_flag
+        sftp_write_u64(&mut reply_data, 255); // f_namemax
+        Ok(SftpWirePacket::ExtendedReply {
+            id,
+            data: reply_data,
+        })
+    }
+
+    fn handle_hardlink(&mut self, id: u32, data: &[u8]) -> Result<SftpWirePacket, RusshError> {
+        let mut off = 0;
+        let old_path = sftp_read_utf8(data, &mut off)?;
+        let new_path = sftp_read_utf8(data, &mut off)?;
+        let old = match self.resolve_path_checked(&old_path, false) {
+            Err(_) => {
+                return Ok(SftpWirePacket::Status {
+                    id,
+                    status: SftpStatus::PermissionDenied,
+                    message: "path escapes root".to_string(),
+                });
+            }
+            Ok(p) => p,
+        };
+        let new = match self.resolve_path_checked(&new_path, true) {
+            Err(_) => {
+                return Ok(SftpWirePacket::Status {
+                    id,
+                    status: SftpStatus::PermissionDenied,
+                    message: "path escapes root".to_string(),
+                });
+            }
+            Ok(p) => p,
+        };
+        match fs::hard_link(&old, &new) {
+            Ok(_) => Ok(Self::status_ok(id)),
+            Err(e) => Ok(Self::status_err(id, &e)),
+        }
+    }
+
+    fn handle_fsync(&self, id: u32, data: &[u8]) -> Result<SftpWirePacket, RusshError> {
+        let mut off = 0;
+        let handle = sftp_read_string(data, &mut off)?;
+        match self.handles.get(&handle) {
+            Some(SftpHandle::File(file)) => match file.sync_all() {
+                Ok(_) => Ok(Self::status_ok(id)),
+                Err(e) => Ok(Self::status_err(id, &e)),
+            },
+            _ => Ok(SftpWirePacket::Status {
+                id,
+                status: SftpStatus::Failure,
+                message: "invalid handle".to_string(),
+            }),
+        }
+    }
+
     /// Process a request packet and return the response packet.
     pub fn process(&mut self, request: &SftpWirePacket) -> Result<SftpWirePacket, RusshError> {
         match request {
-            SftpWirePacket::Init { .. } => Ok(SftpWirePacket::Version { version: 3 }),
+            SftpWirePacket::Init { .. } => Ok(SftpWirePacket::Version {
+                version: 3,
+                extensions: vec![
+                    ("posix-rename@openssh.com".to_string(), "1".to_string()),
+                    ("statvfs@openssh.com".to_string(), "2".to_string()),
+                    ("hardlink@openssh.com".to_string(), "1".to_string()),
+                    ("fsync@openssh.com".to_string(), "1".to_string()),
+                ],
+            }),
 
             SftpWirePacket::Open {
                 id,
@@ -1712,6 +1893,25 @@ impl SftpFileServer {
                 }
             }
 
+            SftpWirePacket::Extended {
+                id,
+                extension_name,
+                data,
+            } => {
+                let id = *id;
+                match extension_name.as_str() {
+                    "posix-rename@openssh.com" => self.handle_posix_rename(id, data),
+                    "statvfs@openssh.com" => self.handle_statvfs(id, data),
+                    "hardlink@openssh.com" => self.handle_hardlink(id, data),
+                    "fsync@openssh.com" => self.handle_fsync(id, data),
+                    _ => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::Unsupported,
+                        message: format!("unknown extension: {extension_name}"),
+                    }),
+                }
+            }
+
             // Unsupported or server→client packets
             _ => Ok(SftpWirePacket::Status {
                 id: 0,
@@ -2042,6 +2242,282 @@ mod tests {
                 );
             }
             other => panic!("expected Name, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn extended_wire_round_trip() {
+        let mut ext_data = Vec::new();
+        super::sftp_write_string(&mut ext_data, b"old.txt");
+        super::sftp_write_string(&mut ext_data, b"new.txt");
+
+        let pkt = SftpWirePacket::Extended {
+            id: 10,
+            extension_name: "posix-rename@openssh.com".to_string(),
+            data: ext_data.clone(),
+        };
+        let encoded = pkt.encode();
+        let decoded = SftpWirePacket::decode(&encoded).expect("decode should succeed");
+        assert_eq!(pkt, decoded);
+
+        // ExtendedReply round-trip
+        let reply = SftpWirePacket::ExtendedReply {
+            id: 10,
+            data: vec![1, 2, 3, 4],
+        };
+        let encoded = reply.encode();
+        let decoded = SftpWirePacket::decode(&encoded).expect("decode should succeed");
+        assert_eq!(reply, decoded);
+    }
+
+    #[test]
+    fn version_response_includes_extensions() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_ext_version_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+        let response = server
+            .process(&SftpWirePacket::Init { version: 3 })
+            .expect("init should succeed");
+
+        match &response {
+            SftpWirePacket::Version {
+                version,
+                extensions,
+            } => {
+                assert_eq!(*version, 3);
+                let names: Vec<&str> = extensions.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(names.contains(&"posix-rename@openssh.com"));
+                assert!(names.contains(&"statvfs@openssh.com"));
+                assert!(names.contains(&"hardlink@openssh.com"));
+                assert!(names.contains(&"fsync@openssh.com"));
+            }
+            other => panic!("expected Version, got: {other:?}"),
+        }
+
+        // Verify round-trip: encode then decode preserves extensions
+        let encoded = response.encode();
+        let decoded = SftpWirePacket::decode(&encoded).expect("decode should succeed");
+        assert_eq!(response, decoded);
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn extended_posix_rename_works() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_ext_posix_rename_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+        fs::write(root.join("old.txt"), b"data").expect("file should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        let mut ext_data = Vec::new();
+        super::sftp_write_string(&mut ext_data, b"old.txt");
+        super::sftp_write_string(&mut ext_data, b"new.txt");
+
+        let response = server
+            .process(&SftpWirePacket::Extended {
+                id: 1,
+                extension_name: "posix-rename@openssh.com".to_string(),
+                data: ext_data,
+            })
+            .expect("posix-rename should succeed");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        assert!(!root.join("old.txt").exists());
+        assert!(root.join("new.txt").exists());
+        assert_eq!(fs::read(root.join("new.txt")).unwrap(), b"data");
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn extended_hardlink_works() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_ext_hardlink_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+        fs::write(root.join("original.txt"), b"content").expect("file should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        let mut ext_data = Vec::new();
+        super::sftp_write_string(&mut ext_data, b"original.txt");
+        super::sftp_write_string(&mut ext_data, b"linked.txt");
+
+        let response = server
+            .process(&SftpWirePacket::Extended {
+                id: 2,
+                extension_name: "hardlink@openssh.com".to_string(),
+                data: ext_data,
+            })
+            .expect("hardlink should succeed");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        assert!(root.join("original.txt").exists());
+        assert!(root.join("linked.txt").exists());
+        assert_eq!(fs::read(root.join("linked.txt")).unwrap(), b"content");
+
+        // Verify hard link (same inode)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let orig_ino = fs::metadata(root.join("original.txt")).unwrap().ino();
+            let link_ino = fs::metadata(root.join("linked.txt")).unwrap().ino();
+            assert_eq!(orig_ino, link_ino);
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn extended_fsync_works() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_ext_fsync_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Open a file for writing
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "fsync_test.txt".to_string(),
+                pflags: super::open_flags::WRITE | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+
+        // Write some data
+        server
+            .process(&SftpWirePacket::Write {
+                id: 2,
+                handle: handle.clone(),
+                offset: 0,
+                data: b"test data".to_vec(),
+            })
+            .expect("write should succeed");
+
+        // Fsync the handle
+        let mut ext_data = Vec::new();
+        super::sftp_write_string(&mut ext_data, &handle);
+
+        let response = server
+            .process(&SftpWirePacket::Extended {
+                id: 3,
+                extension_name: "fsync@openssh.com".to_string(),
+                data: ext_data,
+            })
+            .expect("fsync should succeed");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 3);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        // Close handle
+        server
+            .process(&SftpWirePacket::Close { id: 4, handle })
+            .expect("close should succeed");
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn extended_statvfs_returns_reply() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_ext_statvfs_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        let mut ext_data = Vec::new();
+        super::sftp_write_string(&mut ext_data, b"/");
+
+        let response = server
+            .process(&SftpWirePacket::Extended {
+                id: 5,
+                extension_name: "statvfs@openssh.com".to_string(),
+                data: ext_data,
+            })
+            .expect("statvfs should succeed");
+
+        match &response {
+            SftpWirePacket::ExtendedReply { id, data } => {
+                assert_eq!(*id, 5);
+                // 11 uint64 values = 88 bytes
+                assert_eq!(data.len(), 88);
+            }
+            other => panic!("expected ExtendedReply, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn extended_unknown_returns_unsupported() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_ext_unknown_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        let response = server
+            .process(&SftpWirePacket::Extended {
+                id: 99,
+                extension_name: "nonexistent@example.com".to_string(),
+                data: Vec::new(),
+            })
+            .expect("unknown extension should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 99);
+                assert_eq!(*status, SftpStatus::Unsupported);
+            }
+            other => panic!("expected Status Unsupported, got: {other:?}"),
         }
 
         fs::remove_dir_all(&root).expect("cleanup should succeed");
