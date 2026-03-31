@@ -1,6 +1,6 @@
 # RuSSH Roadmap
 
-## v0.1 ✅ (current)
+## v0.1 ✅
 Complete SSH protocol stack — cryptographic primitives, encrypted transport,
 Curve25519-SHA256 KEX, Ed25519 host keys, publickey/password/keyboard-interactive
 auth, RFC 4254 channel multiplexing with flow control, SFTP v3 wire codec +
@@ -10,27 +10,6 @@ security hardening, and libfuzzer fuzz targets.
 
 158 tests, 0 unsafe blocks.
 
-## v0.3 ✅ (current)
-OpenSSH interoperability — all four cross-implementation tests pass:
-- RuSSH client → OpenSSH server: `exec` + SFTP v3 upload/read
-- OpenSSH client → RuSSH server: `exec` + SFTP v3 upload/read
-
-Bug fixes applied during v0.3:
-- **Exchange hash**: server now preserves raw client KEXINIT bytes before parsing
-  (`store_client_kexinit_payload`) so the exchange hash uses the original wire
-  encoding, not a re-encoded version.
-- **Cipher negotiation**: removed unimplemented ciphers (`chacha20-poly1305`,
-  `aes128-gcm`) from `AlgorithmSet::secure_defaults()` to avoid OpenSSH selecting
-  an unsupported cipher.
-- **`none` auth probe**: OpenSSH always sends a `UserAuthRequest` with method
-  `"none"` first to discover allowed methods; added `UserAuthRequest::None` variant
-  and handler returning `USERAUTH_FAILURE` with the allowed-methods list.
-- **SFTP chroot paths**: `SftpFileServer::resolve_path` now strips the leading
-  `/` component rather than rejecting absolute paths, matching SFTP v3 convention.
-- **Channel EOF/Close**: server sends `CHANNEL_EOF + CHANNEL_CLOSE` back when it
-  receives `CHANNEL_EOF`, unblocking the remote client; IO-level read errors
-  (connection close) are treated as a clean session end.
-
 ## v0.2 ✅
 Async networked transport (`russh-net` crate, tokio):
 - `SshClient::connect()` → full KEX → password auth → channel pipeline
@@ -38,14 +17,15 @@ Async networked transport (`russh-net` crate, tokio):
 - `exec`, SFTP v3 (upload + read-back), SCP upload over real TCP
 - Self-contained loopback integration test (RuSSH client ↔ RuSSH server)
 
-All tests pass (zero unsafe blocks).
+## v0.3 ✅
+OpenSSH interoperability — all four cross-implementation tests pass:
+- RuSSH client → OpenSSH server: `exec` + SFTP v3 upload/read
+- OpenSSH client → RuSSH server: `exec` + SFTP v3 upload/read
 
-## v0.3 — OpenSSH interoperability
-- Spawn real `sshd` / `ssh` binaries in integration tests
-- Validate full handshake, auth, and channel I/O against OpenSSH 9.x
-- SFTP subsystem interop with `sftp` client
+Bug fixes: exchange-hash wire encoding, cipher negotiation, `none` auth probe,
+SFTP chroot absolute paths, channel EOF/Close sequencing.
 
-## v0.4 ✅ (current)
+## v0.4 ✅
 Advanced SSH features:
 - **OpenSSH certificate support** — `ssh-ed25519-cert-v01@openssh.com` wire parsing,
   CA signature verification, server-side cert auth (`CertificateValidator`), client-side
@@ -60,9 +40,29 @@ Advanced SSH features:
   Integration test through two real `sshd` instances.
 - **ControlMaster config directives** — `ProxyJump`, `ControlMaster`, and `ControlPath`
   added to `russh-config`; token expansion (`%h`/`%u`/`%%`) and tilde expansion applied
-  to `ControlPath`. Four new unit tests. Mux-socket protocol defers to v0.5.
+  to `ControlPath`. Mux-socket protocol defers to v0.6+.
 
-## v0.5 — Hardening and performance
+## v0.5 ✅ (current)
+Broad protocol coverage, CLI maturity, and OpenSSH compatibility:
+- **Crypto**: ECDSA-P256, RSA (sha2-256/sha2-512) host keys; AES-256-CTR, AES-128-CTR
+  ciphers with ETM MACs; DH group14-sha256 KEX.
+- **Transport**: `zlib@openssh.com` delayed compression; strict KEX counter reset
+  (CVE-2023-48795 mitigation).
+- **Auth**: keyboard-interactive (server + client), password auth in CLI, auth method
+  ordering via `-o PreferredAuthentications`, multiple identity files (`-i` repeatable).
+- **SFTP**: symlink/readlink; OpenSSH extensions (posix-rename, statvfs, hardlink, fsync).
+- **SCP**: timestamp preservation (T-directive, `filetime` crate).
+- **Forwarding**: local port forwarding (`-L`), agent forwarding (`-A`).
+- **CLI**: SSH config file integration (`-F`), expanded `-o` options (Port, User,
+  IdentityFile, ServerAliveInterval, Compression, KexAlgorithms, Ciphers, MACs,
+  HostKeyAlgorithms, PasswordAuthentication, PreferredAuthentications), terminal resize
+  (window-change), keepalive (`keepalive@openssh.com`).
+
+258 tests, 0 unsafe blocks.
+
+## v0.6 — Hardening and performance
+- Remote port forwarding (`-R`)
+- ControlMaster mux-socket protocol
 - Corpus-based fuzz campaigns; coverage-guided CI
 - Performance benchmark harness (handshake/s, MB/s throughput)
 - Constant-time audit by external reviewer

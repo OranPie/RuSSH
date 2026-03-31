@@ -1,4 +1,138 @@
-# RuSSH Implementation Status — v0.3
+# RuSSH Implementation Status — v0.5
+
+## Delivered in v0.5
+
+### Expanded cryptographic algorithm support (`russh-crypto`)
+
+- **Host key algorithms**: ECDSA-P256 (`ecdsa-sha2-nistp256`) signer/verifier with DER-encoded
+  (r, s) signatures; RSA (`rsa-sha2-256`, `rsa-sha2-512`) signing with 3072-bit key generation
+  (2048-bit minimum validation) and PKCS#1 DER public key format.
+- **Ciphers**: AES-256-CTR and AES-128-CTR (non-AEAD, paired with ETM MACs).
+- **MACs**: `hmac-sha2-256-etm@openssh.com` and `hmac-sha2-512-etm@openssh.com` encrypt-then-MAC.
+- **Key exchange**: `diffie-hellman-group14-sha256` (2048-bit MODP group from RFC 3526).
+- **`AlgorithmSet::secure_defaults()`** now advertises:
+  - KEX: `curve25519-sha256`, `ecdh-sha2-nistp256`, `diffie-hellman-group14-sha256`
+  - Host key: `ssh-ed25519`, `ecdsa-sha2-nistp256`, `rsa-sha2-256`, `rsa-sha2-512`
+  - Ciphers: `aes256-gcm@openssh.com`, `aes256-ctr`, `aes128-ctr`
+  - MACs: `hmac-sha2-256-etm@openssh.com`, `hmac-sha2-512-etm@openssh.com`
+  - Compression: `none`, `zlib@openssh.com`
+
+### Compression (`russh-transport`)
+
+- `zlib@openssh.com` delayed compression negotiated in `KexInitProposal` and
+  `NegotiatedAlgorithms`. Compression activates after user authentication completes,
+  matching OpenSSH behaviour.
+
+### Strict KEX hardening (`russh-transport`)
+
+- Full CVE-2023-48795 mitigation via `kex-strict-c-v00@openssh.com` /
+  `kex-strict-s-v00@openssh.com` extensions. Sequence number reset after NEWKEYS,
+  packet order enforcement during key exchange window
+  (`enforce_strict_kex_packet_order`, `strict_kex_window_active`).
+
+### Keyboard-interactive auth — server + client (`russh-auth`, `russh-cli`)
+
+- Server-side: `AuthRequest::KeyboardInteractive`, `UserAuthMessage::KeyboardInteractiveInfoRequest`
+  with prompt list, `UserAuthMessage::KeyboardInteractiveInfoResponse` decode. Full
+  encode/decode support for challenge-response flows.
+- Client-side: CLI prompts interactively and sends `InfoResponse` replies.
+
+### Password auth — client CLI (`russh-cli`)
+
+- `read_password()` reads from stdin with echo disabled; password sent via
+  `authenticate_password()`. Enabled by default, configurable with
+  `-o PasswordAuthentication=yes|no`.
+
+### Auth method ordering (`russh-cli`)
+
+- `-o PreferredAuthentications=publickey,keyboard-interactive,password` controls
+  auth attempt order. Default order: `publickey → keyboard-interactive → password`.
+
+### Multiple identity files (`russh-cli`)
+
+- `-i` flag is repeatable; each identity file is tried in order during publickey
+  auth. Also resolved from SSH config `IdentityFile` directives.
+
+### SFTP extensions (`russh-sftp`)
+
+- **Symlink / readlink**: `FXP_SYMLINK` and `FXP_READLINK` operations with proper
+  path resolution under the chroot.
+- **OpenSSH extensions** advertised during SFTP init:
+  - `posix-rename@openssh.com` v1 — atomic rename via `handle_posix_rename()`
+  - `statvfs@openssh.com` v2 — filesystem statistics via `handle_statvfs()`
+  - `hardlink@openssh.com` v1 — hard link creation via `handle_hardlink()`
+  - `fsync@openssh.com` v1 — flush file data to disk via `handle_fsync()`
+
+### SCP timestamp preservation (`russh-scp`)
+
+- `ScpTimestamp` struct encodes/decodes T-directives (`T<mtime> 0 <atime> 0\n`).
+- `apply_timestamps()` sets file mtime/atime using the `filetime` crate.
+
+### Local port forwarding (`russh-cli`, `russh-net`)
+
+- `-L [bind_addr:]port:host:hostport` opens a local TCP listener, relays
+  connections over a `direct-tcpip` SSH channel to the remote endpoint.
+  `relay_tcp_channel()` handles bidirectional data transfer.
+
+### Agent forwarding (`russh-cli`, `russh-net`)
+
+- `-A` flag requests `auth-agent-req@openssh.com` on the session channel.
+  `request_agent_forwarding()` sends the channel request; server tracks state
+  in `ServerChannelState`.
+
+### SSH config file integration (`russh-cli`)
+
+- `-F path` specifies a custom SSH config file (default: `~/.ssh/config`).
+  Config values are resolved via `russh-config`'s `resolve_for_host()` and
+  applied to connection parameters.
+
+### Expanded `-o` options (`russh-cli`)
+
+Supported OpenSSH-style options via `-o KEY=VALUE`:
+- `Port`, `User`, `IdentityFile`, `ServerAliveInterval`, `Compression`
+- `KexAlgorithms`, `Ciphers`, `MACs`, `HostKeyAlgorithms`
+- `PasswordAuthentication`, `PreferredAuthentications`
+
+### Terminal resize (`russh-net`)
+
+- `send_window_change()` sends RFC 4254 `window-change` channel requests with
+  terminal dimensions (cols, rows, pixel width, pixel height).
+
+### Keepalive (`russh-net`, `russh-cli`)
+
+- `keepalive@openssh.com` global request sent at the interval specified by
+  `-o ServerAliveInterval=N`. `parse_global_request()` decodes incoming keepalive
+  and unknown global requests.
+
+## Delivered in v0.4
+
+### OpenSSH certificate support (`russh-auth`, `russh-net`)
+
+- `ssh-ed25519-cert-v01@openssh.com` wire parsing and CA signature verification.
+- Server-side: `CertificateValidator` for cert-based publickey auth.
+- Client-side: `authenticate_pubkey_with_cert()` on `SshClientConnection`.
+- Integration tests: RuSSH cert client → `sshd`, OpenSSH cert client → RuSSH server.
+
+### SSH Agent Protocol (`russh-auth`, `russh-net`)
+
+- `SshAgentClient` over `SSH_AUTH_SOCK` Unix socket; `list_identities()` and
+  `sign()` per SSH-AGENT protocol.
+- `authenticate_via_agent()` on `SshClientConnection`.
+- Integration test against real OpenSSH `ssh-agent`.
+
+### ProxyJump (`russh-net`)
+
+- `SshClient::connect_via_jump()` opens a `direct-tcpip` channel to a target
+  through a jump host; inner SSH session runs over a `tokio::io::duplex` bridge.
+- `SshClientConnection` refactored to use boxed `AnyStream` for stream-type
+  agnosticism.
+- Integration test through two real `sshd` instances.
+
+### ControlMaster config directives (`russh-config`)
+
+- `ProxyJump`, `ControlMaster`, and `ControlPath` added to the config parser;
+  token expansion (`%h`/`%u`/`%%`) and tilde expansion applied to `ControlPath`.
+  Mux-socket protocol deferred to a future release.
 
 ## Delivered in v0.3
 
@@ -147,14 +281,14 @@ All four cross-implementation integration tests now pass:
 
 ## Test coverage
 
-158 tests across all 10 crates, all passing.
+258 tests across all workspace crates, all passing.
 
-## Pending for v0.2+
+## Pending for future releases
 
-- Networked TCP transport (async I/O integration, tokio/async-std)
-- OpenSSH interop fixtures (spawn real sshd/ssh binaries)
-- Agent forwarding protocol bridge
-- ProxyJump / `nc`-mode tunneling
-- Certificate (OpenSSH cert format) validation
-- Performance benchmark harness
+- Remote port forwarding (`-R` / `tcpip-forward` global request)
+- ControlMaster mux-socket protocol
+- Certificate (OpenSSH cert format) chain validation beyond single CA
+- Performance benchmark harness (handshake/s, MB/s throughput)
 - Corpus-based fuzz campaigns with coverage metrics
+- Constant-time audit by external reviewer
+- API stabilization pass; deprecation of internal-only symbols

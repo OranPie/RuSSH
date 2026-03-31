@@ -7,17 +7,48 @@ RuSSH is a layered Rust workspace for building secure, OpenSSH-compatible SSH cl
 
 ## Features
 
-- **Real cryptography** — AES-256-GCM, AES-128-GCM, ChaCha20-Poly1305, HMAC-SHA-256/512, SHA-256/512
-- **Curve25519-SHA256 KEX** — RFC 8731 compliant; ECDH-NIST-P256-SHA256 also supported
-- **Ed25519 host keys** — signature generation and verification; exchange hash per RFC 4253 §8
-- **Full auth engine** — publickey (Ed25519), password (constant-time), keyboard-interactive
+- **Real cryptography** — AES-256-GCM, AES-256-CTR, AES-128-CTR, ChaCha20-Poly1305, HMAC-SHA-256/512 (ETM), SHA-256/512
+- **Key exchange** — Curve25519-SHA256 (RFC 8731), ECDH-NIST-P256-SHA256, DH group14-sha256
+- **Host keys** — Ed25519, ECDSA-P256, RSA (sha2-256 / sha2-512); OpenSSH certificate support
+- **Full auth engine** — publickey, password (constant-time), keyboard-interactive; auth method ordering
+- **SSH Agent** — `SSH_AUTH_SOCK` agent protocol (`list_identities`, `sign`), agent forwarding (`-A`)
 - **Channel multiplexing** — RFC 4254 flow-controlled channels with window management
-- **SFTP v3** — complete wire codec + filesystem-backed server (draft-ietf-secsh-filexfer-02)
-- **SCP** — file/directory wire protocol helpers (C/D/E headers, ACK, build/parse helpers)
-- **OpenSSH config** — Host pattern matching, first-match-wins resolution, `%h`/`%u` tokens, `~` expansion
+- **Port forwarding** — local port forwarding (`-L` via `direct-tcpip` channels)
+- **ProxyJump** — multi-hop connections through jump hosts (`-J` / `ProxyJump` config)
+- **Compression** — `zlib@openssh.com` delayed compression
+- **Strict KEX** — CVE-2023-48795 mitigation (sequence number reset, packet order enforcement)
+- **SFTP v3** — complete wire codec + filesystem server; symlink/readlink; extensions: posix-rename, statvfs, hardlink, fsync
+- **SCP** — file/directory wire protocol with timestamp preservation (T-directive)
+- **OpenSSH config** — Host pattern matching, first-match-wins resolution, `%h`/`%u` tokens, `~` expansion, `ProxyJump`/`ControlMaster`/`ControlPath`
+- **CLI client** — `russh` binary with `-L`, `-A`, `-F`, `-i`, `-o` flags; keepalive; terminal resize
+- **Web client** — xterm.js terminal over WebSocket with secure WASM tunnel mode
 - **Observability** — `tracing` and `metrics` feature-gated backends; `MemorySink` for tests
 - **Security hardening** — `#[deny(unsafe_code)]`, `ZeroizeOnDrop` on session keys, `subtle::ConstantTimeEq` for secrets
 - **Fuzz infrastructure** — libfuzzer targets for packet codec, auth parser, and config parser
+
+### Algorithm compatibility matrix
+
+| Category | Algorithms |
+|----------|-----------|
+| **KEX** | `curve25519-sha256`, `ecdh-sha2-nistp256`, `diffie-hellman-group14-sha256` |
+| **Host key** | `ssh-ed25519`, `ecdsa-sha2-nistp256`, `rsa-sha2-256`, `rsa-sha2-512` |
+| **Ciphers** | `aes256-gcm@openssh.com`, `aes256-ctr`, `aes128-ctr` |
+| **MACs** | `hmac-sha2-256-etm@openssh.com`, `hmac-sha2-512-etm@openssh.com` |
+| **Compression** | `none`, `zlib@openssh.com` |
+
+### CLI flags (`russh`)
+
+| Flag | Description |
+|------|-------------|
+| `-i PATH` | Identity file (repeatable for multiple keys) |
+| `-F PATH` | SSH config file (default: `~/.ssh/config`) |
+| `-L [bind:]port:host:hostport` | Local port forwarding |
+| `-A` | Enable agent forwarding |
+| `-o KEY=VALUE` | OpenSSH-style option override (see below) |
+
+**Supported `-o` options:** `Port`, `User`, `IdentityFile`, `ServerAliveInterval`,
+`Compression`, `KexAlgorithms`, `Ciphers`, `MACs`, `HostKeyAlgorithms`,
+`PasswordAuthentication`, `PreferredAuthentications`
 
 ## Workspace crates
 
@@ -89,7 +120,9 @@ For full web setup, compatibility notes, and troubleshooting, see [`docs/web.md`
 
 ## Status
 
-v0.1 implements the complete SSH protocol stack from cryptographic primitives
-through encrypted transport, authentication, channels, file transfer, and
-configuration resolution. See [`docs/implementation-status.md`](docs/implementation-status.md)
+v0.5 delivers broad protocol coverage, CLI maturity, and OpenSSH compatibility —
+including expanded host key algorithms (ECDSA-P256, RSA), CTR ciphers with ETM
+MACs, DH group14 KEX, delayed compression, strict KEX (CVE-2023-48795), SFTP
+extensions, SCP timestamps, port/agent forwarding, and a full-featured CLI with
+SSH config integration. See [`docs/implementation-status.md`](docs/implementation-status.md)
 for a full feature matrix and [`docs/roadmap.md`](docs/roadmap.md) for upcoming work.
