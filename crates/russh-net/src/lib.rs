@@ -144,6 +144,33 @@ fn channel_extended_data_frame(
     PacketFrame::new(payload)
 }
 
+/// Parse a `SSH_MSG_GLOBAL_REQUEST` payload into `(request_name, want_reply)`.
+///
+/// Wire format: `byte(80) | string(request_name) | bool(want_reply) [| data...]`
+fn parse_global_request(payload: &[u8]) -> (&str, bool) {
+    if payload.len() < 6 {
+        // Too short to contain type + u32 length + at least 1 char
+        return ("", false);
+    }
+    let name_len = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+    let name_end = 5 + name_len.min(payload.len().saturating_sub(5));
+    let request_name = std::str::from_utf8(&payload[5..name_end]).unwrap_or("?");
+    let want_reply = payload.get(5 + name_len).copied().unwrap_or(0) != 0;
+    (request_name, want_reply)
+}
+
+/// Build a `keepalive@openssh.com` global request frame with `want_reply = true`.
+///
+/// Wire format: `byte(80) | string("keepalive@openssh.com") | bool(true)`
+fn build_keepalive_frame() -> PacketFrame {
+    const REQUEST_NAME: &[u8] = b"keepalive@openssh.com";
+    let mut payload = Vec::with_capacity(1 + 4 + REQUEST_NAME.len() + 1);
+    payload.push(80); // SSH_MSG_GLOBAL_REQUEST
+    write_bytes(&mut payload, REQUEST_NAME);
+    payload.push(1); // want_reply = true
+    PacketFrame::new(payload)
+}
+
 // ── DirectionalCipher ────────────────────────────────────────────────────────
 
 /// Object-safe trait for stream cipher encrypt/decrypt operations.
@@ -843,7 +870,8 @@ pub struct SshClientConnection {
 impl SshClientConnection {
     /// Read the next packet from the server, skipping non-channel messages
     /// (SSH_MSG_IGNORE=2, SSH_MSG_DEBUG=4, SSH_MSG_GLOBAL_REQUEST=80).
-    /// For GLOBAL_REQUEST with want_reply, sends REQUEST_FAILURE (82).
+    /// For GLOBAL_REQUEST with want_reply, sends REQUEST_FAILURE (82)
+    /// unless the request is `keepalive@openssh.com` (REQUEST_SUCCESS=81).
     async fn read_channel_packet(&mut self) -> Result<PacketFrame, RusshError> {
         loop {
             let frame = self.stream.read_packet().await?;
@@ -851,20 +879,16 @@ impl SshClientConnection {
                 Some(2) | Some(4) => continue, // SSH_MSG_IGNORE, SSH_MSG_DEBUG
                 Some(80) => {
                     // SSH_MSG_GLOBAL_REQUEST
-                    let want_reply = if frame.payload.len() >= 5 {
-                        let nlen = u32::from_be_bytes([
-                            frame.payload[1],
-                            frame.payload[2],
-                            frame.payload[3],
-                            frame.payload[4],
-                        ]) as usize;
-                        frame.payload.get(5 + nlen).copied().unwrap_or(0) != 0
-                    } else {
-                        false
-                    };
+                    let (request_name, want_reply) = parse_global_request(&frame.payload);
+                    debug!(request_name, want_reply, "GLOBAL_REQUEST (client side)");
                     if want_reply {
+                        let reply = if request_name == "keepalive@openssh.com" {
+                            81 // SSH_MSG_REQUEST_SUCCESS
+                        } else {
+                            82 // SSH_MSG_REQUEST_FAILURE
+                        };
                         self.stream
-                            .write_packet(&PacketFrame::new(vec![82]))
+                            .write_packet(&PacketFrame::new(vec![reply]))
                             .await?;
                     }
                 }
@@ -1624,6 +1648,42 @@ impl SshClientConnection {
         self.stream.write_packet(&close.to_frame()?).await
     }
 
+    /// Send a `keepalive@openssh.com` global request to the server.
+    ///
+    /// This is the standard OpenSSH keepalive mechanism. The request has
+    /// `want_reply = true`, so the server should respond with either
+    /// `SSH_MSG_REQUEST_SUCCESS` (81) or `SSH_MSG_REQUEST_FAILURE` (82).
+    pub async fn send_keepalive(&mut self) -> Result<(), RusshError> {
+        let frame = build_keepalive_frame();
+        self.stream.write_packet(&frame).await?;
+        debug!("sent keepalive@openssh.com global request");
+        Ok(())
+    }
+
+    /// Send a window-change (terminal resize) notification on an open channel.
+    ///
+    /// Per RFC 4254 §6.7 the request is sent with `want_reply = false`.
+    pub async fn resize_terminal(
+        &mut self,
+        remote_id: u32,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(), RusshError> {
+        debug!(remote_id, cols, rows, "sending window-change");
+        let req = ChannelMessage::Request {
+            recipient_channel: remote_id,
+            want_reply: false,
+            request: ChannelRequest::WindowChange {
+                width_chars: cols,
+                height_rows: rows,
+                width_pixels: 0,
+                height_pixels: 0,
+            },
+        };
+        self.stream.write_packet(&req.to_frame()?).await?;
+        Ok(())
+    }
+
     /// Send `SSH_MSG_DISCONNECT` and flush the connection.
     pub async fn disconnect(&mut self) -> Result<(), RusshError> {
         self.session.close("client disconnect");
@@ -2077,27 +2137,19 @@ impl SshServerConnection {
                 break;
             }
 
-            // Handle SSH_MSG_GLOBAL_REQUEST (80): reply REQUEST_FAILURE when want_reply set.
+            // Handle SSH_MSG_GLOBAL_REQUEST (80): reply REQUEST_SUCCESS for
+            // keepalive@openssh.com, REQUEST_FAILURE for everything else.
             if frame.message_type() == Some(80) {
-                // Payload: string(request_name) bool(want_reply) [data...]
-                let payload = &frame.payload;
-                // Skip message type byte (index 0), then read string length
-                if payload.len() >= 5 {
-                    let name_len =
-                        u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]])
-                            as usize;
-                    let want_reply_offset = 5 + name_len;
-                    let request_name = std::str::from_utf8(
-                        &payload[5..5 + name_len.min(payload.len().saturating_sub(5))],
-                    )
-                    .unwrap_or("?");
-                    let want_reply = payload.get(want_reply_offset).copied().unwrap_or(0) != 0;
-                    debug!(request_name, want_reply, "GLOBAL_REQUEST");
-                    if want_reply {
-                        // SSH_MSG_REQUEST_FAILURE = 82
-                        let failure_frame = russh_core::PacketFrame { payload: vec![82] };
-                        let _ = self.stream.write_packet(&failure_frame).await;
-                    }
+                let (request_name, want_reply) = parse_global_request(&frame.payload);
+                debug!(request_name, want_reply, "GLOBAL_REQUEST");
+                if want_reply {
+                    let reply = if request_name == "keepalive@openssh.com" {
+                        81 // SSH_MSG_REQUEST_SUCCESS
+                    } else {
+                        82 // SSH_MSG_REQUEST_FAILURE
+                    };
+                    let reply_frame = PacketFrame::new(vec![reply]);
+                    let _ = self.stream.write_packet(&reply_frame).await;
                 }
                 continue;
             }
@@ -2284,6 +2336,28 @@ impl SshServerConnection {
                                     self.stream.write_packet(&fail.to_frame()?).await?;
                                 }
                             }
+                        }
+
+                        ChannelRequest::WindowChange {
+                            width_chars,
+                            height_rows,
+                            width_pixels,
+                            height_pixels,
+                        } => {
+                            debug!(
+                                cols = width_chars,
+                                rows = height_rows,
+                                px_w = width_pixels,
+                                px_h = height_pixels,
+                                "window-change request"
+                            );
+                            state.pty_size = Some((
+                                u16::try_from(width_chars).unwrap_or(80),
+                                u16::try_from(height_rows).unwrap_or(24),
+                            ));
+                            // Per RFC 4254 §6.7, window-change MUST NOT
+                            // have want_reply set, so we do not send a
+                            // response.
                         }
 
                         ChannelRequest::Unknown {
@@ -2914,5 +2988,64 @@ mod tests {
         let path = resolve_scp_target_path(&root, "nested/file.txt")
             .expect("nested path should be accepted");
         assert_eq!(path, root.join("nested/file.txt"));
+    }
+
+    // ── Global request / keepalive tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_global_request_keepalive() {
+        let frame = build_keepalive_frame();
+        let (name, want_reply) = parse_global_request(&frame.payload);
+        assert_eq!(name, "keepalive@openssh.com");
+        assert!(want_reply);
+    }
+
+    #[test]
+    fn parse_global_request_unknown() {
+        // Build an unknown global request with want_reply=true
+        let request_name = b"tcpip-forward";
+        let mut payload = Vec::new();
+        payload.push(80); // SSH_MSG_GLOBAL_REQUEST
+        write_bytes(&mut payload, request_name);
+        payload.push(1); // want_reply = true
+        let (name, want_reply) = parse_global_request(&payload);
+        assert_eq!(name, "tcpip-forward");
+        assert!(want_reply);
+    }
+
+    #[test]
+    fn parse_global_request_no_reply() {
+        let request_name = b"some-notify";
+        let mut payload = Vec::new();
+        payload.push(80);
+        write_bytes(&mut payload, request_name);
+        payload.push(0); // want_reply = false
+        let (name, want_reply) = parse_global_request(&payload);
+        assert_eq!(name, "some-notify");
+        assert!(!want_reply);
+    }
+
+    #[test]
+    fn parse_global_request_too_short() {
+        let (name, want_reply) = parse_global_request(&[80]);
+        assert_eq!(name, "");
+        assert!(!want_reply);
+    }
+
+    #[test]
+    fn build_keepalive_frame_wire_format() {
+        let frame = build_keepalive_frame();
+        let p = &frame.payload;
+        // Byte 0: SSH_MSG_GLOBAL_REQUEST
+        assert_eq!(p[0], 80);
+        // Bytes 1..5: string length of "keepalive@openssh.com" (21)
+        let name_len = u32::from_be_bytes([p[1], p[2], p[3], p[4]]);
+        assert_eq!(name_len, 21);
+        // Bytes 5..26: the request name
+        assert_eq!(&p[5..26], b"keepalive@openssh.com");
+        // Byte 26: want_reply = true
+        assert_eq!(p[26], 1);
+        // Total length: 1 + 4 + 21 + 1 = 27
+        assert_eq!(p.len(), 27);
     }
 }
