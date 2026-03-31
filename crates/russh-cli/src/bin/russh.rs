@@ -1105,7 +1105,10 @@ mod tests {
     #[test]
     fn parse_local_forward_three_part() {
         let fwd = parse_local_forward("8080:localhost:80").unwrap();
-        assert_eq!(fwd, ("127.0.0.1".to_string(), 8080, "localhost".to_string(), 80));
+        assert_eq!(
+            fwd,
+            ("127.0.0.1".to_string(), 8080, "localhost".to_string(), 80)
+        );
     }
 
     #[test]
@@ -1126,8 +1129,10 @@ mod tests {
     #[test]
     fn l_flag_parsed_into_args() {
         let args = parse_args_from(make_argv(&[
-            "-L", "8080:localhost:80",
-            "-L", "0.0.0.0:5432:db:5432",
+            "-L",
+            "8080:localhost:80",
+            "-L",
+            "0.0.0.0:5432:db:5432",
             "host",
         ]));
         assert_eq!(args.local_forwards.len(), 2);
