@@ -1291,7 +1291,11 @@ impl KeyExchangeAlgorithm for DhGroup18Sha512 {
 }
 
 /// Shared DH keypair generation for all groups.
-fn dh_generate_keypair(prime: &[u8], exponent_bytes: usize, rng: &mut dyn RandomSource) -> KexKeyPair {
+fn dh_generate_keypair(
+    prime: &[u8],
+    exponent_bytes: usize,
+    rng: &mut dyn RandomSource,
+) -> KexKeyPair {
     let p = rsa::BigUint::from_bytes_be(prime);
     let g = rsa::BigUint::from(2u32);
     let mut x_buf = vec![0u8; exponent_bytes];

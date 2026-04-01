@@ -44,6 +44,7 @@ fn usage() -> ! {
          \x20 -i IDENTITY      Path to Ed25519 private key (may be repeated)\n\
          \x20 -J JUMP          ProxyJump: [user@]host[:port]\n\
          \x20 -L [BIND:]PORT:HOST:HOSTPORT  Local port forwarding\n\
+         \x20 -D [BIND:]PORT    Dynamic SOCKS proxy forwarding\n\
          \x20 -F CONFIGFILE    SSH config file (default: ~/.ssh/config)\n\
          \x20 -o KEY=VALUE     OpenSSH option (e.g. StrictHostKeyChecking=no)\n\
          \x20 -v               Increase verbosity (-vv, -vvv for more)\n\
@@ -93,6 +94,9 @@ struct Args {
     remote_forwards: Vec<(String, u16, String, u16)>,
     /// Whether to request SSH agent forwarding (`-A`).
     agent_forwarding: bool,
+    /// Dynamic SOCKS forwarding specs: `(bind_host, bind_port)`.
+    #[allow(dead_code)]
+    dynamic_forwards: Vec<(String, u16)>,
 }
 
 fn parse_o_option(opt: &str, o_opts: &mut OOptions, strict: &mut bool, tofu: &mut bool) {
@@ -194,6 +198,19 @@ fn parse_remote_forward(spec: &str) -> Option<(String, u16, String, u16)> {
     parse_local_forward(spec)
 }
 
+/// Parse a `-D` spec: `[bind_address:]port`.
+///
+/// Returns `(bind_host, bind_port)`.
+fn parse_dynamic_forward(spec: &str) -> Option<(String, u16)> {
+    if let Some((addr, port_str)) = spec.rsplit_once(':') {
+        let port = port_str.parse::<u16>().ok()?;
+        Some((addr.to_string(), port))
+    } else {
+        let port = spec.parse::<u16>().ok()?;
+        Some(("127.0.0.1".to_string(), port))
+    }
+}
+
 fn parse_args() -> Args {
     parse_args_from(std::env::args().skip(1).collect())
 }
@@ -215,6 +232,7 @@ fn parse_args_from(argv: Vec<String>) -> Args {
     let mut o_opts = OOptions::default();
     let mut local_forwards: Vec<(String, u16, String, u16)> = Vec::new();
     let mut remote_forwards: Vec<(String, u16, String, u16)> = Vec::new();
+    let mut dynamic_forwards: Vec<(String, u16)> = Vec::new();
     let mut agent_forwarding = false;
 
     let mut i = 0;
@@ -285,6 +303,17 @@ fn parse_args_from(argv: Vec<String>) -> Args {
                     }
                 }
             }
+            "-D" => {
+                i += 1;
+                if let Some(spec) = argv.get(i) {
+                    if let Some(fwd) = parse_dynamic_forward(spec) {
+                        dynamic_forwards.push(fwd);
+                    } else {
+                        eprintln!("error: invalid -D spec: {spec}");
+                        process::exit(1);
+                    }
+                }
+            }
             s if s.starts_with("-o") => {
                 let opt = if s.len() > 2 {
                     s[2..].trim().to_string()
@@ -338,6 +367,7 @@ fn parse_args_from(argv: Vec<String>) -> Args {
         o_options: o_opts,
         local_forwards,
         remote_forwards,
+        dynamic_forwards,
         agent_forwarding,
     }
 }
@@ -485,12 +515,11 @@ fn load_signer(path: &std::path::Path) -> Box<dyn Signer + Send + Sync> {
             eprintln!("russh: {e}");
             process::exit(1);
         }),
-        Err(e) if e.contains("passphrase required") => {
-            prompt_and_load_encrypted(path).unwrap_or_else(|e| {
+        Err(e) if e.contains("passphrase required") => prompt_and_load_encrypted(path)
+            .unwrap_or_else(|e| {
                 eprintln!("russh: {e}");
                 process::exit(1);
-            })
-        }
+            }),
         Err(e) => {
             eprintln!("russh: {e}");
             process::exit(1);
@@ -829,6 +858,10 @@ async fn main() {
                 if conn.authenticate_password(&password).await.is_ok() {
                     authed = true;
                 }
+            }
+            AuthMethod::GssApi => {
+                // GSSAPI not yet supported in CLI client
+                continue;
             }
         }
     }

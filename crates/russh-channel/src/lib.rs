@@ -33,6 +33,8 @@
 //! [`JumpChain`] models ProxyJump host chains.
 //! [`MultiplexPool`] provides connection reuse across sessions.
 
+pub mod socks;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -1118,6 +1120,77 @@ impl ForwardHandle {
     pub fn parse_cancel_tcpip_forward_data(data: &[u8]) -> Result<(String, u32), RusshError> {
         Self::parse_tcpip_forward_data(data)
     }
+
+    // ── streamlocal (Unix domain socket) helpers ───────────────
+
+    /// Parse the extra data from a `direct-streamlocal@openssh.com` channel open.
+    ///
+    /// Wire format: `string(socket_path) || string(reserved) || uint32(reserved)`.
+    /// Returns the socket path.
+    pub fn parse_direct_streamlocal_extra(data: &[u8]) -> Result<String, RusshError> {
+        if data.len() < 4 {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "streamlocal extra data too short",
+            ));
+        }
+        let path_len =
+            u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + path_len {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "streamlocal socket path truncated",
+            ));
+        }
+        String::from_utf8(data[4..4 + path_len].to_vec()).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "streamlocal socket path is not valid UTF-8",
+            )
+        })
+    }
+
+    /// Build the extra data for a `direct-streamlocal@openssh.com` channel open.
+    ///
+    /// Wire format: `string(socket_path) || string("") || uint32(0)`.
+    #[must_use]
+    pub fn build_direct_streamlocal_extra(socket_path: &str) -> Vec<u8> {
+        let path_bytes = socket_path.as_bytes();
+        let mut buf = Vec::with_capacity(4 + path_bytes.len() + 4 + 4);
+        buf.extend_from_slice(&(path_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(path_bytes);
+        // reserved string (empty)
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        // reserved uint32
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf
+    }
+
+    /// Parse the data payload from a `streamlocal-forward@openssh.com` global request.
+    ///
+    /// Wire format: `string(socket_path)`.
+    pub fn parse_streamlocal_forward_data(data: &[u8]) -> Result<String, RusshError> {
+        if data.len() < 4 {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "streamlocal-forward data too short",
+            ));
+        }
+        let path_len =
+            u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + path_len {
+            return Err(RusshError::new(
+                RusshErrorCategory::Protocol,
+                "streamlocal-forward socket path truncated",
+            ));
+        }
+        String::from_utf8(data[4..4 + path_len].to_vec()).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Protocol,
+                "streamlocal socket path is not valid UTF-8",
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1681,6 +1754,35 @@ mod channel_tests {
     fn cancel_tcpip_forward_parse_truncated_payload() {
         // Only 3 bytes — too short for a valid string length
         assert!(ForwardHandle::parse_cancel_tcpip_forward_data(&[0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn direct_streamlocal_extra_round_trip() {
+        let extra = ForwardHandle::build_direct_streamlocal_extra("/var/run/app.sock");
+        let path = ForwardHandle::parse_direct_streamlocal_extra(&extra).expect("parse");
+        assert_eq!(path, "/var/run/app.sock");
+    }
+
+    #[test]
+    fn direct_streamlocal_extra_truncated() {
+        assert!(ForwardHandle::parse_direct_streamlocal_extra(&[0, 0, 0]).is_err());
+        // Length says 10 but only 4 bytes of data
+        assert!(ForwardHandle::parse_direct_streamlocal_extra(&[0, 0, 0, 10, 1, 2, 3, 4]).is_err());
+    }
+
+    #[test]
+    fn streamlocal_forward_data_round_trip() {
+        let path = "/tmp/test.sock";
+        let mut data = Vec::new();
+        data.extend_from_slice(&(path.len() as u32).to_be_bytes());
+        data.extend_from_slice(path.as_bytes());
+        let parsed = ForwardHandle::parse_streamlocal_forward_data(&data).expect("parse");
+        assert_eq!(parsed, path);
+    }
+
+    #[test]
+    fn streamlocal_forward_data_truncated() {
+        assert!(ForwardHandle::parse_streamlocal_forward_data(&[0, 0]).is_err());
     }
 }
 

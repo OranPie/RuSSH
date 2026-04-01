@@ -160,7 +160,7 @@ impl ClientConfig {
 }
 
 /// Server-side session configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub transport: TransportConfig,
     pub max_sessions_per_connection: u16,
@@ -914,7 +914,8 @@ impl ClientSession {
             UserAuthRequest::None { user, .. }
             | UserAuthRequest::PublicKey { user, .. }
             | UserAuthRequest::Password { user, .. }
-            | UserAuthRequest::KeyboardInteractive { user, .. } => user,
+            | UserAuthRequest::KeyboardInteractive { user, .. }
+            | UserAuthRequest::GssApi { user, .. } => user,
         };
         if request_user != &self.config.user {
             return Err(RusshError::new(
@@ -943,9 +944,15 @@ impl ClientSession {
             }
             UserAuthMessage::Banner { .. }
             | UserAuthMessage::PublicKeyOk { .. }
-            | UserAuthMessage::KeyboardInteractiveInfoRequest { .. } => Ok(()),
+            | UserAuthMessage::KeyboardInteractiveInfoRequest { .. }
+            | UserAuthMessage::GssApiResponse { .. }
+            | UserAuthMessage::GssApiToken { .. }
+            | UserAuthMessage::GssApiExchangeComplete
+            | UserAuthMessage::GssApiError { .. }
+            | UserAuthMessage::GssApiErrorToken { .. } => Ok(()),
             UserAuthMessage::Request(_)
-            | UserAuthMessage::KeyboardInteractiveInfoResponse { .. } => Err(RusshError::new(
+            | UserAuthMessage::KeyboardInteractiveInfoResponse { .. }
+            | UserAuthMessage::GssApiMic { .. } => Err(RusshError::new(
                 RusshErrorCategory::Interop,
                 "client session received invalid USERAUTH message direction",
             )),
@@ -1813,7 +1820,8 @@ impl ServerSession {
                     &kex_alg,
                 );
                 let signature = sign_server_exchange_hash(&seed, &host_key_alg, &exchange_hash)?;
-                let keys = derive_session_keys(&shared_secret_mpint, &exchange_hash, None, &kex_alg);
+                let keys =
+                    derive_session_keys(&shared_secret_mpint, &exchange_hash, None, &kex_alg);
                 self.session_keys = Some(keys);
                 self.kex_context = None;
                 self.state = SessionState::Established;
@@ -2019,7 +2027,8 @@ impl ServerSession {
             UserAuthRequest::None { .. } => None,
             UserAuthRequest::PublicKey { user, .. }
             | UserAuthRequest::Password { user, .. }
-            | UserAuthRequest::KeyboardInteractive { user, .. } => Some(user.as_str()),
+            | UserAuthRequest::KeyboardInteractive { user, .. }
+            | UserAuthRequest::GssApi { user, .. } => Some(user.as_str()),
         };
         if let Some(username) = request_user {
             let user_allowed = self
@@ -2165,6 +2174,22 @@ impl ServerSession {
                     instruction: "Enter your credentials".to_string(),
                     language_tag: String::new(),
                     prompts: vec![("Password: ".to_string(), false)],
+                }));
+            }
+            UserAuthRequest::GssApi { user: _, service, .. } => {
+                // GSSAPI auth is not implemented yet - return failure.
+                // When a GssApiProvider is configured in ServerAuthPolicy, this would handle the token exchange.
+                if service != SSH_CONNECTION_SERVICE {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Auth,
+                        "USERAUTH request service must be ssh-connection",
+                    ));
+                }
+                let methods = self.allowed_userauth_methods();
+                self.bump_outgoing_sequence();
+                return Ok(Some(UserAuthMessage::Failure {
+                    methods,
+                    partial_success: false,
                 }));
             }
         };

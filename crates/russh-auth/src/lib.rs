@@ -50,6 +50,12 @@ pub enum AuthRequest {
         user: String,
         responses: Vec<String>,
     },
+    GssApi {
+        user: String,
+        oid: Vec<u8>,
+        token: Vec<u8>,
+        mic: Option<Vec<u8>>,
+    },
 }
 
 impl AuthRequest {
@@ -58,7 +64,8 @@ impl AuthRequest {
         match self {
             Self::PublicKey { user, .. }
             | Self::Password { user, .. }
-            | Self::KeyboardInteractive { user, .. } => user,
+            | Self::KeyboardInteractive { user, .. }
+            | Self::GssApi { user, .. } => user,
         }
     }
 
@@ -68,6 +75,7 @@ impl AuthRequest {
             Self::PublicKey { .. } => AuthMethod::PublicKey,
             Self::Password { .. } => AuthMethod::Password,
             Self::KeyboardInteractive { .. } => AuthMethod::KeyboardInteractive,
+            Self::GssApi { .. } => AuthMethod::GssApi,
         }
     }
 }
@@ -86,6 +94,7 @@ pub enum AuthMethod {
     PublicKey,
     Password,
     KeyboardInteractive,
+    GssApi,
 }
 
 impl AuthMethod {
@@ -95,6 +104,7 @@ impl AuthMethod {
             Self::PublicKey => "publickey",
             Self::Password => "password",
             Self::KeyboardInteractive => "keyboard-interactive",
+            Self::GssApi => "gssapi-with-mic",
         }
     }
 
@@ -106,6 +116,7 @@ impl AuthMethod {
             "publickey" => Some(Self::PublicKey),
             "password" => Some(Self::Password),
             "keyboard-interactive" => Some(Self::KeyboardInteractive),
+            "gssapi-with-mic" => Some(Self::GssApi),
             _ => None,
         }
     }
@@ -132,7 +143,6 @@ pub enum AuthEvent {
 }
 
 /// Server policy for accepted auth mechanisms.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerAuthPolicy {
     allowed_methods: BTreeSet<AuthMethod>,
     required_methods: BTreeSet<AuthMethod>,
@@ -148,6 +158,41 @@ pub struct ServerAuthPolicy {
     pub allow_users: Option<Vec<String>>,
     /// If set, these usernames are denied authentication (takes priority over allow_users).
     pub deny_users: Option<Vec<String>>,
+    /// If set, GSSAPI authentication is handled by this provider.
+    pub gssapi_provider: Option<Box<dyn GssApiProvider>>,
+}
+
+impl std::fmt::Debug for ServerAuthPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerAuthPolicy")
+            .field("allowed_methods", &self.allowed_methods)
+            .field("required_methods", &self.required_methods)
+            .field("max_attempts", &self.max_attempts)
+            .field("certificate_validator", &self.certificate_validator)
+            .field("authorized_keys", &self.authorized_keys)
+            .field("allow_users", &self.allow_users)
+            .field("deny_users", &self.deny_users)
+            .field(
+                "gssapi_provider",
+                &self.gssapi_provider.as_ref().map(|p| format!("{p:?}")),
+            )
+            .finish()
+    }
+}
+
+impl Clone for ServerAuthPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            allowed_methods: self.allowed_methods.clone(),
+            required_methods: self.required_methods.clone(),
+            max_attempts: self.max_attempts,
+            certificate_validator: self.certificate_validator.clone(),
+            authorized_keys: self.authorized_keys.clone(),
+            allow_users: self.allow_users.clone(),
+            deny_users: self.deny_users.clone(),
+            gssapi_provider: None,
+        }
+    }
 }
 
 impl ServerAuthPolicy {
@@ -169,6 +214,7 @@ impl ServerAuthPolicy {
             authorized_keys: None,
             allow_users: None,
             deny_users: None,
+            gssapi_provider: None,
         }
     }
 
@@ -275,6 +321,23 @@ pub trait AgentClient {
     fn sign(&self, key_blob: &[u8], message: &[u8]) -> Result<Vec<u8>, RusshError>;
 }
 
+/// GSSAPI security context provider for server-side authentication.
+pub trait GssApiProvider: Send + Sync + std::fmt::Debug {
+    fn accept_sec_context(&mut self, token: &[u8]) -> Result<(Vec<u8>, bool), RusshError>;
+    fn get_username(&self) -> Result<String, RusshError>;
+    fn verify_mic(&self, message: &[u8], mic: &[u8]) -> Result<(), RusshError>;
+}
+
+/// GSSAPI security context provider for client-side authentication.
+pub trait GssApiClientProvider: Send + Sync + std::fmt::Debug {
+    fn init_sec_context(
+        &mut self,
+        target: &str,
+        token: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, bool), RusshError>;
+    fn get_mic(&self, message: &[u8]) -> Result<Vec<u8>, RusshError>;
+}
+
 /// SSH USERAUTH request payload variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UserAuthRequest {
@@ -299,6 +362,11 @@ pub enum UserAuthRequest {
         service: String,
         language_tag: String,
         submethods: String,
+    },
+    GssApi {
+        user: String,
+        service: String,
+        oids: Vec<Vec<u8>>,
     },
 }
 
@@ -328,6 +396,25 @@ pub enum UserAuthMessage {
     KeyboardInteractiveInfoResponse {
         responses: Vec<String>,
     },
+    GssApiResponse {
+        oid: Vec<u8>,
+    },
+    GssApiToken {
+        token: Vec<u8>,
+    },
+    GssApiExchangeComplete,
+    GssApiError {
+        major_status: u32,
+        minor_status: u32,
+        message: String,
+        language_tag: String,
+    },
+    GssApiErrorToken {
+        error_token: Vec<u8>,
+    },
+    GssApiMic {
+        mic: Vec<u8>,
+    },
 }
 
 impl UserAuthMessage {
@@ -337,6 +424,12 @@ impl UserAuthMessage {
     const MSG_BANNER: u8 = 53;
     const MSG_INFO_REQUEST_OR_PK_OK: u8 = 60;
     const MSG_INFO_RESPONSE: u8 = 61;
+    const MSG_GSSAPI_RESPONSE: u8 = 60;
+    const MSG_GSSAPI_TOKEN: u8 = 61;
+    const MSG_GSSAPI_EXCHANGE_COMPLETE: u8 = 63;
+    const MSG_GSSAPI_ERROR: u8 = 64;
+    const MSG_GSSAPI_ERRTOK: u8 = 65;
+    const MSG_GSSAPI_MIC: u8 = 66;
 
     pub fn to_frame(&self) -> Result<PacketFrame, RusshError> {
         let mut payload = Vec::new();
@@ -389,6 +482,27 @@ impl UserAuthMessage {
                         write_string(&mut payload, AuthMethod::KeyboardInteractive.as_ssh_name())?;
                         write_string(&mut payload, language_tag)?;
                         write_string(&mut payload, submethods)?;
+                    }
+                    UserAuthRequest::GssApi {
+                        user,
+                        service,
+                        oids,
+                    } => {
+                        write_string(&mut payload, user)?;
+                        write_string(&mut payload, service)?;
+                        write_string(&mut payload, AuthMethod::GssApi.as_ssh_name())?;
+                        write_u32(
+                            &mut payload,
+                            u32::try_from(oids.len()).map_err(|_| {
+                                RusshError::new(
+                                    RusshErrorCategory::Auth,
+                                    "GSSAPI OID count exceeds u32",
+                                )
+                            })?,
+                        );
+                        for oid in oids {
+                            write_binary_string(&mut payload, oid)?;
+                        }
                     }
                 }
             }
@@ -456,6 +570,37 @@ impl UserAuthMessage {
                     write_string(&mut payload, response)?;
                 }
             }
+            Self::GssApiResponse { oid } => {
+                payload.push(Self::MSG_GSSAPI_RESPONSE);
+                write_binary_string(&mut payload, oid)?;
+            }
+            Self::GssApiToken { token } => {
+                payload.push(Self::MSG_GSSAPI_TOKEN);
+                write_binary_string(&mut payload, token)?;
+            }
+            Self::GssApiExchangeComplete => {
+                payload.push(Self::MSG_GSSAPI_EXCHANGE_COMPLETE);
+            }
+            Self::GssApiError {
+                major_status,
+                minor_status,
+                message,
+                language_tag,
+            } => {
+                payload.push(Self::MSG_GSSAPI_ERROR);
+                write_u32(&mut payload, *major_status);
+                write_u32(&mut payload, *minor_status);
+                write_string(&mut payload, message)?;
+                write_string(&mut payload, language_tag)?;
+            }
+            Self::GssApiErrorToken { error_token } => {
+                payload.push(Self::MSG_GSSAPI_ERRTOK);
+                write_binary_string(&mut payload, error_token)?;
+            }
+            Self::GssApiMic { mic } => {
+                payload.push(Self::MSG_GSSAPI_MIC);
+                write_binary_string(&mut payload, mic)?;
+            }
         }
 
         Ok(PacketFrame::new(payload))
@@ -516,6 +661,24 @@ impl UserAuthMessage {
                             service,
                             language_tag,
                             submethods,
+                        })
+                    }
+                    "gssapi-with-mic" => {
+                        let count =
+                            usize::try_from(read_u32(body, &mut offset)?).map_err(|_| {
+                                RusshError::new(
+                                    RusshErrorCategory::Auth,
+                                    "GSSAPI OID count does not fit usize",
+                                )
+                            })?;
+                        let mut oids = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            oids.push(read_binary_string(body, &mut offset)?);
+                        }
+                        Self::Request(UserAuthRequest::GssApi {
+                            user,
+                            service,
+                            oids,
                         })
                     }
                     _ => {
@@ -590,6 +753,27 @@ impl UserAuthMessage {
                     responses.push(read_string(body, &mut offset)?);
                 }
                 Self::KeyboardInteractiveInfoResponse { responses }
+            }
+            Self::MSG_GSSAPI_EXCHANGE_COMPLETE => Self::GssApiExchangeComplete,
+            Self::MSG_GSSAPI_ERROR => {
+                let major_status = read_u32(body, &mut offset)?;
+                let minor_status = read_u32(body, &mut offset)?;
+                let message = read_string(body, &mut offset)?;
+                let language_tag = read_string(body, &mut offset)?;
+                Self::GssApiError {
+                    major_status,
+                    minor_status,
+                    message,
+                    language_tag,
+                }
+            }
+            Self::MSG_GSSAPI_ERRTOK => {
+                let error_token = read_binary_string(body, &mut offset)?;
+                Self::GssApiErrorToken { error_token }
+            }
+            Self::MSG_GSSAPI_MIC => {
+                let mic = read_binary_string(body, &mut offset)?;
+                Self::GssApiMic { mic }
             }
             _ => {
                 return Err(RusshError::new(
@@ -1754,10 +1938,7 @@ pub fn verify_cert_auth_signature(
     } else {
         Err(RusshError::new(
             RusshErrorCategory::Auth,
-            format!(
-                "unsupported cert key type for auth: {}",
-                cert.cert_key_type
-            ),
+            format!("unsupported cert key type for auth: {}", cert.cert_key_type),
         ))
     }
 }
@@ -2015,8 +2196,9 @@ mod tests {
 
     use super::{
         AuthEngine, AuthMethod, AuthRequest, AuthResult, AuthSession, CertificateValidator,
-        KnownHostsStore, MemoryAuthorizedKeys, MemoryKnownHostsStore, OpenSshCertificate,
-        ServerAuthPolicy, UserAuthMessage, UserAuthRequest, parse_authorized_keys,
+        GssApiProvider, KnownHostsStore, MemoryAuthorizedKeys, MemoryKnownHostsStore,
+        OpenSshCertificate, ServerAuthPolicy, UserAuthMessage, UserAuthRequest,
+        parse_authorized_keys,
     };
 
     #[test]
@@ -2522,7 +2704,7 @@ mod tests {
 
     #[test]
     fn auth_method_from_ssh_name_unknown() {
-        assert_eq!(AuthMethod::from_ssh_name("gssapi-with-mic"), None);
+        assert_eq!(AuthMethod::from_ssh_name("unknown-method"), None);
         assert_eq!(AuthMethod::from_ssh_name(""), None);
     }
 
@@ -2532,6 +2714,7 @@ mod tests {
             AuthMethod::PublicKey,
             AuthMethod::Password,
             AuthMethod::KeyboardInteractive,
+            AuthMethod::GssApi,
         ] {
             assert_eq!(
                 AuthMethod::from_ssh_name(method.as_ssh_name()),
@@ -2574,5 +2757,136 @@ mod tests {
         assert!(policy.is_user_allowed("alice"));
         assert!(!policy.is_user_allowed("mallory"));
         assert!(!policy.is_user_allowed("bob"));
+    }
+
+    // --- GSSAPI tests ---
+
+    #[derive(Debug)]
+    struct MockGssApiProvider {
+        username: String,
+    }
+
+    impl GssApiProvider for MockGssApiProvider {
+        fn accept_sec_context(
+            &mut self,
+            _token: &[u8],
+        ) -> Result<(Vec<u8>, bool), russh_core::RusshError> {
+            Ok((vec![0xAA, 0xBB], true))
+        }
+        fn get_username(&self) -> Result<String, russh_core::RusshError> {
+            Ok(self.username.clone())
+        }
+        fn verify_mic(&self, _message: &[u8], _mic: &[u8]) -> Result<(), russh_core::RusshError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn gssapi_auth_method_ssh_name_round_trip() {
+        assert_eq!(AuthMethod::GssApi.as_ssh_name(), "gssapi-with-mic");
+        assert_eq!(
+            AuthMethod::from_ssh_name("gssapi-with-mic"),
+            Some(AuthMethod::GssApi)
+        );
+    }
+
+    #[test]
+    fn gssapi_auth_request_user_and_method() {
+        let request = AuthRequest::GssApi {
+            user: "alice".to_string(),
+            oid: vec![1, 2, 3],
+            token: vec![4, 5, 6],
+            mic: Some(vec![7, 8, 9]),
+        };
+        assert_eq!(request.user(), "alice");
+        assert_eq!(request.method(), AuthMethod::GssApi);
+    }
+
+    #[test]
+    fn gssapi_userauth_request_round_trip() {
+        let codec = PacketCodec::with_defaults();
+        let message = UserAuthMessage::Request(UserAuthRequest::GssApi {
+            user: "alice".to_string(),
+            service: "ssh-connection".to_string(),
+            oids: vec![vec![0x06, 0x09, 0x60], vec![0x06, 0x05, 0x2B]],
+        });
+        let encoded = message.encode(&codec).expect("encode should succeed");
+        let decoded = UserAuthMessage::decode(&codec, &encoded).expect("decode should succeed");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn gssapi_exchange_complete_round_trip() {
+        let codec = PacketCodec::with_defaults();
+        let message = UserAuthMessage::GssApiExchangeComplete;
+        let encoded = message.encode(&codec).expect("encode should succeed");
+        let decoded = UserAuthMessage::decode(&codec, &encoded).expect("decode should succeed");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn gssapi_error_round_trip() {
+        let codec = PacketCodec::with_defaults();
+        let message = UserAuthMessage::GssApiError {
+            major_status: 0x000D_0000,
+            minor_status: 0x0001_0000,
+            message: "credential expired".to_string(),
+            language_tag: "en-US".to_string(),
+        };
+        let encoded = message.encode(&codec).expect("encode should succeed");
+        let decoded = UserAuthMessage::decode(&codec, &encoded).expect("decode should succeed");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn gssapi_errtok_round_trip() {
+        let codec = PacketCodec::with_defaults();
+        let message = UserAuthMessage::GssApiErrorToken {
+            error_token: vec![0xDE, 0xAD],
+        };
+        let encoded = message.encode(&codec).expect("encode should succeed");
+        let decoded = UserAuthMessage::decode(&codec, &encoded).expect("decode should succeed");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn gssapi_mic_round_trip() {
+        let codec = PacketCodec::with_defaults();
+        let message = UserAuthMessage::GssApiMic {
+            mic: vec![0x01, 0x02, 0x03, 0x04],
+        };
+        let encoded = message.encode(&codec).expect("encode should succeed");
+        let decoded = UserAuthMessage::decode(&codec, &encoded).expect("decode should succeed");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn gssapi_response_serializes() {
+        let message = UserAuthMessage::GssApiResponse {
+            oid: vec![0x06, 0x09, 0x60],
+        };
+        let frame = message.to_frame().expect("to_frame should succeed");
+        assert_eq!(frame.payload[0], 60);
+    }
+
+    #[test]
+    fn mock_gssapi_provider_basic() {
+        let mut provider = MockGssApiProvider {
+            username: "alice".to_string(),
+        };
+        let (token, complete) = provider
+            .accept_sec_context(&[1, 2, 3])
+            .expect("accept_sec_context should succeed");
+        assert_eq!(token, vec![0xAA, 0xBB]);
+        assert!(complete);
+        assert_eq!(
+            provider
+                .get_username()
+                .expect("get_username should succeed"),
+            "alice"
+        );
+        provider
+            .verify_mic(&[1], &[2])
+            .expect("verify_mic should succeed");
     }
 }

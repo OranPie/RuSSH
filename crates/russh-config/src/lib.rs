@@ -610,7 +610,7 @@ fn glob_match_impl(pattern: &[u8], value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{glob_match, matches_host_patterns, parse_config, Directive};
+    use super::{Directive, glob_match, matches_host_patterns, parse_config};
 
     #[test]
     fn parser_handles_known_and_unknown_directives() {

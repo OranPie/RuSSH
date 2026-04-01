@@ -102,10 +102,7 @@ fn parse_openssh_private_key_with_passphrase(
         let passphrase = passphrase.ok_or("key is encrypted; passphrase required")?;
         decrypt_private_section(cipher, kdfopts, passphrase, priv_blob_encrypted)?
     } else {
-        return Err(format!(
-            "unsupported KDF: {}",
-            String::from_utf8_lossy(kdf)
-        ));
+        return Err(format!("unsupported KDF: {}", String::from_utf8_lossy(kdf)));
     };
 
     let mut poff = 0usize;
@@ -237,7 +234,7 @@ fn decrypt_private_section(
             return Err(format!(
                 "unsupported cipher for encrypted key: {}",
                 String::from_utf8_lossy(cipher_name)
-            ))
+            ));
         }
     };
 
@@ -265,7 +262,7 @@ fn decrypt_private_section(
             return Err(format!(
                 "CBC cipher for encrypted keys is not yet supported ({})",
                 String::from_utf8_lossy(cipher_name)
-            ))
+            ));
         }
         _ => return Err("unsupported cipher".into()),
     }

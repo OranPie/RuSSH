@@ -3120,6 +3120,73 @@ impl SshServerConnection {
                                     }
                                 }
                             }
+                        } else if request_name == "streamlocal-forward@openssh.com" {
+                            #[cfg(unix)]
+                            {
+                                let name_len = u32::from_be_bytes([
+                                    frame.payload[1],
+                                    frame.payload[2],
+                                    frame.payload[3],
+                                    frame.payload[4],
+                                ]) as usize;
+                                let data_start = 5 + name_len + 1;
+                                let data = &frame.payload[data_start..];
+                                // Streamlocal forward data is a single SSH string (socket path).
+                                if data.len() >= 4 {
+                                    let path_len =
+                                        u32::from_be_bytes([data[0], data[1], data[2], data[3]])
+                                            as usize;
+                                    if data.len() >= 4 + path_len {
+                                        let socket_path =
+                                            String::from_utf8_lossy(&data[4..4 + path_len])
+                                                .to_string();
+                                        let _ = std::fs::remove_file(&socket_path);
+                                        match tokio::net::UnixListener::bind(&socket_path) {
+                                            Ok(_listener) => {
+                                                info!(
+                                                    socket_path,
+                                                    "streamlocal-forward: listener bound"
+                                                );
+                                                if want_reply {
+                                                    let _ = self
+                                                        .stream
+                                                        .write_packet(&PacketFrame::new(vec![81]))
+                                                        .await;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    error = %e,
+                                                    "streamlocal-forward: bind failed"
+                                                );
+                                                if want_reply {
+                                                    let _ = self
+                                                        .stream
+                                                        .write_packet(&PacketFrame::new(vec![82]))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                    } else if want_reply {
+                                        let _ = self
+                                            .stream
+                                            .write_packet(&PacketFrame::new(vec![82]))
+                                            .await;
+                                    }
+                                } else if want_reply {
+                                    let _ =
+                                        self.stream.write_packet(&PacketFrame::new(vec![82])).await;
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            if want_reply {
+                                let _ = self.stream.write_packet(&PacketFrame::new(vec![82])).await;
+                            }
+                        } else if request_name == "cancel-streamlocal-forward@openssh.com" {
+                            // Stub: acknowledge the request but don't track listeners yet.
+                            if want_reply {
+                                let _ = self.stream.write_packet(&PacketFrame::new(vec![81])).await;
+                            }
                         } else if want_reply {
                             let reply = if request_name == "keepalive@openssh.com" {
                                 81
@@ -3156,35 +3223,134 @@ impl SshServerConnection {
                     };
                     match msg {
                         ChannelMessage::Open {
+                            channel_type,
                             sender_channel: client_ch,
                             initial_window_size,
                             maximum_packet_size,
-                            ..
+                            extra_data,
                         } => {
-                            let our_id = next_server_id;
-                            next_server_id += 1;
-                            debug!(client_ch, our_id, "channel opened");
-                            server_channels.insert(
-                                client_ch,
-                                ServerChannelState {
-                                    is_sftp: false,
-                                    scp_root: None,
-                                    sftp_server: None,
-                                    sftp_framer: SftpFramer::new(),
-                                    pty_requested: false,
-                                    pty_size: None,
-                                    pty_term: None,
-                                    env: Vec::new(),
-                                    agent_forwarding_requested: false,
-                                },
-                            );
-                            let confirm = ChannelMessage::OpenConfirmation {
-                                recipient_channel: client_ch,
-                                sender_channel: our_id,
-                                initial_window_size,
-                                maximum_packet_size,
-                            };
-                            self.stream.write_packet(&confirm.to_frame()?).await?;
+                            // Handle direct-streamlocal@openssh.com: connect to a
+                            // local Unix domain socket and relay the channel.
+                            #[cfg(unix)]
+                            if channel_type == "direct-streamlocal@openssh.com" {
+                                let our_id = next_server_id;
+                                next_server_id += 1;
+                                match ForwardHandle::parse_direct_streamlocal_extra(&extra_data) {
+                                    Ok(socket_path) => {
+                                        match tokio::net::UnixStream::connect(&socket_path).await {
+                                            Ok(mut unix_stream) => {
+                                                debug!(
+                                                    socket_path,
+                                                    client_ch,
+                                                    our_id,
+                                                    "direct-streamlocal: connected"
+                                                );
+                                                let confirm = ChannelMessage::OpenConfirmation {
+                                                    recipient_channel: client_ch,
+                                                    sender_channel: our_id,
+                                                    initial_window_size,
+                                                    maximum_packet_size,
+                                                };
+                                                self.stream
+                                                    .write_packet(&confirm.to_frame()?)
+                                                    .await?;
+                                                let _ = self
+                                                    .relay_server_unix_channel(
+                                                        our_id,
+                                                        client_ch,
+                                                        &mut unix_stream,
+                                                    )
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    error = %e,
+                                                    socket_path,
+                                                    "direct-streamlocal: connect failed"
+                                                );
+                                                let fail = ChannelMessage::OpenFailure {
+                                                    recipient_channel: client_ch,
+                                                    reason: russh_channel::ChannelOpenFailureReason::ConnectFailed,
+                                                    description: format!(
+                                                        "connect to {socket_path} failed: {e}"
+                                                    ),
+                                                };
+                                                self.stream.write_packet(&fail.to_frame()?).await?;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            "direct-streamlocal: parse extra failed"
+                                        );
+                                        let fail = ChannelMessage::OpenFailure {
+                                            recipient_channel: client_ch,
+                                            reason: russh_channel::ChannelOpenFailureReason::ConnectFailed,
+                                            description: format!("bad streamlocal extra data: {e}"),
+                                        };
+                                        self.stream.write_packet(&fail.to_frame()?).await?;
+                                    }
+                                }
+                                // Skip normal session channel setup for streamlocal.
+                            } else {
+                                let _ = &channel_type; // suppress unused warning
+                                let _ = &extra_data;
+                                let our_id = next_server_id;
+                                next_server_id += 1;
+                                debug!(client_ch, our_id, "channel opened");
+                                server_channels.insert(
+                                    client_ch,
+                                    ServerChannelState {
+                                        is_sftp: false,
+                                        scp_root: None,
+                                        sftp_server: None,
+                                        sftp_framer: SftpFramer::new(),
+                                        pty_requested: false,
+                                        pty_size: None,
+                                        pty_term: None,
+                                        env: Vec::new(),
+                                        agent_forwarding_requested: false,
+                                    },
+                                );
+                                let confirm = ChannelMessage::OpenConfirmation {
+                                    recipient_channel: client_ch,
+                                    sender_channel: our_id,
+                                    initial_window_size,
+                                    maximum_packet_size,
+                                };
+                                self.stream.write_packet(&confirm.to_frame()?).await?;
+                            }
+
+                            #[cfg(not(unix))]
+                            {
+                                let _ = &channel_type;
+                                let _ = &extra_data;
+                                let our_id = next_server_id;
+                                next_server_id += 1;
+                                debug!(client_ch, our_id, "channel opened");
+                                server_channels.insert(
+                                    client_ch,
+                                    ServerChannelState {
+                                        is_sftp: false,
+                                        scp_root: None,
+                                        sftp_server: None,
+                                        sftp_framer: SftpFramer::new(),
+                                        pty_requested: false,
+                                        pty_size: None,
+                                        pty_term: None,
+                                        env: Vec::new(),
+                                        agent_forwarding_requested: false,
+                                    },
+                                );
+                                let confirm = ChannelMessage::OpenConfirmation {
+                                    recipient_channel: client_ch,
+                                    sender_channel: our_id,
+                                    initial_window_size,
+                                    maximum_packet_size,
+                                };
+                                self.stream.write_packet(&confirm.to_frame()?).await?;
+                            }
                         }
 
                         ChannelMessage::Request {
@@ -3489,6 +3655,70 @@ impl SshServerConnection {
             }
         }
         // Send EOF + CLOSE on the forwarded channel.
+        let _ = self
+            .stream
+            .write_packet(
+                &ChannelMessage::Eof {
+                    recipient_channel: client_ch,
+                }
+                .to_frame()?,
+            )
+            .await;
+        let _ = self
+            .stream
+            .write_packet(
+                &ChannelMessage::Close {
+                    recipient_channel: client_ch,
+                }
+                .to_frame()?,
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Drive bidirectional I/O between a Unix domain socket stream and an SSH
+    /// channel (server side).
+    #[cfg(unix)]
+    async fn relay_server_unix_channel(
+        &mut self,
+        _our_id: u32,
+        client_ch: u32,
+        unix: &mut tokio::net::UnixStream,
+    ) -> Result<(), RusshError> {
+        let (mut unix_rx, mut unix_tx) = unix.split();
+        let mut buf = vec![0u8; 32768];
+
+        loop {
+            tokio::select! {
+                n = unix_rx.read(&mut buf) => {
+                    let n = match n {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let frame = channel_data_frame(client_ch, &buf[..n]);
+                    if self.stream.write_packet(&frame).await.is_err() {
+                        break;
+                    }
+                }
+                frame_res = self.stream.read_packet() => {
+                    let frame = match frame_res {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                    match ChannelMessage::from_bytes(&frame.payload) {
+                        Ok(ChannelMessage::Data { data, .. }) => {
+                            if unix_tx.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(ChannelMessage::WindowAdjust { .. }) => {}
+                        Ok(ChannelMessage::Eof { .. })
+                        | Ok(ChannelMessage::Close { .. }) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
         let _ = self
             .stream
             .write_packet(
