@@ -1,4 +1,67 @@
-# RuSSH Implementation Status — v0.5
+# RuSSH Implementation Status — v0.7
+
+## Delivered in v0.7
+
+### SSH_MSG_DEBUG handling (`russh-transport`)
+- `SSH_MSG_DEBUG` (type 4) packets decoded and passed to `EventSink::on_debug_message()`
+- `always_display` flag and language tag preserved; debug messages no longer silently dropped
+
+### Config Include directive (`russh-config`)
+- `Include` directive with glob pattern expansion, `~` tilde expansion, and recursive depth limiting (default 16, prevents circular includes)
+- A→B→A circular includes and self-includes are detected and halted at the depth limit
+- Missing or empty glob matches produce warnings, not errors
+
+### SFTP fsetstat / setstat (`russh-sftp`)
+- `SSH_FXP_FSETSTAT` (opcode 10): set attributes on an open file handle
+- `SSH_FXP_SETSTAT` (opcode 9): set attributes by path; permission bits, timestamps applied via `std::fs`
+
+### TCP keepalive (`russh-net`)
+- `SO_KEEPALIVE` set on both client and server TCP sockets via `socket2` crate
+- Applied at socket level before `TcpStream` is handed to the transport layer
+
+### tcpip-forward lifecycle tracking (`russh-net`)
+- Active forward listener registry: maps bind address to `JoinHandle` + cancel token
+- `cancel-tcpip-forward` tears down the registered listener atomically
+- Prevents dangling listeners on session close
+
+### Observability wiring (`russh-net`, `russh-observability`)
+- `EventSink` and `MetricsHook` traits now threaded through `SshClientConnection` and `SshServerConnection`
+- Per-connection event emission: connect, auth, channel open/close, forward, error
+- `TracingEventSink` (feature `tracing`) and `MetricsEventSink` (feature `metrics`) available as drop-in implementations
+
+### SOCKS proxy wiring (`russh-channel`, `russh-net`)
+- SOCKS4/5 handshake fully wired: SOCKS request parsed → `direct-tcpip` channel opened to target → bidirectional relay
+- SOCKS5 domain names resolved server-side through the SSH connection
+- SOCKS4a domain support
+
+## Delivered in v0.6
+
+### Encrypted private key support (`russh-cli`, `russh-crypto`)
+- `-----BEGIN OPENSSH PRIVATE KEY-----` format with bcrypt-pbkdf KDF passphrase decryption
+- RUSSH-SEED-V1 format for Ed25519 identity files (raw 32-byte seed)
+- CLI passphrase prompt for encrypted keys via `read_passphrase()`
+
+### Wider algorithm support (`russh-crypto`, `russh-transport`)
+- **Host key algorithms**: ECDSA P-384 (`ecdsa-sha2-nistp384`) and P-521 (`ecdsa-sha2-nistp521`) signers and verifiers
+- **Key exchange**: `diffie-hellman-group16-sha512` (4096-bit MODP, RFC 3526 §4) and `diffie-hellman-group18-sha512` (8192-bit MODP, RFC 3526 §6); SHA-512 used for both exchange hash and key derivation
+- **Certificates**: `OpenSshCertificate` generalized to support Ed25519, RSA, and ECDSA cert key types; serializes/deserializes cert public key block per key algorithm
+
+### Server hardening (`russh-auth`, `russh-config`, `russh-net`)
+- **AllowUsers / DenyUsers**: Parsed from SSH config; enforced in `ServerAuthPolicy` before auth succeeds (DenyUsers takes precedence over AllowUsers)
+- **LoginGraceTime**: 120s default; `tokio::time::timeout` wraps the entire authentication phase; configurable via `LoginGraceTime` directive
+- **`cancel-tcpip-forward`**: Global request handler tears down the active TCP listener registered for that bind address, returns success/failure response
+
+### Advanced forwarding (`russh-net`, `russh-channel`, `russh-cli`)
+- **GSSAPI scaffolding**: `AuthMethod::GssapiWithMic` variant; method name `gssapi-with-mic`; infrastructure for future Kerberos wiring
+- **Unix socket forwarding**: `direct-streamlocal@openssh.com` channel type; `ForwardHandle::streamlocal()` constructor; `parse_direct_streamlocal_extra()` for socket path extraction
+- **SOCKS4/5 proxy**: `-D [bind:]port` flag spawns local TCP listener; `socks.rs` module parses SOCKS4 (IP + userid) and SOCKS5 (IP/domain/IPv6) CONNECT requests; relays over `direct-tcpip` channel
+- **Remote port forwarding**: `-R [bind:]port:host:hostport` global request; `tcpip-forward` request/response; server-side channel opens forwarded connections back to client
+
+### CLI flags (`russh-cli`)
+- `-N` — No remote commands; keeps connection alive for port forwarding (uses `tokio::signal::ctrl_c()` to block)
+- `-f` — Background mode; detaches process after authentication completes
+- `-D [bind:]port` — Dynamic SOCKS4/5 proxy
+- `-R [bind:]port:host:hostport` — Remote port forwarding
 
 ## Delivered in v0.5
 
@@ -279,15 +342,18 @@ All four cross-implementation integration tests now pass:
 ### CI
 - Format, clippy, test matrix: Ubuntu / macOS / Windows × stable Rust 1.89
 
-## Test coverage
+## Test coverage (current)
 
-258 tests across all workspace crates, all passing.
+495 tests across all workspace crates, all passing, 0 unsafe blocks.
 
 ## Pending for future releases
 
-- Remote port forwarding (`-R` / `tcpip-forward` global request)
-- ControlMaster mux-socket protocol
-- Certificate (OpenSSH cert format) chain validation beyond single CA
+- ControlMaster mux-socket protocol (mux-client wire format, `ControlMaster auto/ask`)
+- X11 forwarding (`x11-req` channel request, `x11` channel type, `DISPLAY` injection)
+- Hostbased authentication (`hostbased` auth method, `/etc/ssh/ssh_known_hosts` lookup)
+- ProxyCommand support (spawn subprocess, relay over stdio)
+- Formal GSSAPI / Kerberos wiring (replace scaffolding with real `libgssapi` or `sspi` backend)
+- Certificate chain validation beyond single CA (intermediate CA support)
 - Performance benchmark harness (handshake/s, MB/s throughput)
 - Corpus-based fuzz campaigns with coverage metrics
 - Constant-time audit by external reviewer
