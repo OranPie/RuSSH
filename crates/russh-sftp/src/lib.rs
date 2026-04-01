@@ -4,7 +4,7 @@
 //!
 //! [`SftpWirePacket`] encodes and decodes all SFTP v3 wire packets:
 //! - **Client→Server**: INIT, OPEN, CLOSE, READ, WRITE, LSTAT, FSTAT,
-//!   SETSTAT, OPENDIR, READDIR, REMOVE, MKDIR, RMDIR, REALPATH, STAT, RENAME,
+//!   SETSTAT, FSETSTAT, OPENDIR, READDIR, REMOVE, MKDIR, RMDIR, REALPATH, STAT, RENAME,
 //!   READLINK, SYMLINK
 //! - **Server→Client**: VERSION, STATUS, HANDLE, DATA, NAME, ATTRS
 //!
@@ -701,6 +701,11 @@ pub enum SftpWirePacket {
         path: String,
         attrs: FileAttrs,
     },
+    Fsetstat {
+        id: u32,
+        handle: Vec<u8>,
+        attrs: FileAttrs,
+    },
     Opendir {
         id: u32,
         path: String,
@@ -859,6 +864,12 @@ impl SftpWirePacket {
                 body.push(sftp_type::SETSTAT);
                 sftp_write_u32(&mut body, *id);
                 sftp_write_string(&mut body, path.as_bytes());
+                body.extend_from_slice(&attrs.encode());
+            }
+            Self::Fsetstat { id, handle, attrs } => {
+                body.push(sftp_type::FSETSTAT);
+                sftp_write_u32(&mut body, *id);
+                sftp_write_string(&mut body, handle);
                 body.extend_from_slice(&attrs.encode());
             }
             Self::Opendir { id, path } => {
@@ -1076,6 +1087,12 @@ impl SftpWirePacket {
                 let attrs = FileAttrs::decode(data, &mut off)?;
                 Self::Setstat { id, path, attrs }
             }
+            sftp_type::FSETSTAT => {
+                let id = sftp_read_u32(data, &mut off)?;
+                let handle = sftp_read_string(data, &mut off)?;
+                let attrs = FileAttrs::decode(data, &mut off)?;
+                Self::Fsetstat { id, handle, attrs }
+            }
             sftp_type::OPENDIR => {
                 let id = sftp_read_u32(data, &mut off)?;
                 let path = sftp_read_utf8(data, &mut off)?;
@@ -1218,7 +1235,7 @@ impl SftpWirePacket {
 // ---------------------------------------------------------------------------
 
 enum SftpHandle {
-    File(fs::File),
+    File(fs::File, PathBuf),
     Dir(ReadDirState),
 }
 
@@ -1480,7 +1497,7 @@ impl SftpFileServer {
         let mut off = 0;
         let handle = sftp_read_string(data, &mut off)?;
         match self.handles.get(&handle) {
-            Some(SftpHandle::File(file)) => match file.sync_all() {
+            Some(SftpHandle::File(file, _)) => match file.sync_all() {
                 Ok(_) => Ok(Self::status_ok(id)),
                 Err(e) => Ok(Self::status_err(id, &e)),
             },
@@ -1490,6 +1507,27 @@ impl SftpFileServer {
                 message: "invalid handle".to_string(),
             }),
         }
+    }
+
+    /// Apply file attributes to a filesystem path.
+    fn apply_attrs(path: &Path, attrs: &FileAttrs) -> std::io::Result<()> {
+        if let Some(size) = attrs.size {
+            let file = fs::OpenOptions::new().write(true).open(path)?;
+            file.set_len(size)?;
+        }
+        #[cfg(unix)]
+        if let Some(perm) = attrs.permissions {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(perm))?;
+        }
+        if let (Some(atime), Some(mtime)) = (attrs.atime, attrs.mtime) {
+            filetime::set_file_times(
+                path,
+                filetime::FileTime::from_unix_time(i64::from(atime), 0),
+                filetime::FileTime::from_unix_time(i64::from(mtime), 0),
+            )?;
+        }
+        Ok(())
     }
 
     /// Process a request packet and return the response packet.
@@ -1544,7 +1582,8 @@ impl SftpFileServer {
                 match result {
                     Ok(file) => {
                         let handle = self.alloc_handle();
-                        self.handles.insert(handle.clone(), SftpHandle::File(file));
+                        self.handles
+                            .insert(handle.clone(), SftpHandle::File(file, full_path));
                         Ok(SftpWirePacket::Handle { id, handle })
                     }
                     Err(e) => Ok(Self::status_err(id, &e)),
@@ -1567,7 +1606,7 @@ impl SftpFileServer {
                 let offset = *offset;
                 let max = *len as usize;
                 match self.handles.get_mut(handle) {
-                    Some(SftpHandle::File(file)) => match file.seek(SeekFrom::Start(offset)) {
+                    Some(SftpHandle::File(file, _)) => match file.seek(SeekFrom::Start(offset)) {
                         Err(e) => Ok(Self::status_err(id, &e)),
                         Ok(_) => {
                             let mut buf = vec![0u8; max];
@@ -1602,7 +1641,7 @@ impl SftpFileServer {
                 let id = *id;
                 let offset = *offset;
                 match self.handles.get_mut(handle) {
-                    Some(SftpHandle::File(file)) => match file.seek(SeekFrom::Start(offset)) {
+                    Some(SftpHandle::File(file, _)) => match file.seek(SeekFrom::Start(offset)) {
                         Err(e) => Ok(Self::status_err(id, &e)),
                         Ok(_) => match file.write_all(data) {
                             Err(e) => Ok(Self::status_err(id, &e)),
@@ -1638,11 +1677,41 @@ impl SftpFileServer {
             SftpWirePacket::Fstat { id, handle } => {
                 let id = *id;
                 match self.handles.get(handle) {
-                    Some(SftpHandle::File(file)) => match file.metadata() {
+                    Some(SftpHandle::File(file, _)) => match file.metadata() {
                         Ok(meta) => Ok(SftpWirePacket::AttrsReply {
                             id,
                             attrs: FileAttrs::from_fs_metadata(&meta),
                         }),
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                    },
+                    _ => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::Failure,
+                        message: "invalid handle".to_string(),
+                    }),
+                }
+            }
+
+            SftpWirePacket::Setstat { id, path, attrs } => {
+                let id = *id;
+                match self.resolve_path_checked(path, false) {
+                    Err(_) => Ok(SftpWirePacket::Status {
+                        id,
+                        status: SftpStatus::PermissionDenied,
+                        message: "path escapes root".to_string(),
+                    }),
+                    Ok(full_path) => match Self::apply_attrs(&full_path, attrs) {
+                        Ok(()) => Ok(Self::status_ok(id)),
+                        Err(e) => Ok(Self::status_err(id, &e)),
+                    },
+                }
+            }
+
+            SftpWirePacket::Fsetstat { id, handle, attrs } => {
+                let id = *id;
+                match self.handles.get(handle) {
+                    Some(SftpHandle::File(_, path)) => match Self::apply_attrs(path, attrs) {
+                        Ok(()) => Ok(Self::status_ok(id)),
                         Err(e) => Ok(Self::status_err(id, &e)),
                     },
                     _ => Ok(SftpWirePacket::Status {
@@ -2518,6 +2587,202 @@ mod tests {
                 assert_eq!(*status, SftpStatus::Unsupported);
             }
             other => panic!("expected Status Unsupported, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn setstat_sets_permissions_on_path() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_setstat_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Create a file via SFTP
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "target.txt".to_string(),
+                pflags: super::open_flags::WRITE | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+        server
+            .process(&SftpWirePacket::Write {
+                id: 2,
+                handle: handle.clone(),
+                offset: 0,
+                data: b"hello".to_vec(),
+            })
+            .expect("write should succeed");
+        server
+            .process(&SftpWirePacket::Close { id: 3, handle })
+            .expect("close should succeed");
+
+        // Apply setstat with permissions
+        let response = server
+            .process(&SftpWirePacket::Setstat {
+                id: 4,
+                path: "target.txt".to_string(),
+                attrs: super::FileAttrs {
+                    permissions: Some(0o644),
+                    ..Default::default()
+                },
+            })
+            .expect("setstat should succeed");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 4);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(root.join("target.txt")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn fsetstat_on_open_handle_succeeds() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_fsetstat_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Open a file for writing
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "fsetstat_file.txt".to_string(),
+                pflags: super::open_flags::WRITE | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+
+        // Write some data
+        server
+            .process(&SftpWirePacket::Write {
+                id: 2,
+                handle: handle.clone(),
+                offset: 0,
+                data: b"hello world".to_vec(),
+            })
+            .expect("write should succeed");
+
+        // Fsetstat: set permissions via handle
+        let response = server
+            .process(&SftpWirePacket::Fsetstat {
+                id: 3,
+                handle: handle.clone(),
+                attrs: super::FileAttrs {
+                    permissions: Some(0o600),
+                    ..Default::default()
+                },
+            })
+            .expect("fsetstat should succeed");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 3);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        // Verify permissions were applied
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = fs::metadata(root.join("fsetstat_file.txt")).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+
+        // Fsetstat: truncate via handle
+        let response = server
+            .process(&SftpWirePacket::Fsetstat {
+                id: 4,
+                handle: handle.clone(),
+                attrs: super::FileAttrs {
+                    size: Some(5),
+                    ..Default::default()
+                },
+            })
+            .expect("fsetstat truncate should succeed");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 4);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        // Close and verify truncation
+        server
+            .process(&SftpWirePacket::Close {
+                id: 5,
+                handle: handle.clone(),
+            })
+            .expect("close should succeed");
+
+        let content = fs::read(root.join("fsetstat_file.txt")).unwrap();
+        assert_eq!(content, b"hello");
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn fsetstat_invalid_handle_returns_failure() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_fsetstat_bad_handle_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        let response = server
+            .process(&SftpWirePacket::Fsetstat {
+                id: 1,
+                handle: vec![0xFF, 0xFF, 0xFF, 0xFF],
+                attrs: super::FileAttrs {
+                    permissions: Some(0o644),
+                    ..Default::default()
+                },
+            })
+            .expect("fsetstat with bad handle should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*status, SftpStatus::Failure);
+            }
+            other => panic!("expected Status Failure, got: {other:?}"),
         }
 
         fs::remove_dir_all(&root).expect("cleanup should succeed");

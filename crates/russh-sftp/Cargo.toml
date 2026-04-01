@@ -13,3 +13,4 @@ workspace = true
 [dependencies]
 russh-core = { path = "../russh-core" }
 russh-channel = { path = "../russh-channel" }
+filetime = { workspace = true }
