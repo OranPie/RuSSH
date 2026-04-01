@@ -23,6 +23,10 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 crossterm = "0.28"
+bcrypt-pbkdf = { workspace = true }
+aes = { workspace = true }
+ctr = { workspace = true }
+zeroize = { workspace = true }
 
 [[bin]]
 name = "russh"

@@ -22,7 +22,18 @@ pub enum ParsedPrivateKey {
 /// - ECDSA P-256 (`ecdsa-sha2-nistp256`)
 /// - RSA (`ssh-rsa`)
 /// - RuSSH compact seed format (`RUSSH-SEED-V1\n` + 32 raw bytes, Ed25519 only)
+///
+/// For encrypted keys, pass `passphrase`. If `None` and the key is encrypted,
+/// returns an error.
 pub fn load_private_key(path: &std::path::Path) -> Result<ParsedPrivateKey, String> {
+    load_private_key_with_passphrase(path, None)
+}
+
+/// Load a private key, decrypting with the given passphrase if encrypted.
+pub fn load_private_key_with_passphrase(
+    path: &std::path::Path,
+    passphrase: Option<&[u8]>,
+) -> Result<ParsedPrivateKey, String> {
     let raw = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
     // Detect compact seed format: b"RUSSH-SEED-V1\n" (14 bytes) + 32 bytes seed.
@@ -41,7 +52,8 @@ pub fn load_private_key(path: &std::path::Path) -> Result<ParsedPrivateKey, Stri
     let text = std::str::from_utf8(&raw).map_err(|_| "key file is not valid UTF-8".to_string())?;
     let b64: String = text.lines().filter(|l| !l.starts_with("-----")).collect();
     let decoded = base64_decode(&b64).map_err(|e| format!("base64 decode failed: {e}"))?;
-    parse_openssh_private_key(&decoded).map_err(|e| format!("key parse failed: {e}"))
+    parse_openssh_private_key_with_passphrase(&decoded, passphrase)
+        .map_err(|e| format!("key parse failed: {e}"))
 }
 
 /// Parse an unencrypted OpenSSH Ed25519 private key file and return the 32-byte seed.
@@ -54,23 +66,24 @@ pub fn load_ed25519_seed(path: &std::path::Path) -> Result<[u8; 32], String> {
     }
 }
 
-fn parse_openssh_private_key(raw: &[u8]) -> Result<ParsedPrivateKey, &'static str> {
+#[cfg(test)]
+fn parse_openssh_private_key(raw: &[u8]) -> Result<ParsedPrivateKey, String> {
+    parse_openssh_private_key_with_passphrase(raw, None)
+}
+
+fn parse_openssh_private_key_with_passphrase(
+    raw: &[u8],
+    passphrase: Option<&[u8]>,
+) -> Result<ParsedPrivateKey, String> {
     let magic = b"openssh-key-v1\0";
     if !raw.starts_with(magic) {
-        return Err("missing openssh-key-v1 magic");
+        return Err("missing openssh-key-v1 magic".into());
     }
     let mut off = magic.len();
 
-    // ciphername, kdfname, kdfoptions — must all be "none" / ""
     let cipher = read_ssh_string(raw, &mut off).ok_or("truncated: ciphername")?;
-    if cipher != b"none" {
-        return Err("encrypted private keys are not yet supported");
-    }
     let kdf = read_ssh_string(raw, &mut off).ok_or("truncated: kdfname")?;
-    if kdf != b"none" {
-        return Err("encrypted private keys are not yet supported");
-    }
-    let _kdfopts = read_ssh_string(raw, &mut off).ok_or("truncated: kdfoptions")?;
+    let kdfopts = read_ssh_string(raw, &mut off).ok_or("truncated: kdfoptions")?;
 
     // number of keys (uint32)
     let _nkeys = read_u32(raw, &mut off).ok_or("truncated: nkeys")?;
@@ -79,24 +92,39 @@ fn parse_openssh_private_key(raw: &[u8]) -> Result<ParsedPrivateKey, &'static st
     let _pubkey = read_ssh_string(raw, &mut off).ok_or("truncated: pubkey blob")?;
 
     // private section blob
-    let priv_blob = read_ssh_string(raw, &mut off).ok_or("truncated: private blob")?;
+    let priv_blob_encrypted = read_ssh_string(raw, &mut off).ok_or("truncated: private blob")?;
+
+    let priv_blob: Vec<u8> = if cipher == b"none" && kdf == b"none" {
+        priv_blob_encrypted.to_vec()
+    } else if kdf == b"bcrypt" {
+        let passphrase = passphrase.ok_or("key is encrypted; passphrase required")?;
+        decrypt_private_section(cipher, kdfopts, passphrase, priv_blob_encrypted)?
+    } else {
+        return Err(format!(
+            "unsupported KDF: {}",
+            String::from_utf8_lossy(kdf)
+        ));
+    };
+
     let mut poff = 0usize;
 
     // check1, check2
-    let check1 = read_u32(priv_blob, &mut poff).ok_or("truncated: check1")?;
-    let check2 = read_u32(priv_blob, &mut poff).ok_or("truncated: check2")?;
+    let check1 = read_u32(&priv_blob, &mut poff).ok_or("truncated: check1")?;
+    let check2 = read_u32(&priv_blob, &mut poff).ok_or("truncated: check2")?;
     if check1 != check2 {
-        return Err("check values mismatch (wrong passphrase or corrupt key)");
+        return Err("check values mismatch (wrong passphrase or corrupt key)".into());
     }
 
     // key type string — dispatch on type
-    let keytype = read_ssh_string(priv_blob, &mut poff).ok_or("truncated: keytype")?;
+    let keytype = read_ssh_string(&priv_blob, &mut poff).ok_or("truncated: keytype")?;
 
     match keytype {
-        b"ssh-ed25519" => parse_ed25519_private(priv_blob, &mut poff),
-        b"ecdsa-sha2-nistp256" => parse_ecdsa_p256_private(priv_blob, &mut poff),
-        b"ssh-rsa" => parse_rsa_private(priv_blob, &mut poff),
-        _ => Err("unsupported key type"),
+        b"ssh-ed25519" => parse_ed25519_private(&priv_blob, &mut poff).map_err(|e| e.into()),
+        b"ecdsa-sha2-nistp256" => {
+            parse_ecdsa_p256_private(&priv_blob, &mut poff).map_err(|e| e.into())
+        }
+        b"ssh-rsa" => parse_rsa_private(&priv_blob, &mut poff).map_err(|e| e.into()),
+        _ => Err("unsupported key type".into()),
     }
 }
 
@@ -163,6 +191,70 @@ fn parse_rsa_private(priv_blob: &[u8], poff: &mut usize) -> Result<ParsedPrivate
         p: strip_leading_zeros(p),
         q: strip_leading_zeros(q),
     })
+}
+
+/// Decrypt the private section of an OpenSSH encrypted key.
+///
+/// Supports aes256-ctr and aes256-cbc ciphers with bcrypt KDF.
+fn decrypt_private_section(
+    cipher_name: &[u8],
+    kdfopts: &[u8],
+    passphrase: &[u8],
+    encrypted: &[u8],
+) -> Result<Vec<u8>, String> {
+    use aes::cipher::KeyIvInit;
+    use zeroize::Zeroize;
+
+    // Parse KDF options: string(salt) || uint32(rounds)
+    let mut koff = 0usize;
+    let salt = read_ssh_string(kdfopts, &mut koff).ok_or("truncated: KDF salt")?;
+    let rounds = read_u32(kdfopts, &mut koff).ok_or("truncated: KDF rounds")?;
+
+    // Determine key_len and iv_len from cipher
+    let (key_len, iv_len) = match cipher_name {
+        b"aes256-ctr" | b"aes256-cbc" => (32, 16),
+        b"aes128-ctr" | b"aes128-cbc" => (16, 16),
+        _ => {
+            return Err(format!(
+                "unsupported cipher for encrypted key: {}",
+                String::from_utf8_lossy(cipher_name)
+            ))
+        }
+    };
+
+    // Derive key material via bcrypt-pbkdf
+    let mut derived = vec![0u8; key_len + iv_len];
+    bcrypt_pbkdf::bcrypt_pbkdf(passphrase, salt, rounds, &mut derived)
+        .map_err(|e| format!("bcrypt-pbkdf failed: {e}"))?;
+    let key = &derived[..key_len];
+    let iv = &derived[key_len..];
+
+    // Decrypt
+    let mut plaintext = encrypted.to_vec();
+    match cipher_name {
+        b"aes256-ctr" => {
+            type Aes256Ctr = ctr::Ctr64BE<aes::Aes256>;
+            let mut cipher = Aes256Ctr::new(key.into(), iv.into());
+            aes::cipher::StreamCipher::apply_keystream(&mut cipher, &mut plaintext);
+        }
+        b"aes128-ctr" => {
+            type Aes128Ctr = ctr::Ctr64BE<aes::Aes128>;
+            let mut cipher = Aes128Ctr::new(key.into(), iv.into());
+            aes::cipher::StreamCipher::apply_keystream(&mut cipher, &mut plaintext);
+        }
+        b"aes256-cbc" | b"aes128-cbc" => {
+            return Err(format!(
+                "CBC cipher for encrypted keys is not yet supported ({})",
+                String::from_utf8_lossy(cipher_name)
+            ))
+        }
+        _ => return Err("unsupported cipher".into()),
+    }
+
+    // Zeroize derived key material
+    derived.zeroize();
+
+    Ok(plaintext)
 }
 
 fn read_u32(buf: &[u8], off: &mut usize) -> Option<u32> {
@@ -485,17 +577,160 @@ AwQFBg==
     }
 
     #[test]
-    fn reject_encrypted_key() {
-        // Craft a minimal header with cipher != "none"
-        let mut data = Vec::new();
-        data.extend_from_slice(b"openssh-key-v1\0");
-        // ciphername = "aes256-ctr"
-        let cipher = b"aes256-ctr";
-        data.extend_from_slice(&(cipher.len() as u32).to_be_bytes());
-        data.extend_from_slice(cipher);
-        let result = parse_openssh_private_key(&data);
+    fn reject_encrypted_key_without_passphrase() {
+        // Generate an encrypted ed25519 key with ssh-keygen
+        let tmp = std::env::temp_dir().join("russh_test_encrypted_reject");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-f"])
+            .arg(&tmp)
+            .args(["-N", "testpassword", "-q"])
+            .status()
+            .expect("ssh-keygen not found");
+        assert!(status.success());
+        // Loading without passphrase should fail
+        let result = load_private_key(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("encrypted"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("passphrase"),
+            "expected 'passphrase' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decrypt_encrypted_ed25519_key() {
+        let tmp = std::env::temp_dir().join("russh_test_encrypted_ed25519");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        let passphrase = "test-passphrase-123";
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-f"])
+            .arg(&tmp)
+            .args(["-N", passphrase, "-q"])
+            .status()
+            .expect("ssh-keygen not found");
+        assert!(status.success());
+        // Correct passphrase should succeed
+        let key = load_private_key_with_passphrase(&tmp, Some(passphrase.as_bytes()))
+            .expect("failed to decrypt with correct passphrase");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        match key {
+            ParsedPrivateKey::Ed25519(seed) => {
+                assert_ne!(seed, [0u8; 32], "seed should not be all zeros");
+            }
+            _ => panic!("expected Ed25519 key"),
+        }
+    }
+
+    #[test]
+    fn decrypt_encrypted_rsa_key() {
+        let tmp = std::env::temp_dir().join("russh_test_encrypted_rsa");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        let passphrase = "rsa-test-pass";
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "rsa", "-b", "2048", "-f"])
+            .arg(&tmp)
+            .args(["-N", passphrase, "-q"])
+            .status()
+            .expect("ssh-keygen not found");
+        assert!(status.success());
+        let key = load_private_key_with_passphrase(&tmp, Some(passphrase.as_bytes()))
+            .expect("failed to decrypt RSA key");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        match key {
+            ParsedPrivateKey::Rsa { n, e, d, .. } => {
+                assert!(!n.is_empty());
+                assert!(!e.is_empty());
+                assert!(!d.is_empty());
+            }
+            _ => panic!("expected RSA key"),
+        }
+    }
+
+    #[test]
+    fn decrypt_encrypted_ecdsa_key() {
+        let tmp = std::env::temp_dir().join("russh_test_encrypted_ecdsa");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        let passphrase = "ecdsa-test-pass";
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "ecdsa", "-b", "256", "-f"])
+            .arg(&tmp)
+            .args(["-N", passphrase, "-q"])
+            .status()
+            .expect("ssh-keygen not found");
+        assert!(status.success());
+        let key = load_private_key_with_passphrase(&tmp, Some(passphrase.as_bytes()))
+            .expect("failed to decrypt ECDSA key");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        match key {
+            ParsedPrivateKey::EcdsaP256(scalar) => {
+                assert_eq!(scalar.len(), 32, "P-256 scalar should be 32 bytes");
+            }
+            _ => panic!("expected ECDSA P-256 key"),
+        }
+    }
+
+    #[test]
+    fn wrong_passphrase_fails() {
+        let tmp = std::env::temp_dir().join("russh_test_wrong_pass");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-f"])
+            .arg(&tmp)
+            .args(["-N", "correct-password", "-q"])
+            .status()
+            .expect("ssh-keygen not found");
+        assert!(status.success());
+        let result = load_private_key_with_passphrase(&tmp, Some(b"wrong-password"));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("check values mismatch") || err.contains("wrong passphrase"),
+            "expected check mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encrypted_key_sign_verify_roundtrip() {
+        let tmp = std::env::temp_dir().join("russh_test_enc_signverify");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        let passphrase = "sign-verify-pass";
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-f"])
+            .arg(&tmp)
+            .args(["-N", passphrase, "-q"])
+            .status()
+            .expect("ssh-keygen not found");
+        assert!(status.success());
+        let key = load_private_key_with_passphrase(&tmp, Some(passphrase.as_bytes()))
+            .expect("decrypt failed");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        match key {
+            ParsedPrivateKey::Ed25519(seed) => {
+                let signer = russh_crypto::Ed25519Signer::from_seed(&seed);
+                use russh_crypto::Signer;
+                let msg = b"encrypted key test";
+                let sig = signer.sign(msg).expect("sign failed");
+                assert!(!sig.is_empty());
+                let pub_blob = signer.public_key_blob();
+                assert!(!pub_blob.is_empty());
+            }
+            _ => panic!("expected Ed25519"),
+        }
     }
 
     #[test]

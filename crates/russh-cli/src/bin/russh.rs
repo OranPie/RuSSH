@@ -459,6 +459,16 @@ fn read_line_echo(prompt: &str) -> String {
 fn try_load_signer(path: &std::path::Path) -> Option<Box<dyn Signer + Send + Sync>> {
     match russh_cli::load_private_key(path) {
         Ok(key) => parsed_key_to_signer(key).ok(),
+        Err(e) if e.contains("passphrase required") => {
+            // Key is encrypted — prompt for passphrase
+            match prompt_and_load_encrypted(path) {
+                Ok(signer) => Some(signer),
+                Err(e) => {
+                    eprintln!("russh: {}: {e}", path.display());
+                    None
+                }
+            }
+        }
         Err(e) => {
             eprintln!("russh: warning: cannot load {}: {e}", path.display());
             None
@@ -467,14 +477,75 @@ fn try_load_signer(path: &std::path::Path) -> Option<Box<dyn Signer + Send + Syn
 }
 
 fn load_signer(path: &std::path::Path) -> Box<dyn Signer + Send + Sync> {
-    let key = russh_cli::load_private_key(path).unwrap_or_else(|e| {
-        eprintln!("russh: {e}");
-        process::exit(1);
-    });
-    parsed_key_to_signer(key).unwrap_or_else(|e| {
-        eprintln!("russh: {e}");
-        process::exit(1);
-    })
+    match russh_cli::load_private_key(path) {
+        Ok(key) => parsed_key_to_signer(key).unwrap_or_else(|e| {
+            eprintln!("russh: {e}");
+            process::exit(1);
+        }),
+        Err(e) if e.contains("passphrase required") => {
+            prompt_and_load_encrypted(path).unwrap_or_else(|e| {
+                eprintln!("russh: {e}");
+                process::exit(1);
+            })
+        }
+        Err(e) => {
+            eprintln!("russh: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+fn prompt_and_load_encrypted(
+    path: &std::path::Path,
+) -> Result<Box<dyn Signer + Send + Sync>, String> {
+    eprint!("Enter passphrase for {}: ", path.display());
+    let _ = io::stderr().flush();
+    let passphrase = read_passphrase()?;
+    let key = russh_cli::load_private_key_with_passphrase(path, Some(passphrase.as_bytes()))?;
+    parsed_key_to_signer(key)
+}
+
+fn read_passphrase() -> Result<String, String> {
+    terminal::enable_raw_mode().map_err(|e| format!("terminal: {e}"))?;
+    let mut passphrase = String::new();
+    loop {
+        use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+        let ev = event::read().map_err(|e| {
+            let _ = terminal::disable_raw_mode();
+            format!("read event: {e}")
+        })?;
+        match ev {
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }) => break,
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                let _ = terminal::disable_raw_mode();
+                eprintln!();
+                return Err("interrupted".into());
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                passphrase.pop();
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            }) => {
+                passphrase.push(c);
+            }
+            _ => {}
+        }
+    }
+    let _ = terminal::disable_raw_mode();
+    eprintln!(); // newline after passphrase
+    Ok(passphrase)
 }
 
 fn parsed_key_to_signer(key: ParsedPrivateKey) -> Result<Box<dyn Signer + Send + Sync>, String> {
