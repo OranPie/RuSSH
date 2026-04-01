@@ -36,10 +36,11 @@ use russh_auth::{
 };
 use russh_core::{AlgorithmSet, PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{
-    CryptoPolicy, Curve25519Sha256, DhGroup14Sha256, EcdhNistp256, EcdsaP256Signer,
-    EcdsaP256Verifier, Ed25519Signer, Ed25519Verifier, HashAlgorithm, KexKeyPair,
-    KeyExchangeAlgorithm, OsRng, RsaVerifier, Sha256, Signer, Verifier, decode_ssh_string,
-    derive_key_sha256, encode_mpint, encode_ssh_string,
+    CryptoPolicy, Curve25519Sha256, DhGroup14Sha256, DhGroup16Sha512, DhGroup18Sha512,
+    EcdhNistp256, EcdsaP256Signer, EcdsaP256Verifier, EcdsaP384Verifier, EcdsaP521Verifier,
+    Ed25519Signer, Ed25519Verifier, HashAlgorithm, KexKeyPair, KeyExchangeAlgorithm, OsRng,
+    RsaVerifier, Sha256, Sha512, Signer, Verifier, decode_ssh_string, derive_key_sha256,
+    derive_key_sha512, encode_mpint, encode_ssh_string,
 };
 
 const SSH_USERAUTH_SERVICE: &str = "ssh-userauth";
@@ -1263,13 +1264,14 @@ impl ClientSession {
             &shared_secret_mpint,
             true,
             is_dh_kex(&kex_alg),
+            &kex_alg,
         );
 
         if self.config.strict_host_key_checking {
             verify_host_key_signature(&server_host_key_blob, &exchange_hash, &signature)?;
         }
 
-        let keys = derive_session_keys(&shared_secret_mpint, &exchange_hash, None);
+        let keys = derive_session_keys(&shared_secret_mpint, &exchange_hash, None, &kex_alg);
         let newkeys_frame = TransportMessage::NewKeys.to_frame()?;
 
         self.session_keys = Some(keys.clone());
@@ -1804,9 +1806,10 @@ impl ServerSession {
                     &shared_secret_mpint,
                     false,
                     is_dh_kex(&kex_alg),
+                    &kex_alg,
                 );
                 let signature = sign_server_exchange_hash(&seed, &host_key_alg, &exchange_hash)?;
-                let keys = derive_session_keys(&shared_secret_mpint, &exchange_hash, None);
+                let keys = derive_session_keys(&shared_secret_mpint, &exchange_hash, None, &kex_alg);
                 self.session_keys = Some(keys);
                 self.kex_context = None;
                 self.state = SessionState::Established;
@@ -2265,19 +2268,13 @@ impl ServerSession {
         // Verify the user's signature over the auth payload using the cert's embedded key.
         if let Some(session_keys) = &self.session_keys {
             let session_id = session_keys.session_id.clone();
-            let embedded: &[u8; 32] = cert.public_key.as_slice().try_into().map_err(|_| {
-                RusshError::new(
-                    RusshErrorCategory::Auth,
-                    "cert embedded key is not 32 bytes",
-                )
-            })?;
             if verify_cert_auth_signature(
                 &session_id,
                 &user,
                 SSH_CONNECTION_SERVICE,
                 &algorithm,
                 &cert_blob,
-                embedded,
+                &cert,
                 &signature,
             )
             .is_err()
@@ -2644,6 +2641,7 @@ fn compute_exchange_hash(
     shared_secret_mpint: &[u8],
     is_client: bool,
     dh_mode: bool,
+    kex_alg: &str,
 ) -> Vec<u8> {
     let (v_c, v_s, i_c, i_s) = if is_client {
         (
@@ -2674,7 +2672,11 @@ fn compute_exchange_hash(
         data.extend_from_slice(&encode_ssh_string(server_ephemeral_pubkey));
     }
     data.extend_from_slice(shared_secret_mpint);
-    Sha256::digest(&data)
+    if kex_uses_sha512(kex_alg) {
+        Sha512::digest(&data)
+    } else {
+        Sha256::digest(&data)
+    }
 }
 
 /// Derive the seven SSH session keys from a completed key exchange.
@@ -2682,17 +2684,37 @@ fn derive_session_keys(
     shared_secret_mpint: &[u8],
     exchange_hash: &[u8],
     session_id: Option<&[u8]>,
+    kex_alg: &str,
 ) -> SessionKeys {
     let sid = session_id.unwrap_or(exchange_hash);
-    SessionKeys {
-        session_id: sid.to_vec(),
-        iv_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'A', sid, 16),
-        iv_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'B', sid, 16),
-        key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'C', sid, 64),
-        key_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'D', sid, 64),
-        mac_key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'E', sid, 32),
-        mac_key_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'F', sid, 32),
+    if kex_uses_sha512(kex_alg) {
+        SessionKeys {
+            session_id: sid.to_vec(),
+            iv_c2s: derive_key_sha512(shared_secret_mpint, exchange_hash, b'A', sid, 16),
+            iv_s2c: derive_key_sha512(shared_secret_mpint, exchange_hash, b'B', sid, 16),
+            key_c2s: derive_key_sha512(shared_secret_mpint, exchange_hash, b'C', sid, 64),
+            key_s2c: derive_key_sha512(shared_secret_mpint, exchange_hash, b'D', sid, 64),
+            mac_key_c2s: derive_key_sha512(shared_secret_mpint, exchange_hash, b'E', sid, 32),
+            mac_key_s2c: derive_key_sha512(shared_secret_mpint, exchange_hash, b'F', sid, 32),
+        }
+    } else {
+        SessionKeys {
+            session_id: sid.to_vec(),
+            iv_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'A', sid, 16),
+            iv_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'B', sid, 16),
+            key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'C', sid, 64),
+            key_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'D', sid, 64),
+            mac_key_c2s: derive_key_sha256(shared_secret_mpint, exchange_hash, b'E', sid, 32),
+            mac_key_s2c: derive_key_sha256(shared_secret_mpint, exchange_hash, b'F', sid, 32),
+        }
     }
+}
+
+fn kex_uses_sha512(kex_alg: &str) -> bool {
+    matches!(
+        kex_alg,
+        "diffie-hellman-group16-sha512" | "diffie-hellman-group18-sha512"
+    )
 }
 
 /// Verify an SSH host key signature blob against an exchange hash.
@@ -2727,6 +2749,18 @@ fn verify_host_key_signature(
             let verifier = EcdsaP256Verifier::from_sec1_bytes(&ec_point)?;
             verifier.verify(exchange_hash, &sig_bytes)
         }
+        "ecdsa-sha2-nistp384" => {
+            let _curve_name = decode_ssh_string(host_key_blob, &mut offset)?;
+            let ec_point = decode_ssh_string(host_key_blob, &mut offset)?;
+            let verifier = EcdsaP384Verifier::from_sec1_bytes(&ec_point)?;
+            verifier.verify(exchange_hash, &sig_bytes)
+        }
+        "ecdsa-sha2-nistp521" => {
+            let _curve_name = decode_ssh_string(host_key_blob, &mut offset)?;
+            let ec_point = decode_ssh_string(host_key_blob, &mut offset)?;
+            let verifier = EcdsaP521Verifier::from_sec1_bytes(&ec_point)?;
+            verifier.verify(exchange_hash, &sig_bytes)
+        }
         "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
             let verifier = RsaVerifier::from_ssh_blob(host_key_blob)?;
             let verifier = if algo_str == "rsa-sha2-512" {
@@ -2750,6 +2784,8 @@ fn generate_kex_keypair(kex_alg: &str) -> Result<KexKeyPair, RusshError> {
         }
         "ecdh-sha2-nistp256" => Ok(EcdhNistp256::generate_keypair(&mut OsRng)),
         "diffie-hellman-group14-sha256" => Ok(DhGroup14Sha256::generate_keypair(&mut OsRng)),
+        "diffie-hellman-group16-sha512" => Ok(DhGroup16Sha512::generate_keypair(&mut OsRng)),
+        "diffie-hellman-group18-sha512" => Ok(DhGroup18Sha512::generate_keypair(&mut OsRng)),
         _ => Err(RusshError::new(
             RusshErrorCategory::Crypto,
             format!("unsupported KEX algorithm: {kex_alg}"),
@@ -2769,6 +2805,12 @@ fn compute_kex_shared_secret(
         "ecdh-sha2-nistp256" => EcdhNistp256::compute_shared_secret(private_key, peer_pubkey),
         "diffie-hellman-group14-sha256" => {
             DhGroup14Sha256::compute_shared_secret(private_key, peer_pubkey)
+        }
+        "diffie-hellman-group16-sha512" => {
+            DhGroup16Sha512::compute_shared_secret(private_key, peer_pubkey)
+        }
+        "diffie-hellman-group18-sha512" => {
+            DhGroup18Sha512::compute_shared_secret(private_key, peer_pubkey)
         }
         _ => Err(RusshError::new(
             RusshErrorCategory::Crypto,

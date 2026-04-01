@@ -24,7 +24,10 @@ use crossterm::terminal;
 use russh_auth::AuthMethod;
 use russh_cli::ParsedPrivateKey;
 use russh_config::{ResolvedConfig, parse_config};
-use russh_crypto::{EcdsaP256Signer, Ed25519Signer, RsaSha256Signer, RsaSigner, Signer};
+use russh_crypto::{
+    EcdsaP256Signer, EcdsaP384Signer, EcdsaP521Signer, Ed25519Signer, RsaSha256Signer, RsaSigner,
+    Signer,
+};
 use russh_net::{SshClient, SshClientConnection};
 use russh_observability::{Severity, StderrLogger, VerboseLevel};
 use russh_transport::ClientConfig;
@@ -553,7 +556,17 @@ fn parsed_key_to_signer(key: ParsedPrivateKey) -> Result<Box<dyn Signer + Send +
         ParsedPrivateKey::Ed25519(seed) => Ok(Box::new(Ed25519Signer::from_seed(&seed))),
         ParsedPrivateKey::EcdsaP256(scalar) => {
             let signer =
-                EcdsaP256Signer::from_bytes(&scalar).map_err(|e| format!("ECDSA key: {e}"))?;
+                EcdsaP256Signer::from_bytes(&scalar).map_err(|e| format!("ECDSA-P256 key: {e}"))?;
+            Ok(Box::new(signer))
+        }
+        ParsedPrivateKey::EcdsaP384(scalar) => {
+            let signer =
+                EcdsaP384Signer::from_bytes(&scalar).map_err(|e| format!("ECDSA-P384 key: {e}"))?;
+            Ok(Box::new(signer))
+        }
+        ParsedPrivateKey::EcdsaP521(scalar) => {
+            let signer =
+                EcdsaP521Signer::from_bytes(&scalar).map_err(|e| format!("ECDSA-P521 key: {e}"))?;
             Ok(Box::new(signer))
         }
         ParsedPrivateKey::Rsa {

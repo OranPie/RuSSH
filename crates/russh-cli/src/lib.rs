@@ -5,6 +5,8 @@
 pub enum ParsedPrivateKey {
     Ed25519([u8; 32]),
     EcdsaP256(Vec<u8>),
+    EcdsaP384(Vec<u8>),
+    EcdsaP521(Vec<u8>),
     Rsa {
         n: Vec<u8>,
         e: Vec<u8>,
@@ -121,7 +123,22 @@ fn parse_openssh_private_key_with_passphrase(
     match keytype {
         b"ssh-ed25519" => parse_ed25519_private(&priv_blob, &mut poff).map_err(|e| e.into()),
         b"ecdsa-sha2-nistp256" => {
-            parse_ecdsa_p256_private(&priv_blob, &mut poff).map_err(|e| e.into())
+            parse_ecdsa_private(&priv_blob, &mut poff, b"nistp256", 32, |s| {
+                ParsedPrivateKey::EcdsaP256(s)
+            })
+            .map_err(|e| e.into())
+        }
+        b"ecdsa-sha2-nistp384" => {
+            parse_ecdsa_private(&priv_blob, &mut poff, b"nistp384", 48, |s| {
+                ParsedPrivateKey::EcdsaP384(s)
+            })
+            .map_err(|e| e.into())
+        }
+        b"ecdsa-sha2-nistp521" => {
+            parse_ecdsa_private(&priv_blob, &mut poff, b"nistp521", 66, |s| {
+                ParsedPrivateKey::EcdsaP521(s)
+            })
+            .map_err(|e| e.into())
         }
         b"ssh-rsa" => parse_rsa_private(&priv_blob, &mut poff).map_err(|e| e.into()),
         _ => Err("unsupported key type".into()),
@@ -144,27 +161,29 @@ fn parse_ed25519_private(
     Ok(ParsedPrivateKey::Ed25519(seed))
 }
 
-fn parse_ecdsa_p256_private(
+fn parse_ecdsa_private(
     priv_blob: &[u8],
     poff: &mut usize,
+    expected_curve: &[u8],
+    scalar_len: usize,
+    wrap: fn(Vec<u8>) -> ParsedPrivateKey,
 ) -> Result<ParsedPrivateKey, &'static str> {
-    // curve identifier (e.g. "nistp256")
     let curve = read_ssh_string(priv_blob, poff).ok_or("truncated: curve id")?;
-    if curve != b"nistp256" {
-        return Err("expected nistp256 curve identifier");
+    if curve != expected_curve {
+        return Err("unexpected curve identifier");
     }
     // public key point (uncompressed SEC1 format)
     let _pubkey = read_ssh_string(priv_blob, poff).ok_or("truncated: ECDSA pubkey")?;
     // private scalar (may have leading 0x00 for mpint sign encoding)
     let privkey = read_ssh_string(priv_blob, poff).ok_or("truncated: ECDSA privkey")?;
-    let scalar = if privkey.len() == 33 && privkey[0] == 0x00 {
+    let scalar = if privkey.len() == scalar_len + 1 && privkey[0] == 0x00 {
         &privkey[1..]
-    } else if privkey.len() == 32 {
+    } else if privkey.len() == scalar_len {
         privkey
     } else {
-        return Err("ECDSA-P256 private scalar must be 32 or 33 bytes");
+        return Err("ECDSA private scalar has unexpected length");
     };
-    Ok(ParsedPrivateKey::EcdsaP256(scalar.to_vec()))
+    Ok(wrap(scalar.to_vec()))
 }
 
 fn parse_rsa_private(priv_blob: &[u8], poff: &mut usize) -> Result<ParsedPrivateKey, &'static str> {

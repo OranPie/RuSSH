@@ -30,8 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use russh_core::{PacketCodec, PacketFrame, RusshError, RusshErrorCategory};
 use russh_crypto::{
-    EcdsaP256Verifier, Ed25519Verifier, RsaVerifier, Verifier, constant_time_eq, decode_ssh_string,
-    encode_ssh_string,
+    EcdsaP256Verifier, EcdsaP384Verifier, EcdsaP521Verifier, Ed25519Verifier, RsaVerifier,
+    Verifier, constant_time_eq, decode_ssh_string, encode_ssh_string,
 };
 
 /// Client authentication request variants.
@@ -967,8 +967,12 @@ pub fn parse_known_hosts(input: &str) -> Result<Vec<KnownHostEntry>, RusshError>
 /// the `ca_public_key` field (i.e., everything before `signature`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenSshCertificate {
+    /// The certificate key type (e.g. "ssh-ed25519-cert-v01@openssh.com").
+    pub cert_key_type: String,
     pub nonce: Vec<u8>,
-    /// Raw 32-byte Ed25519 public key embedded in the certificate.
+    /// Embedded public key — format depends on cert_key_type.
+    /// Ed25519: raw 32 bytes. RSA: SSH wire-format (string e, string n).
+    /// ECDSA: string curve_name, string ec_point.
     pub public_key: Vec<u8>,
     pub serial: u64,
     /// 1 = user certificate, 2 = host certificate.
@@ -979,9 +983,9 @@ pub struct OpenSshCertificate {
     pub valid_before_unix: u64,
     pub critical_options: Vec<(String, Vec<u8>)>,
     pub extensions: Vec<(String, Vec<u8>)>,
-    /// CA public key blob (SSH wire format: `string "ssh-ed25519" || string 32_bytes`).
+    /// CA public key blob (SSH wire format).
     pub ca_public_key: Vec<u8>,
-    /// CA signature blob (SSH wire format: `string "ssh-ed25519" || string 64_bytes`).
+    /// CA signature blob (SSH wire format).
     pub signature: Vec<u8>,
     /// The bytes that were signed: cert blob[0..offset_after_ca_public_key].
     pub signed_data: Vec<u8>,
@@ -993,31 +997,69 @@ impl OpenSshCertificate {
 
     /// Parse a certificate from its SSH wire encoding.
     ///
-    /// The blob must start with the key-type string
-    /// `"ssh-ed25519-cert-v01@openssh.com"`.
+    /// Supports Ed25519, RSA, and ECDSA (P-256, P-384, P-521) cert types.
     pub fn parse(blob: &[u8]) -> Result<Self, RusshError> {
         let mut off = 0;
 
         // key_type
         let key_type = decode_ssh_string(blob, &mut off)?;
-        if key_type != b"ssh-ed25519-cert-v01@openssh.com" {
+        let cert_key_type = String::from_utf8(key_type.clone()).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Auth,
+                "certificate key type is not valid UTF-8",
+            )
+        })?;
+
+        // Validate supported cert types
+        let supported = [
+            "ssh-ed25519-cert-v01@openssh.com",
+            "ssh-rsa-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+            "rsa-sha2-256-cert-v01@openssh.com",
+            "rsa-sha2-512-cert-v01@openssh.com",
+        ];
+        if !supported.contains(&cert_key_type.as_str()) {
             return Err(RusshError::new(
                 RusshErrorCategory::Auth,
-                "expected ssh-ed25519-cert-v01@openssh.com key type",
+                format!("unsupported certificate key type: {cert_key_type}"),
             ));
         }
 
         // nonce
         let nonce = decode_ssh_string(blob, &mut off)?;
 
-        // ed25519 public key (raw 32 bytes)
-        let public_key = decode_ssh_string(blob, &mut off)?;
-        if public_key.len() != 32 {
-            return Err(RusshError::new(
-                RusshErrorCategory::Auth,
-                "certificate ed25519 public key must be 32 bytes",
-            ));
-        }
+        // Embedded public key — format varies by key type.
+        // We capture the raw bytes from the current offset to after reading the
+        // key fields so we can re-parse them during verification.
+        let public_key = if cert_key_type.starts_with("ssh-ed25519") {
+            let pk = decode_ssh_string(blob, &mut off)?;
+            if pk.len() != 32 {
+                return Err(RusshError::new(
+                    RusshErrorCategory::Auth,
+                    "certificate Ed25519 public key must be 32 bytes",
+                ));
+            }
+            pk
+        } else if cert_key_type.starts_with("ssh-rsa") || cert_key_type.starts_with("rsa-sha2") {
+            // RSA: string e, string n
+            let e = decode_ssh_string(blob, &mut off)?;
+            let n = decode_ssh_string(blob, &mut off)?;
+            // Store as SSH wire blob for later reconstruction
+            let mut pk = Vec::new();
+            pk.extend_from_slice(&encode_ssh_string(&e));
+            pk.extend_from_slice(&encode_ssh_string(&n));
+            pk
+        } else {
+            // ECDSA: string curve_name, string ec_point
+            let curve = decode_ssh_string(blob, &mut off)?;
+            let point = decode_ssh_string(blob, &mut off)?;
+            let mut pk = Vec::new();
+            pk.extend_from_slice(&encode_ssh_string(&curve));
+            pk.extend_from_slice(&encode_ssh_string(&point));
+            pk
+        };
 
         // serial (uint64)
         let serial = Self::read_u64(blob, &mut off)?;
@@ -1062,6 +1104,7 @@ impl OpenSshCertificate {
         let signature = decode_ssh_string(blob, &mut off)?;
 
         Ok(Self {
+            cert_key_type,
             nonce,
             public_key,
             serial,
@@ -1080,12 +1123,61 @@ impl OpenSshCertificate {
 
     /// Verify the CA signature over `self.signed_data`.
     ///
-    /// Only Ed25519 CA keys are supported. Returns `Ok(())` if valid.
+    /// Supports Ed25519, RSA, and ECDSA CA keys.
     pub fn verify_ca_signature(&self) -> Result<(), RusshError> {
-        let ca_key_bytes = parse_ed25519_public_key_blob(&self.ca_public_key)?;
-        let sig_bytes = parse_ed25519_signature_blob(&self.signature)?;
-        let verifier = Ed25519Verifier::from_bytes(&ca_key_bytes)?;
-        verifier.verify(&self.signed_data, &sig_bytes)
+        // Parse CA key type from the CA public key blob
+        let mut ca_off = 0;
+        let ca_algo = decode_ssh_string(&self.ca_public_key, &mut ca_off)?;
+        let ca_algo_str = std::str::from_utf8(&ca_algo).map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Auth,
+                "CA key algorithm is not valid UTF-8",
+            )
+        })?;
+
+        // Parse signature blob: string(algo) || string(sig_bytes)
+        let mut sig_off = 0;
+        let _sig_algo = decode_ssh_string(&self.signature, &mut sig_off)?;
+        let sig_bytes = decode_ssh_string(&self.signature, &mut sig_off)?;
+
+        match ca_algo_str {
+            "ssh-ed25519" => {
+                let ca_key_bytes = parse_ed25519_public_key_blob(&self.ca_public_key)?;
+                let verifier = Ed25519Verifier::from_bytes(&ca_key_bytes)?;
+                verifier.verify(&self.signed_data, &sig_bytes)
+            }
+            "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
+                let verifier = RsaVerifier::from_ssh_blob(&self.ca_public_key)?;
+                let verifier = if ca_algo_str == "rsa-sha2-512" {
+                    verifier.with_sha512()
+                } else {
+                    verifier
+                };
+                verifier.verify(&self.signed_data, &sig_bytes)
+            }
+            "ecdsa-sha2-nistp256" => {
+                let _curve = decode_ssh_string(&self.ca_public_key, &mut ca_off)?;
+                let ec_point = decode_ssh_string(&self.ca_public_key, &mut ca_off)?;
+                let verifier = EcdsaP256Verifier::from_sec1_bytes(&ec_point)?;
+                verifier.verify(&self.signed_data, &sig_bytes)
+            }
+            "ecdsa-sha2-nistp384" => {
+                let _curve = decode_ssh_string(&self.ca_public_key, &mut ca_off)?;
+                let ec_point = decode_ssh_string(&self.ca_public_key, &mut ca_off)?;
+                let verifier = EcdsaP384Verifier::from_sec1_bytes(&ec_point)?;
+                verifier.verify(&self.signed_data, &sig_bytes)
+            }
+            "ecdsa-sha2-nistp521" => {
+                let _curve = decode_ssh_string(&self.ca_public_key, &mut ca_off)?;
+                let ec_point = decode_ssh_string(&self.ca_public_key, &mut ca_off)?;
+                let verifier = EcdsaP521Verifier::from_sec1_bytes(&ec_point)?;
+                verifier.verify(&self.signed_data, &sig_bytes)
+            }
+            _ => Err(RusshError::new(
+                RusshErrorCategory::Auth,
+                format!("unsupported CA key algorithm: {ca_algo_str}"),
+            )),
+        }
     }
 
     fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64, RusshError> {
@@ -1540,6 +1632,18 @@ pub fn verify_publickey_auth_signature(
             let verifier = EcdsaP256Verifier::from_sec1_bytes(&ec_point)?;
             verifier.verify(&payload, &sig_bytes)
         }
+        "ecdsa-sha2-nistp384" => {
+            let _curve_name = decode_ssh_string(public_key_blob, &mut key_offset)?;
+            let ec_point = decode_ssh_string(public_key_blob, &mut key_offset)?;
+            let verifier = EcdsaP384Verifier::from_sec1_bytes(&ec_point)?;
+            verifier.verify(&payload, &sig_bytes)
+        }
+        "ecdsa-sha2-nistp521" => {
+            let _curve_name = decode_ssh_string(public_key_blob, &mut key_offset)?;
+            let ec_point = decode_ssh_string(public_key_blob, &mut key_offset)?;
+            let verifier = EcdsaP521Verifier::from_sec1_bytes(&ec_point)?;
+            verifier.verify(&payload, &sig_bytes)
+        }
         "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
             let verifier = RsaVerifier::from_ssh_blob(public_key_blob)?;
             let verifier = if key_type_str == "rsa-sha2-512" {
@@ -1558,21 +1662,74 @@ pub fn verify_publickey_auth_signature(
 
 /// Verify the user signature in a certificate-based publickey auth request.
 ///
-/// The signing payload is built with `algorithm` and `cert_blob` as the public key blob,
-/// but the signature is verified using the embedded Ed25519 key inside the certificate.
+/// The signing payload is built with `algorithm` and `cert_blob` as the public key blob.
+/// The signature is verified using the embedded public key, dispatching by cert key type.
 pub fn verify_cert_auth_signature(
     session_id: &[u8],
     user: &str,
     service: &str,
     algorithm: &str,
     cert_blob: &[u8],
-    embedded_pubkey: &[u8; 32],
+    cert: &OpenSshCertificate,
     signature_blob: &[u8],
 ) -> Result<(), RusshError> {
-    let sig_bytes = parse_ed25519_signature_blob(signature_blob)?;
     let payload = build_userauth_signing_payload(session_id, user, service, algorithm, cert_blob);
-    let verifier = Ed25519Verifier::from_bytes(embedded_pubkey)?;
-    verifier.verify(&payload, &sig_bytes)
+
+    // Parse signature blob: string(algo) || string(raw_sig)
+    let mut sig_off = 0;
+    let _sig_algo = decode_ssh_string(signature_blob, &mut sig_off)?;
+    let sig_bytes = decode_ssh_string(signature_blob, &mut sig_off)?;
+
+    if cert.cert_key_type.starts_with("ssh-ed25519") {
+        let pubkey_arr: [u8; 32] = cert.public_key.as_slice().try_into().map_err(|_| {
+            RusshError::new(
+                RusshErrorCategory::Auth,
+                "Ed25519 cert embedded key must be 32 bytes",
+            )
+        })?;
+        let verifier = Ed25519Verifier::from_bytes(&pubkey_arr)?;
+        verifier.verify(&payload, &sig_bytes)
+    } else if cert.cert_key_type.starts_with("ssh-rsa")
+        || cert.cert_key_type.starts_with("rsa-sha2")
+    {
+        // Reconstruct SSH wire blob: string("ssh-rsa") || string(e) || string(n)
+        let mut rsa_blob = Vec::new();
+        rsa_blob.extend_from_slice(&encode_ssh_string(b"ssh-rsa"));
+        rsa_blob.extend_from_slice(&cert.public_key);
+        let verifier = RsaVerifier::from_ssh_blob(&rsa_blob)?;
+        let verifier = if cert.cert_key_type.contains("rsa-sha2-512") {
+            verifier.with_sha512()
+        } else {
+            verifier
+        };
+        verifier.verify(&payload, &sig_bytes)
+    } else if cert.cert_key_type.starts_with("ecdsa-sha2-nistp256") {
+        let mut pk_off = 0;
+        let _curve = decode_ssh_string(&cert.public_key, &mut pk_off)?;
+        let ec_point = decode_ssh_string(&cert.public_key, &mut pk_off)?;
+        let verifier = EcdsaP256Verifier::from_sec1_bytes(&ec_point)?;
+        verifier.verify(&payload, &sig_bytes)
+    } else if cert.cert_key_type.starts_with("ecdsa-sha2-nistp384") {
+        let mut pk_off = 0;
+        let _curve = decode_ssh_string(&cert.public_key, &mut pk_off)?;
+        let ec_point = decode_ssh_string(&cert.public_key, &mut pk_off)?;
+        let verifier = EcdsaP384Verifier::from_sec1_bytes(&ec_point)?;
+        verifier.verify(&payload, &sig_bytes)
+    } else if cert.cert_key_type.starts_with("ecdsa-sha2-nistp521") {
+        let mut pk_off = 0;
+        let _curve = decode_ssh_string(&cert.public_key, &mut pk_off)?;
+        let ec_point = decode_ssh_string(&cert.public_key, &mut pk_off)?;
+        let verifier = EcdsaP521Verifier::from_sec1_bytes(&ec_point)?;
+        verifier.verify(&payload, &sig_bytes)
+    } else {
+        Err(RusshError::new(
+            RusshErrorCategory::Auth,
+            format!(
+                "unsupported cert key type for auth: {}",
+                cert.cert_key_type
+            ),
+        ))
+    }
 }
 
 pub fn build_userauth_signing_payload(
@@ -1846,6 +2003,7 @@ mod tests {
     #[test]
     fn certificate_validator_checks_principal_and_time() {
         let cert = OpenSshCertificate {
+            cert_key_type: "ssh-ed25519-cert-v01@openssh.com".to_string(),
             nonce: vec![],
             public_key: vec![0u8; 32],
             serial: 1,
