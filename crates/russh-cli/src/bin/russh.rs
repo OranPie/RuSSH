@@ -22,8 +22,9 @@ use std::{
 
 use crossterm::terminal;
 use russh_auth::AuthMethod;
+use russh_cli::ParsedPrivateKey;
 use russh_config::{ResolvedConfig, parse_config};
-use russh_crypto::Ed25519Signer;
+use russh_crypto::{EcdsaP256Signer, Ed25519Signer, RsaSha256Signer, RsaSigner, Signer};
 use russh_net::{SshClient, SshClientConnection};
 use russh_observability::{Severity, StderrLogger, VerboseLevel};
 use russh_transport::ClientConfig;
@@ -455,9 +456,9 @@ fn read_line_echo(prompt: &str) -> String {
         .to_string()
 }
 
-fn try_load_seed(path: &std::path::Path) -> Option<[u8; 32]> {
-    match russh_cli::load_ed25519_seed(path) {
-        Ok(seed) => Some(seed),
+fn try_load_signer(path: &std::path::Path) -> Option<Box<dyn Signer + Send + Sync>> {
+    match russh_cli::load_private_key(path) {
+        Ok(key) => parsed_key_to_signer(key).ok(),
         Err(e) => {
             eprintln!("russh: warning: cannot load {}: {e}", path.display());
             None
@@ -465,11 +466,38 @@ fn try_load_seed(path: &std::path::Path) -> Option<[u8; 32]> {
     }
 }
 
-fn load_seed(path: &std::path::Path) -> [u8; 32] {
-    russh_cli::load_ed25519_seed(path).unwrap_or_else(|e| {
+fn load_signer(path: &std::path::Path) -> Box<dyn Signer + Send + Sync> {
+    let key = russh_cli::load_private_key(path).unwrap_or_else(|e| {
+        eprintln!("russh: {e}");
+        process::exit(1);
+    });
+    parsed_key_to_signer(key).unwrap_or_else(|e| {
         eprintln!("russh: {e}");
         process::exit(1);
     })
+}
+
+fn parsed_key_to_signer(key: ParsedPrivateKey) -> Result<Box<dyn Signer + Send + Sync>, String> {
+    match key {
+        ParsedPrivateKey::Ed25519(seed) => Ok(Box::new(Ed25519Signer::from_seed(&seed))),
+        ParsedPrivateKey::EcdsaP256(scalar) => {
+            let signer =
+                EcdsaP256Signer::from_bytes(&scalar).map_err(|e| format!("ECDSA key: {e}"))?;
+            Ok(Box::new(signer))
+        }
+        ParsedPrivateKey::Rsa {
+            n,
+            e,
+            d,
+            iqmp,
+            p,
+            q,
+        } => {
+            let rsa = RsaSigner::from_openssh_components(&n, &e, &d, &iqmp, &p, &q)
+                .map_err(|err| format!("RSA key: {err}"))?;
+            Ok(Box::new(RsaSha256Signer(rsa)))
+        }
+    }
 }
 
 #[tokio::main]
@@ -576,9 +604,9 @@ async fn main() {
         let mut jump_cfg = ClientConfig::secure_defaults(&jump_user);
         jump_cfg.strict_host_key_checking = args.strict_host_key_checking;
 
-        let jump_seed = identity_paths
+        let jump_signer = identity_paths
             .first()
-            .map(|p| load_seed(p))
+            .map(|p| load_signer(p))
             .unwrap_or_else(|| {
                 eprintln!("russh: -J requires an identity file (-i)");
                 process::exit(1);
@@ -588,8 +616,7 @@ async fn main() {
             format!("{jump_host}:{jump_port}"),
             jump_cfg,
             move |jconn| {
-                let s = Ed25519Signer::from_seed(&jump_seed);
-                Box::pin(async move { jconn.authenticate_pubkey(&s).await })
+                Box::pin(async move { jconn.authenticate_pubkey(jump_signer.as_ref()).await })
             },
             &args.host,
             args.port,
@@ -651,9 +678,8 @@ async fn main() {
         match method {
             AuthMethod::PublicKey => {
                 for id_path in &identity_paths {
-                    if let Some(seed) = try_load_seed(id_path) {
-                        let signer = Ed25519Signer::from_seed(&seed);
-                        if conn.authenticate_pubkey(&signer).await.is_ok() {
+                    if let Some(signer) = try_load_signer(id_path) {
+                        if conn.authenticate_pubkey(signer.as_ref()).await.is_ok() {
                             authed = true;
                             break;
                         }

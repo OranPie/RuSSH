@@ -43,7 +43,7 @@ use tracing::{debug, info, trace, warn};
 #[cfg(unix)]
 use russh_auth::AgentClient;
 use russh_auth::{
-    ServerAuthPolicy, UserAuthMessage, UserAuthRequest, build_ed25519_signature_blob,
+    ServerAuthPolicy, UserAuthMessage, UserAuthRequest, build_signature_blob,
     build_userauth_signing_payload,
 };
 use russh_channel::{ChannelKind, ChannelManager, ChannelMessage, ChannelRequest, ForwardHandle};
@@ -1468,10 +1468,14 @@ impl SshClientConnection {
         }
     }
 
-    /// Authenticate with an Ed25519 private key.  Returns `Ok(())` on success.
-    pub async fn authenticate_pubkey(&mut self, signer: &Ed25519Signer) -> Result<(), RusshError> {
+    /// Authenticate with a private key (Ed25519, RSA, or ECDSA).
+    pub async fn authenticate_pubkey(
+        &mut self,
+        signer: &(dyn Signer + Send + Sync),
+    ) -> Result<(), RusshError> {
         let user = self.session.config.user.clone();
-        debug!(user = %user, "authenticating with pubkey");
+        let algo_name = signer.algorithm_name();
+        debug!(user = %user, algorithm = %algo_name, "authenticating with pubkey");
         let session_id = self
             .session
             .session_keys()
@@ -1484,21 +1488,16 @@ impl SshClientConnection {
             &session_id,
             &user,
             "ssh-connection",
-            "ssh-ed25519",
+            algo_name,
             &public_key_blob,
         );
         let raw_sig = signer.sign(&signing_payload)?;
-        let signature = build_ed25519_signature_blob(
-            raw_sig
-                .as_slice()
-                .try_into()
-                .map_err(|_| protocol_err("unexpected signature length"))?,
-        );
+        let signature = build_signature_blob(algo_name, &raw_sig);
 
         let request = UserAuthRequest::PublicKey {
             user: user.clone(),
             service: "ssh-connection".to_owned(),
-            algorithm: "ssh-ed25519".to_owned(),
+            algorithm: algo_name.to_owned(),
             public_key: public_key_blob,
             signature: Some(signature),
         };
@@ -1539,7 +1538,7 @@ impl SshClientConnection {
     pub async fn authenticate_pubkey_with_cert(
         &mut self,
         cert_blob: Vec<u8>,
-        signer: &Ed25519Signer,
+        signer: &(dyn Signer + Send + Sync),
     ) -> Result<(), RusshError> {
         let user = self.session.config.user.clone();
         let session_id = self
@@ -1549,26 +1548,28 @@ impl SshClientConnection {
             .session_id
             .clone();
 
-        const CERT_ALG: &str = "ssh-ed25519-cert-v01@openssh.com";
+        let cert_alg = match signer.algorithm_name() {
+            "ssh-ed25519" => "ssh-ed25519-cert-v01@openssh.com",
+            "rsa-sha2-256" => "ssh-rsa-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp256" => "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            other => {
+                return Err(protocol_err(format!("unsupported cert algorithm: {other}")));
+            }
+        };
         let signing_payload = build_userauth_signing_payload(
             &session_id,
             &user,
             "ssh-connection",
-            CERT_ALG,
+            cert_alg,
             &cert_blob,
         );
         let raw_sig = signer.sign(&signing_payload)?;
-        let signature = build_ed25519_signature_blob(
-            raw_sig
-                .as_slice()
-                .try_into()
-                .map_err(|_| protocol_err("unexpected signature length"))?,
-        );
+        let signature = build_signature_blob(signer.algorithm_name(), &raw_sig);
 
         let request = UserAuthRequest::PublicKey {
             user,
             service: "ssh-connection".to_owned(),
-            algorithm: CERT_ALG.to_owned(),
+            algorithm: cert_alg.to_owned(),
             public_key: cert_blob,
             signature: Some(signature),
         };

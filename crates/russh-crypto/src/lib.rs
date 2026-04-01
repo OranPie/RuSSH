@@ -1362,6 +1362,43 @@ impl RsaSigner {
         Ok(Self { key })
     }
 
+    /// Construct from OpenSSH private key components (individual big-endian bigints).
+    ///
+    /// The openssh-key-v1 format stores RSA parameters as SSH mpints:
+    /// n, e, d, iqmp, p, q.
+    pub fn from_openssh_components(
+        n: &[u8],
+        e: &[u8],
+        d: &[u8],
+        _iqmp: &[u8],
+        p: &[u8],
+        q: &[u8],
+    ) -> Result<Self, RusshError> {
+        use rsa::BigUint;
+        let n = BigUint::from_bytes_be(n);
+        let e = BigUint::from_bytes_be(e);
+        let d = BigUint::from_bytes_be(d);
+        let primes = vec![BigUint::from_bytes_be(p), BigUint::from_bytes_be(q)];
+        let key = rsa::RsaPrivateKey::from_components(n, e, d, primes).map_err(|e| {
+            RusshError::new(
+                RusshErrorCategory::Crypto,
+                format!("invalid RSA key components: {e}"),
+            )
+        })?;
+        key.validate().map_err(|e| {
+            RusshError::new(
+                RusshErrorCategory::Crypto,
+                format!("RSA key validation failed: {e}"),
+            )
+        })?;
+        use rsa::traits::PublicKeyParts as _;
+        let bits = key.n().bits();
+        if bits < 2048 {
+            return Err(crypto_error("RSA key must be at least 2048 bits"));
+        }
+        Ok(Self { key })
+    }
+
     /// Return the public key for verification.
     pub fn verifier_sha256(&self) -> RsaVerifier {
         RsaVerifier {

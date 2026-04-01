@@ -1479,9 +1479,14 @@ pub fn build_ed25519_public_key_blob(key_bytes: &[u8; 32]) -> Vec<u8> {
 
 /// Build an SSH Ed25519 signature blob: string "ssh-ed25519" || string <64 bytes>
 pub fn build_ed25519_signature_blob(sig_bytes: &[u8; 64]) -> Vec<u8> {
+    build_signature_blob("ssh-ed25519", sig_bytes.as_slice())
+}
+
+/// Build a generic SSH signature blob: string algorithm || string raw_signature
+pub fn build_signature_blob(algorithm: &str, sig_bytes: &[u8]) -> Vec<u8> {
     let mut blob = Vec::new();
-    blob.extend_from_slice(&encode_ssh_string(b"ssh-ed25519"));
-    blob.extend_from_slice(&encode_ssh_string(sig_bytes.as_slice()));
+    blob.extend_from_slice(&encode_ssh_string(algorithm.as_bytes()));
+    blob.extend_from_slice(&encode_ssh_string(sig_bytes));
     blob
 }
 
