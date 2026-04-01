@@ -58,6 +58,10 @@ pub struct TransportConfig {
     /// Mirrors OpenSSH `ServerAliveCountMax`. Default: `3`.
     pub keepalive_count_max: u32,
     pub policy: CryptoPolicy,
+    /// Enable TCP-level `SO_KEEPALIVE` on the socket.
+    /// `None` = use system default, `Some(n)` = enable with n-second idle interval.
+    /// Default: `Some(60)`.
+    pub tcp_keepalive_secs: Option<u32>,
 }
 
 impl TransportConfig {
@@ -75,6 +79,7 @@ pub struct TransportConfigBuilder {
     keepalive_interval: Duration,
     keepalive_count_max: u32,
     policy: CryptoPolicy,
+    tcp_keepalive_secs: Option<u32>,
 }
 
 impl Default for TransportConfigBuilder {
@@ -86,6 +91,7 @@ impl Default for TransportConfigBuilder {
             keepalive_interval: Duration::from_secs(30),
             keepalive_count_max: 3,
             policy: CryptoPolicy::secure_defaults(),
+            tcp_keepalive_secs: Some(60),
         }
     }
 }
@@ -128,6 +134,12 @@ impl TransportConfigBuilder {
     }
 
     #[must_use]
+    pub fn tcp_keepalive_secs(mut self, secs: Option<u32>) -> Self {
+        self.tcp_keepalive_secs = secs;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> TransportConfig {
         TransportConfig {
             rekey_after_bytes: self.rekey_after_bytes,
@@ -136,6 +148,7 @@ impl TransportConfigBuilder {
             keepalive_interval: self.keepalive_interval,
             keepalive_count_max: self.keepalive_count_max,
             policy: self.policy,
+            tcp_keepalive_secs: self.tcp_keepalive_secs,
         }
     }
 }
@@ -341,6 +354,12 @@ pub enum TransportMessage {
     Unimplemented {
         sequence_number: u32,
     },
+    /// SSH_MSG_DEBUG (message type 4)
+    Debug {
+        always_display: bool,
+        message: String,
+        language: String,
+    },
     /// SSH_MSG_KEX_ECDH_INIT (message type 30)
     KexEcdhInit {
         client_pubkey: Vec<u8>,
@@ -398,6 +417,7 @@ impl TransportMessage {
     const MSG_KEXINIT: u8 = 20;
     const MSG_NEWKEYS: u8 = 21;
     const MSG_UNIMPLEMENTED: u8 = 3;
+    const MSG_DEBUG: u8 = 4;
     const MSG_KEX_ECDH_INIT: u8 = 30;
     const MSG_KEX_ECDH_REPLY: u8 = 31;
 
@@ -458,6 +478,16 @@ impl TransportMessage {
             Self::Unimplemented { sequence_number } => {
                 payload.push(Self::MSG_UNIMPLEMENTED);
                 write_u32(&mut payload, *sequence_number);
+            }
+            Self::Debug {
+                always_display,
+                message,
+                language,
+            } => {
+                payload.push(Self::MSG_DEBUG);
+                write_bool(&mut payload, *always_display);
+                write_ssh_string(&mut payload, message)?;
+                write_ssh_string(&mut payload, language)?;
             }
             Self::KexEcdhInit { client_pubkey } => {
                 payload.push(Self::MSG_KEX_ECDH_INIT);
@@ -632,6 +662,17 @@ impl TransportMessage {
                 let mut offset = 0;
                 let sequence_number = read_u32(body, &mut offset)?;
                 Ok(Self::Unimplemented { sequence_number })
+            }
+            Self::MSG_DEBUG => {
+                let mut offset = 0;
+                let always_display = read_bool(body, &mut offset)?;
+                let message = read_ssh_string(body, &mut offset)?;
+                let language = read_ssh_string(body, &mut offset)?;
+                Ok(Self::Debug {
+                    always_display,
+                    message,
+                    language,
+                })
             }
             Self::MSG_KEX_ECDH_INIT => {
                 let mut offset = 0;
@@ -1084,6 +1125,18 @@ impl ClientSession {
                 Ok(())
             }
             TransportMessage::Ignore { .. } => Ok(()),
+            TransportMessage::Debug {
+                always_display,
+                message,
+                ..
+            } => {
+                if always_display {
+                    tracing::info!(msg = %message, "SSH_MSG_DEBUG (always_display)");
+                } else {
+                    tracing::debug!(msg = %message, "SSH_MSG_DEBUG");
+                }
+                Ok(())
+            }
             TransportMessage::Disconnect { code, reason } => {
                 self.close_with_code(code, reason);
                 Ok(())
@@ -1765,6 +1818,18 @@ impl ServerSession {
                 Ok(Some(TransportMessage::ServiceAccept { service }))
             }
             TransportMessage::Ignore { .. } => Ok(None),
+            TransportMessage::Debug {
+                always_display,
+                message,
+                ..
+            } => {
+                if always_display {
+                    tracing::info!(msg = %message, "SSH_MSG_DEBUG (always_display)");
+                } else {
+                    tracing::debug!(msg = %message, "SSH_MSG_DEBUG");
+                }
+                Ok(None)
+            }
             TransportMessage::Disconnect { .. } => {
                 self.state = SessionState::Closed;
                 Ok(None)
@@ -4040,5 +4105,70 @@ mod tests {
     fn server_config_login_grace_time_default_is_120s() {
         let cfg = ServerConfig::secure_defaults();
         assert_eq!(cfg.login_grace_time, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn debug_message_round_trip() {
+        let message = TransportMessage::Debug {
+            always_display: true,
+            message: "hello from server".to_string(),
+            language: "en".to_string(),
+        };
+        let frame = message.to_frame().expect("DEBUG should encode");
+        let decoded = TransportMessage::from_frame(&frame).expect("DEBUG should decode");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn debug_message_always_display_false_round_trip() {
+        let message = TransportMessage::Debug {
+            always_display: false,
+            message: "quiet debug".to_string(),
+            language: "".to_string(),
+        };
+        let frame = message.to_frame().expect("DEBUG should encode");
+        let decoded = TransportMessage::from_frame(&frame).expect("DEBUG should decode");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn debug_message_empty_fields_round_trip() {
+        let message = TransportMessage::Debug {
+            always_display: false,
+            message: String::new(),
+            language: String::new(),
+        };
+        let frame = message.to_frame().expect("DEBUG should encode");
+        let decoded = TransportMessage::from_frame(&frame).expect("DEBUG should decode");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn client_handles_debug_message() {
+        let mut session = ClientSession::new(ClientConfig::secure_defaults("alice"));
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+        session
+            .receive_message(TransportMessage::Debug {
+                always_display: true,
+                message: "server restarting soon".to_string(),
+                language: "en".to_string(),
+            })
+            .expect("client should accept SSH_MSG_DEBUG");
+    }
+
+    #[test]
+    fn server_handles_debug_message() {
+        let mut server = ServerSession::new(ServerConfig::secure_defaults());
+        server
+            .accept_banner("SSH-2.0-OpenSSH_9.8")
+            .expect("banner should be accepted");
+        let reply = server
+            .receive_message(TransportMessage::Debug {
+                always_display: false,
+                message: "client debug".to_string(),
+                language: String::new(),
+            })
+            .expect("server should accept SSH_MSG_DEBUG");
+        assert!(reply.is_none(), "SSH_MSG_DEBUG should not produce a reply");
     }
 }
