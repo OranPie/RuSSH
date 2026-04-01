@@ -2458,6 +2458,137 @@ impl SshClientConnection {
         }
     }
 
+    /// Cancel a remote port forward previously requested with `request_remote_forward`.
+    ///
+    /// Sends a `cancel-tcpip-forward` global request (RFC 4254 §7.1).
+    pub async fn cancel_remote_forward(
+        &mut self,
+        bind_host: &str,
+        bind_port: u16,
+    ) -> Result<(), RusshError> {
+        debug!(bind_host, bind_port, "requesting cancel-tcpip-forward");
+        let data =
+            ForwardHandle::build_cancel_tcpip_forward_data(bind_host, u32::from(bind_port));
+        let mut payload = Vec::new();
+        payload.push(80); // SSH_MSG_GLOBAL_REQUEST
+        let name = b"cancel-tcpip-forward";
+        payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        payload.extend_from_slice(name);
+        payload.push(1); // want_reply = true
+        payload.extend_from_slice(&data);
+        self.stream.write_packet(&PacketFrame::new(payload)).await?;
+
+        // Wait for REQUEST_SUCCESS (81) or REQUEST_FAILURE (82).
+        loop {
+            let frame = self.read_channel_packet().await?;
+            match frame.payload.first().copied() {
+                Some(81) => {
+                    info!(bind_host, bind_port, "cancel remote forward accepted");
+                    return Ok(());
+                }
+                Some(82) => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Channel,
+                        format!("cancel remote forward rejected for {bind_host}:{bind_port}"),
+                    ));
+                }
+                _ => {
+                    if let Ok(ch) = ChannelMessage::from_bytes(&frame.payload) {
+                        let _ = self.channel_manager.process(&ch);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Request the server to listen on a Unix domain socket and forward
+    /// incoming connections back to the client.
+    ///
+    /// Sends a `streamlocal-forward@openssh.com` global request.
+    #[cfg(unix)]
+    pub async fn request_streamlocal_forward(&mut self, socket_path: &str) -> Result<(), RusshError> {
+        debug!(socket_path, "requesting streamlocal-forward");
+        let mut data = Vec::new();
+        let path_bytes = socket_path.as_bytes();
+        data.extend_from_slice(&(path_bytes.len() as u32).to_be_bytes());
+        data.extend_from_slice(path_bytes);
+
+        let mut payload = Vec::new();
+        payload.push(80); // SSH_MSG_GLOBAL_REQUEST
+        let name = b"streamlocal-forward@openssh.com";
+        payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        payload.extend_from_slice(name);
+        payload.push(1); // want_reply = true
+        payload.extend_from_slice(&data);
+        self.stream.write_packet(&PacketFrame::new(payload)).await?;
+
+        // Wait for REQUEST_SUCCESS (81) or REQUEST_FAILURE (82).
+        loop {
+            let frame = self.read_channel_packet().await?;
+            match frame.payload.first().copied() {
+                Some(81) => {
+                    info!(socket_path, "streamlocal forward accepted");
+                    return Ok(());
+                }
+                Some(82) => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Channel,
+                        format!("streamlocal forward request rejected for {socket_path}"),
+                    ));
+                }
+                _ => {
+                    if let Ok(ch) = ChannelMessage::from_bytes(&frame.payload) {
+                        let _ = self.channel_manager.process(&ch);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cancel a Unix domain socket forward previously requested with
+    /// `request_streamlocal_forward`.
+    ///
+    /// Sends a `cancel-streamlocal-forward@openssh.com` global request.
+    #[cfg(unix)]
+    pub async fn cancel_streamlocal_forward(&mut self, socket_path: &str) -> Result<(), RusshError> {
+        debug!(socket_path, "requesting cancel-streamlocal-forward");
+        let mut data = Vec::new();
+        let path_bytes = socket_path.as_bytes();
+        data.extend_from_slice(&(path_bytes.len() as u32).to_be_bytes());
+        data.extend_from_slice(path_bytes);
+
+        let mut payload = Vec::new();
+        payload.push(80); // SSH_MSG_GLOBAL_REQUEST
+        let name = b"cancel-streamlocal-forward@openssh.com";
+        payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        payload.extend_from_slice(name);
+        payload.push(1); // want_reply = true
+        payload.extend_from_slice(&data);
+        self.stream.write_packet(&PacketFrame::new(payload)).await?;
+
+        // Wait for REQUEST_SUCCESS (81) or REQUEST_FAILURE (82).
+        loop {
+            let frame = self.read_channel_packet().await?;
+            match frame.payload.first().copied() {
+                Some(81) => {
+                    info!(socket_path, "cancel streamlocal forward accepted");
+                    return Ok(());
+                }
+                Some(82) => {
+                    return Err(RusshError::new(
+                        RusshErrorCategory::Channel,
+                        format!("cancel streamlocal forward rejected for {socket_path}"),
+                    ));
+                }
+                _ => {
+                    if let Ok(ch) = ChannelMessage::from_bytes(&frame.payload) {
+                        let _ = self.channel_manager.process(&ch);
+                    }
+                }
+            }
+        }
+    }
+
     /// Send `SSH_MSG_DISCONNECT` and flush the connection.
     pub async fn disconnect(&mut self) -> Result<(), RusshError> {
         self.session.close("client disconnect");
@@ -5083,5 +5214,297 @@ mod tests {
 
         // Apply with None (system default) — should also succeed.
         apply_tcp_keepalive(&client_tcp, None);
+    }
+
+    // ── tcpip-forward listener lifecycle tests ──────────────────────────────
+
+    /// Test that tcpip-forward binds a listener and cancel-tcpip-forward cleans up properly.
+    #[tokio::test]
+    async fn tcpip_forward_lifecycle() {
+        use tokio::time::{timeout, Duration};
+
+        // ── Server config ──
+        let host_key_seed = [0x99u8; 32];
+        let mut server_config = ServerConfig::secure_defaults();
+        server_config.host_key_seed = Some(host_key_seed);
+
+        // ── Bind server ──
+        let server = SshServer::bind("127.0.0.1:0", server_config)
+            .await
+            .expect("bind server");
+        let server_addr = server.local_addr().expect("local addr");
+
+        // ── Spawn server task ──
+        let server_handle = task::spawn(async move {
+            let conn = server.accept().await.expect("accept");
+            conn.run(DefaultSessionHandler::new(".")).await
+        });
+
+        // ── Client config ──
+        let mut client_config = ClientConfig::secure_defaults("test-user");
+        client_config.strict_host_key_checking = false;
+
+        let mut client = SshClient::connect(server_addr, client_config)
+            .await
+            .expect("connect");
+        client
+            .authenticate_password("test-password")
+            .await
+            .expect("auth");
+
+        // ── Request tcpip-forward with port 0 (let OS assign) ──
+        let bind_port = client
+            .request_remote_forward("127.0.0.1", 0)
+            .await
+            .expect("tcpip-forward request");
+        assert!(bind_port > 0, "server should allocate a port");
+
+        // ── Verify the listener is bound by checking the port is in use ──
+        // We'll try to bind the same port — it should fail because it's already bound.
+        let bind_result = TcpListener::bind(format!("127.0.0.1:{}", bind_port)).await;
+        assert!(
+            bind_result.is_err(),
+            "port should be in use after tcpip-forward"
+        );
+
+        // ── Cancel the forward ──
+        client
+            .cancel_remote_forward("127.0.0.1", bind_port)
+            .await
+            .expect("cancel-tcpip-forward");
+
+        // Give the server a moment to clean up.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // ── Verify the listener is closed by binding the same port ──
+        // This should succeed because the listener was removed.
+        let rebind_result = timeout(
+            Duration::from_millis(500),
+            TcpListener::bind(format!("127.0.0.1:{}", bind_port)),
+        )
+        .await;
+
+        match rebind_result {
+            Ok(Ok(_listener)) => {
+                // Success — the port is now free.
+            }
+            Ok(Err(e)) => {
+                panic!(
+                    "port should be free after cancel-tcpip-forward, but bind failed: {}",
+                    e
+                );
+            }
+            Err(_) => {
+                panic!("rebind timed out after cancel-tcpip-forward");
+            }
+        }
+
+        // ── Disconnect ──
+        client.disconnect().await.expect("disconnect");
+        let _ = timeout(Duration::from_secs(2), server_handle).await;
+    }
+
+    /// Test that tcpip-forward with explicit port works.
+    #[tokio::test]
+    async fn tcpip_forward_explicit_port() {
+        use tokio::time::{timeout, Duration};
+
+        let host_key_seed = [0xAAu8; 32];
+        let mut server_config = ServerConfig::secure_defaults();
+        server_config.host_key_seed = Some(host_key_seed);
+
+        let server = SshServer::bind("127.0.0.1:0", server_config)
+            .await
+            .expect("bind server");
+        let server_addr = server.local_addr().expect("local addr");
+
+        let server_handle = task::spawn(async move {
+            let conn = server.accept().await.expect("accept");
+            conn.run(DefaultSessionHandler::new(".")).await
+        });
+
+        let mut client_config = ClientConfig::secure_defaults("test-user");
+        client_config.strict_host_key_checking = false;
+
+        let mut client = SshClient::connect(server_addr, client_config)
+            .await
+            .expect("connect");
+        client
+            .authenticate_password("test-password")
+            .await
+            .expect("auth");
+
+        // Find a free port by binding and immediately closing.
+        let temp_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind temp listener");
+        let explicit_port = temp_listener.local_addr().unwrap().port();
+        drop(temp_listener);
+
+        // Small delay to ensure the OS releases the port.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Request tcpip-forward with the explicit port.
+        let returned_port = client
+            .request_remote_forward("127.0.0.1", explicit_port)
+            .await
+            .expect("tcpip-forward with explicit port");
+        assert_eq!(
+            returned_port, explicit_port,
+            "server should return the requested port"
+        );
+
+        // Cancel and disconnect.
+        client
+            .cancel_remote_forward("127.0.0.1", explicit_port)
+            .await
+            .expect("cancel");
+        client.disconnect().await.expect("disconnect");
+        let _ = timeout(Duration::from_secs(2), server_handle).await;
+    }
+
+    /// Test that multiple tcpip-forward listeners can coexist and be
+    /// independently canceled.
+    #[tokio::test]
+    async fn tcpip_forward_multiple_listeners() {
+        use tokio::time::{timeout, Duration};
+
+        let host_key_seed = [0xBBu8; 32];
+        let mut server_config = ServerConfig::secure_defaults();
+        server_config.host_key_seed = Some(host_key_seed);
+
+        let server = SshServer::bind("127.0.0.1:0", server_config)
+            .await
+            .expect("bind server");
+        let server_addr = server.local_addr().expect("local addr");
+
+        let server_handle = task::spawn(async move {
+            let conn = server.accept().await.expect("accept");
+            conn.run(DefaultSessionHandler::new(".")).await
+        });
+
+        let mut client_config = ClientConfig::secure_defaults("test-user");
+        client_config.strict_host_key_checking = false;
+
+        let mut client = SshClient::connect(server_addr, client_config)
+            .await
+            .expect("connect");
+        client
+            .authenticate_password("test-password")
+            .await
+            .expect("auth");
+
+        // Request two tcpip-forwards on different ports.
+        let port1 = client
+            .request_remote_forward("127.0.0.1", 0)
+            .await
+            .expect("tcpip-forward 1");
+        let port2 = client
+            .request_remote_forward("127.0.0.1", 0)
+            .await
+            .expect("tcpip-forward 2");
+        assert_ne!(port1, port2, "ports should be different");
+
+        // Verify both listeners are active by trying to bind the same ports.
+        let bind1_result = TcpListener::bind(format!("127.0.0.1:{}", port1)).await;
+        let bind2_result = TcpListener::bind(format!("127.0.0.1:{}", port2)).await;
+        assert!(bind1_result.is_err(), "port1 should be in use");
+        assert!(bind2_result.is_err(), "port2 should be in use");
+
+        // Cancel the first listener.
+        client
+            .cancel_remote_forward("127.0.0.1", port1)
+            .await
+            .expect("cancel port1");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify port1 is closed but port2 is still open.
+        let bind1_again = TcpListener::bind(format!("127.0.0.1:{}", port1)).await;
+        let bind2_check = TcpListener::bind(format!("127.0.0.1:{}", port2)).await;
+        assert!(bind1_again.is_ok(), "port1 should be free after cancel");
+        assert!(bind2_check.is_err(), "port2 should still be in use");
+
+        // Cancel the second listener.
+        client
+            .cancel_remote_forward("127.0.0.1", port2)
+            .await
+            .expect("cancel port2");
+
+        // Disconnect.
+        client.disconnect().await.expect("disconnect");
+        let _ = timeout(Duration::from_secs(2), server_handle).await;
+    }
+
+    // ── streamlocal-forward listener lifecycle tests ────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamlocal_forward_lifecycle() {
+        use tokio::time::{timeout, Duration};
+
+        let host_key_seed = [0xCCu8; 32];
+        let mut server_config = ServerConfig::secure_defaults();
+        server_config.host_key_seed = Some(host_key_seed);
+
+        let server = SshServer::bind("127.0.0.1:0", server_config)
+            .await
+            .expect("bind server");
+        let server_addr = server.local_addr().expect("local addr");
+
+        let server_handle = task::spawn(async move {
+            let conn = server.accept().await.expect("accept");
+            conn.run(DefaultSessionHandler::new(".")).await
+        });
+
+        let mut client_config = ClientConfig::secure_defaults("test-user");
+        client_config.strict_host_key_checking = false;
+
+        let mut client = SshClient::connect(server_addr, client_config)
+            .await
+            .expect("connect");
+        client
+            .authenticate_password("test-password")
+            .await
+            .expect("auth");
+
+        // Request streamlocal-forward with a unique socket path.
+        let socket_path = format!(
+            "russh_test_socket_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        client
+            .request_streamlocal_forward(&socket_path)
+            .await
+            .expect("streamlocal-forward request");
+
+        // Verify the socket exists by checking the filesystem.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            std::path::Path::new(&socket_path).exists(),
+            "socket should exist after streamlocal-forward"
+        );
+
+        // Cancel the forward.
+        client
+            .cancel_streamlocal_forward(&socket_path)
+            .await
+            .expect("cancel-streamlocal-forward");
+
+        // Give the server a moment to clean up.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify the socket is removed.
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "socket should be removed after cancel-streamlocal-forward"
+        );
+
+        client.disconnect().await.expect("disconnect");
+        let _ = timeout(Duration::from_secs(2), server_handle).await;
     }
 }

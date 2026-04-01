@@ -1166,6 +1166,22 @@ impl ForwardHandle {
         buf
     }
 
+    /// Build the extra data for a `forwarded-streamlocal@openssh.com` channel open.
+    ///
+    /// Wire format: `string(socket_path) || string("") || uint32(0)`.
+    #[must_use]
+    pub fn build_forwarded_streamlocal_open_extra(socket_path: &str) -> Vec<u8> {
+        let path_bytes = socket_path.as_bytes();
+        let mut buf = Vec::with_capacity(4 + path_bytes.len() + 4 + 4);
+        buf.extend_from_slice(&(path_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(path_bytes);
+        // reserved string (empty)
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        // reserved uint32
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf
+    }
+
     /// Parse the data payload from a `streamlocal-forward@openssh.com` global request.
     ///
     /// Wire format: `string(socket_path)`.

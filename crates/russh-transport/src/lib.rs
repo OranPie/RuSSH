@@ -43,7 +43,10 @@ use russh_crypto::{
     RsaVerifier, Sha256, Sha512, Signer, Verifier, decode_ssh_string, derive_key_sha256,
     derive_key_sha512, encode_mpint, encode_ssh_string,
 };
-use russh_observability::EventSink;
+use russh_observability::{
+    AuthEvent, EventSink, TelemetryEvent,
+    TransportEvent as ObservabilityTransportEvent,
+};
 
 const SSH_USERAUTH_SERVICE: &str = "ssh-userauth";
 const SSH_CONNECTION_SERVICE: &str = "ssh-connection";
@@ -834,6 +837,13 @@ impl ClientSession {
         self.event_sink = Some(sink);
     }
 
+    /// Helper to emit a transport event to the observability sink (if configured).
+    fn emit_observability_event(&self, event: ObservabilityTransportEvent) {
+        if let Some(ref sink) = self.event_sink {
+            sink.emit(&TelemetryEvent::Transport(event));
+        }
+    }
+
     pub async fn handshake(&mut self, remote_version: &str) -> Result<(), RusshError> {
         self.handshake_with_peer(PeerDescription::openssh_like(remote_version))
             .await
@@ -874,6 +884,7 @@ impl ClientSession {
             local: "SSH-2.0-RuSSH_0.1".to_string(),
             remote: peer.banner,
         });
+        self.emit_observability_event(ObservabilityTransportEvent::VersionExchange);
 
         let negotiated = negotiate_algorithms(
             self.config.transport.policy.algorithms(),
@@ -885,6 +896,7 @@ impl ClientSession {
             cipher_client_to_server: negotiated.cipher_client_to_server.clone(),
             cipher_server_to_client: negotiated.cipher_server_to_client.clone(),
         });
+        self.emit_observability_event(ObservabilityTransportEvent::AlgorithmNegotiated);
 
         self.negotiated = Some(negotiated);
         self.state = SessionState::AlgorithmsNegotiated;
@@ -1275,6 +1287,7 @@ impl ClientSession {
         let reason = reason.into();
         self.events
             .push(TransportEvent::Disconnected { code, reason });
+        self.emit_observability_event(ObservabilityTransportEvent::Disconnect);
         self.state = SessionState::Closed;
     }
 
@@ -1598,6 +1611,7 @@ impl ClientSession {
     fn perform_rekey(&mut self) {
         self.state = SessionState::Rekeying;
         self.events.push(TransportEvent::RekeyStarted);
+        self.emit_observability_event(ObservabilityTransportEvent::Rekey);
         self.reset_rekey_counters();
         self.events.push(TransportEvent::RekeyFinished);
         self.state = if self.pending_service.is_some() {
@@ -1675,6 +1689,20 @@ impl ServerSession {
         self.event_sink = Some(sink);
     }
 
+    /// Helper to emit a transport event to the observability sink (if configured).
+    fn emit_observability_event(&self, event: ObservabilityTransportEvent) {
+        if let Some(ref sink) = self.event_sink {
+            sink.emit(&TelemetryEvent::Transport(event));
+        }
+    }
+
+    /// Helper to emit an auth event to the observability sink (if configured).
+    fn emit_auth_event(&self, event: AuthEvent) {
+        if let Some(ref sink) = self.event_sink {
+            sink.emit(&TelemetryEvent::Auth(event));
+        }
+    }
+
     /// Store the raw (wire-format) bytes of the client's KEXINIT payload.
     /// Must be called before `receive_message(KexInit)` so the exchange hash uses
     /// the original bytes rather than a re-encoded version.
@@ -1705,6 +1733,7 @@ impl ServerSession {
             self.local_version = "SSH-2.0-RuSSH_0.1".to_string();
         }
         self.remote_version = client_banner.to_string();
+        self.emit_observability_event(ObservabilityTransportEvent::VersionExchange);
         Ok(())
     }
 
@@ -1734,6 +1763,7 @@ impl ServerSession {
         )?;
         self.state = SessionState::AlgorithmsNegotiated;
         self.negotiated = Some(negotiated);
+        self.emit_observability_event(ObservabilityTransportEvent::AlgorithmNegotiated);
 
         self.negotiated.as_ref().ok_or_else(|| {
             RusshError::new(
@@ -1980,6 +2010,8 @@ impl ServerSession {
                 let (result, _event) = auth_session.evaluate_with_event(&auth_request);
                 match result {
                     AuthResult::Accepted => {
+                        
+                        self.emit_auth_event(AuthEvent::Success);
                         self.authenticated_user = Some(user);
                         self.bump_outgoing_sequence();
                         Ok(Some(UserAuthMessage::Success))
@@ -1991,6 +2023,10 @@ impl ServerSession {
                             .map(AuthMethod::as_ssh_name)
                             .map(ToOwned::to_owned)
                             .collect();
+                        
+                        self.emit_auth_event(AuthEvent::Failure {
+                            reason: "keyboard-interactive failed".to_string(),
+                        });
                         self.bump_outgoing_sequence();
                         Ok(Some(UserAuthMessage::Failure {
                             methods,
@@ -2297,6 +2333,17 @@ impl ServerSession {
             }
         };
 
+        // Emit method attempt event
+        let method_name = match &auth_request {
+            AuthRequest::PublicKey { .. } => "publickey",
+            AuthRequest::Password { .. } => "password",
+            AuthRequest::KeyboardInteractive { .. } => "keyboard-interactive",
+            AuthRequest::GssApi { .. } => "gssapi",
+        };
+        self.emit_auth_event(AuthEvent::MethodAttempt {
+            method: method_name.to_string(),
+        });
+
         if let Some(authenticating_user) = self.authenticating_user.as_deref() {
             if authenticating_user != user {
                 let methods = self.allowed_userauth_methods();
@@ -2320,11 +2367,17 @@ impl ServerSession {
         let (result, _event) = auth_session.evaluate_with_event(&auth_request);
         match result {
             AuthResult::Accepted => {
+                
+                self.emit_auth_event(AuthEvent::Success);
                 self.authenticated_user = Some(user);
                 self.bump_outgoing_sequence();
                 Ok(Some(UserAuthMessage::Success))
             }
             AuthResult::PartiallyAccepted { next_methods } => {
+                
+                self.emit_auth_event(AuthEvent::Failure {
+                    reason: "partial success".to_string(),
+                });
                 self.bump_outgoing_sequence();
                 Ok(Some(UserAuthMessage::Failure {
                     methods: next_methods
@@ -2342,6 +2395,10 @@ impl ServerSession {
                     .map(AuthMethod::as_ssh_name)
                     .map(ToOwned::to_owned)
                     .collect();
+                
+                self.emit_auth_event(AuthEvent::Failure {
+                    reason: "rejected".to_string(),
+                });
                 self.bump_outgoing_sequence();
                 Ok(Some(UserAuthMessage::Failure {
                     methods,
@@ -4228,5 +4285,80 @@ mod tests {
             .tcp_keepalive_secs(Some(120))
             .build();
         assert_eq!(cfg.tcp_keepalive_secs, Some(120));
+    }
+
+    #[test]
+    fn client_session_emits_events_to_sink() {
+        use russh_observability::{
+            MemorySink, TelemetryEvent, TransportEvent as ObservabilityTransportEvent,
+        };
+        use std::sync::Arc;
+
+        let sink = Arc::new(MemorySink::default());
+        let mut session = ClientSession::new(ClientConfig::secure_defaults("alice"));
+        session.set_event_sink(sink.clone());
+
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+
+        let events = sink.events();
+        assert!(
+            events.contains(&TelemetryEvent::Transport(
+                ObservabilityTransportEvent::VersionExchange
+            )),
+            "expected VersionExchange event"
+        );
+        assert!(
+            events.contains(&TelemetryEvent::Transport(
+                ObservabilityTransportEvent::AlgorithmNegotiated
+            )),
+            "expected AlgorithmNegotiated event"
+        );
+    }
+
+    #[test]
+    fn server_session_emits_auth_events_to_sink() {
+        use russh_observability::{AuthEvent, MemorySink, TelemetryEvent};
+        use std::sync::Arc;
+
+        let sink = Arc::new(MemorySink::default());
+        let mut server = ServerSession::new(test_server_config());
+        server.set_event_sink(sink.clone());
+        drive_server_past_kex(&mut server);
+
+        // Request ssh-userauth service
+        let _reply = server
+            .receive_message(TransportMessage::ServiceRequest {
+                service: "ssh-userauth".to_string(),
+            })
+            .expect("should accept service request");
+
+        // Activate auth with default policy (accepts password auth)
+        let policy = ServerAuthPolicy::secure_defaults();
+        server.activate_userauth(policy);
+
+        // Try password auth - will succeed with default policy
+        let request = UserAuthRequest::Password {
+            user: "alice".to_string(),
+            service: "ssh-connection".to_string(),
+            password: "anything".to_string(),
+        };
+        let _reply = server
+            .receive_userauth_message(UserAuthMessage::Request(request))
+            .expect("should handle userauth request");
+
+        let events = sink.events();
+        assert!(
+            events.contains(&TelemetryEvent::Auth(AuthEvent::MethodAttempt {
+                method: "password".to_string(),
+            })),
+            "expected MethodAttempt event"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::Auth(AuthEvent::Success)
+            )),
+            "expected auth Success event"
+        );
     }
 }
