@@ -10,6 +10,9 @@
 //! plus [`Directive::Unknown`] for unrecognized keywords (preserved without
 //! error).
 //!
+//! [`parse_config_file`] loads a config file from disk and recursively
+//! resolves `Include` directives (with a depth limit of 16).
+//!
 //! ## Resolution
 //!
 //! [`ConfigFile::resolve_for_host`] applies all matching `Host` blocks to
@@ -39,8 +42,11 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use russh_core::{RusshError, RusshErrorCategory};
+
+const MAX_INCLUDE_DEPTH: u8 = 16;
 
 /// Parsed config file with directives and deterministic warnings.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +128,9 @@ impl ConfigFile {
                 Directive::LoginGraceTime(seconds) => {
                     normalized.insert("LoginGraceTime".to_string(), seconds.to_string());
                 }
+                Directive::TcpKeepAlive(enabled) => {
+                    normalized.insert("TCPKeepAlive".to_string(), enabled.to_string());
+                }
                 Directive::Unknown(unknown) => {
                     normalized.insert(
                         format!("Unknown:{}", unknown.keyword),
@@ -163,6 +172,7 @@ pub enum Directive {
     AllowUsers(Vec<String>),
     DenyUsers(Vec<String>),
     LoginGraceTime(u64),
+    TcpKeepAlive(bool),
     Unknown(UnknownDirective),
 }
 
@@ -199,6 +209,7 @@ pub struct ResolvedConfig {
     pub allow_users: Option<Vec<String>>,
     pub deny_users: Option<Vec<String>>,
     pub login_grace_time: Option<u64>,
+    pub tcp_keepalive: Option<bool>,
     pub extra: std::collections::BTreeMap<String, String>,
 }
 
@@ -280,6 +291,9 @@ pub fn parse_config(input: &str) -> Result<ConfigFile, RusshError> {
             "logingracetime" => {
                 Directive::LoginGraceTime(parse_integer(args, line_number, "LoginGraceTime")?)
             }
+            "tcpkeepalive" => {
+                Directive::TcpKeepAlive(parse_bool(args, line_number, "TCPKeepAlive")?)
+            }
             _ => {
                 file.warnings.push(ConfigWarning {
                     line: line_number,
@@ -297,6 +311,129 @@ pub fn parse_config(input: &str) -> Result<ConfigFile, RusshError> {
     }
 
     Ok(file)
+}
+
+/// Parse an SSH config file from disk, resolving `Include` directives.
+///
+/// Include paths are resolved relative to the directory containing the config
+/// file. Tilde (`~`) is expanded to `$HOME`. Glob patterns (`*`, `?`) are
+/// supported in the filename component of the include path.
+///
+/// Missing include files are silently skipped (OpenSSH behavior).
+/// Include depth is limited to [`MAX_INCLUDE_DEPTH`] to prevent circular
+/// includes.
+pub fn parse_config_file(path: &Path) -> Result<ConfigFile, RusshError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        RusshError::new(
+            RusshErrorCategory::Config,
+            format!("failed to read config file {}: {e}", path.display()),
+        )
+    })?;
+    let base_dir = path.parent().unwrap_or(Path::new("."));
+    parse_config_with_includes(&text, base_dir, 0)
+}
+
+/// Parse config text, resolving `Include` directives relative to `base_dir`.
+///
+/// `depth` tracks the current include nesting level. Callers should pass `0`
+/// for the top-level file. Returns [`RusshError`] if the depth limit
+/// ([`MAX_INCLUDE_DEPTH`]) is exceeded.
+pub fn parse_config_with_includes(
+    input: &str,
+    base_dir: &Path,
+    depth: u8,
+) -> Result<ConfigFile, RusshError> {
+    if depth > MAX_INCLUDE_DEPTH {
+        return Err(RusshError::new(
+            RusshErrorCategory::Config,
+            format!(
+                "include depth limit ({MAX_INCLUDE_DEPTH}) exceeded — possible circular include"
+            ),
+        ));
+    }
+
+    let mut file = parse_config(input)?;
+    let mut expanded_directives = Vec::new();
+
+    for directive in file.directives.drain(..) {
+        if let Directive::Include(ref pattern) = directive {
+            let paths = resolve_include_paths(pattern, base_dir);
+            for include_path in paths {
+                if let Ok(text) = std::fs::read_to_string(&include_path) {
+                    let include_dir = include_path.parent().unwrap_or(base_dir);
+                    let included = parse_config_with_includes(&text, include_dir, depth + 1)?;
+                    expanded_directives.extend(included.directives);
+                    file.warnings.extend(included.warnings);
+                }
+                // Missing files are silently skipped (OpenSSH behavior)
+            }
+        } else {
+            expanded_directives.push(directive);
+        }
+    }
+
+    file.directives = expanded_directives;
+    Ok(file)
+}
+
+fn expand_include_tilde(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(stripped);
+        }
+    } else if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn resolve_include_paths(pattern: &str, base_dir: &Path) -> Vec<PathBuf> {
+    let expanded = expand_include_tilde(pattern);
+    let full_path = if expanded.is_absolute() {
+        expanded
+    } else {
+        base_dir.join(expanded)
+    };
+
+    let path_str = full_path.to_string_lossy();
+    if path_str.contains('*') || path_str.contains('?') {
+        glob_include_paths(&full_path)
+    } else {
+        vec![full_path]
+    }
+}
+
+/// Case-sensitive glob match for file name matching (unlike [`glob_match`]
+/// which is case-insensitive for SSH host patterns).
+fn file_glob_match(pattern: &str, value: &str) -> bool {
+    glob_match_impl(pattern.as_bytes(), value.as_bytes())
+}
+
+fn glob_include_paths(pattern_path: &Path) -> Vec<PathBuf> {
+    let parent = pattern_path.parent().unwrap_or(Path::new("."));
+    let file_pattern = match pattern_path.file_name() {
+        Some(f) => f.to_string_lossy().to_string(),
+        None => return Vec::new(),
+    };
+
+    let dir_entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(), // directory doesn't exist, skip silently
+    };
+
+    let mut paths: Vec<PathBuf> = dir_entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            file_glob_match(&file_pattern, &name) && entry.path().is_file()
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    paths.sort();
+    paths
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -518,6 +655,9 @@ fn apply_directive_first_match(
         Directive::LoginGraceTime(v) if resolved.login_grace_time.is_none() => {
             resolved.login_grace_time = Some(*v);
         }
+        Directive::TcpKeepAlive(v) if resolved.tcp_keepalive.is_none() => {
+            resolved.tcp_keepalive = Some(*v);
+        }
         Directive::Unknown(u) => {
             resolved
                 .extra
@@ -610,7 +750,10 @@ fn glob_match_impl(pattern: &[u8], value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Directive, glob_match, matches_host_patterns, parse_config};
+    use super::{
+        Directive, expand_include_tilde, glob_match, matches_host_patterns, parse_config,
+        parse_config_file, parse_config_with_includes,
+    };
 
     #[test]
     fn parser_handles_known_and_unknown_directives() {
@@ -878,5 +1021,209 @@ Host myserver
             Some(&["alice".to_string()] as &[String]),
             "first-match-wins should apply"
         );
+    }
+
+    #[test]
+    fn include_basic_file() {
+        let dir = std::env::temp_dir().join("russh_test_include_basic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("main.conf"),
+            "Host bastion\n  User admin\nInclude extra.conf\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("extra.conf"), "Host web\n  Port 8080\n").unwrap();
+
+        let result = parse_config_file(&dir.join("main.conf")).unwrap();
+        assert!(
+            result
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Host(h) if h == "bastion"))
+        );
+        assert!(
+            result
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Host(h) if h == "web"))
+        );
+        assert!(
+            result
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Port(8080)))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_glob_pattern() {
+        let dir = std::env::temp_dir().join("russh_test_include_glob");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("conf.d")).unwrap();
+
+        std::fs::write(dir.join("main.conf"), "Include conf.d/*\n").unwrap();
+        std::fs::write(
+            dir.join("conf.d").join("a.conf"),
+            "Host alpha\n  User alice\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("conf.d").join("b.conf"),
+            "Host beta\n  Port 3333\n",
+        )
+        .unwrap();
+
+        let result = parse_config_file(&dir.join("main.conf")).unwrap();
+        assert!(
+            result
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Host(h) if h == "alpha"))
+        );
+        assert!(
+            result
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Host(h) if h == "beta"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_depth_limit() {
+        let dir = std::env::temp_dir().join("russh_test_include_depth");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // File that includes itself → triggers depth limit
+        std::fs::write(dir.join("loop.conf"), "Include loop.conf\n").unwrap();
+
+        let err = parse_config_file(&dir.join("loop.conf")).unwrap_err();
+        assert!(err.message().contains("include depth limit"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_missing_file_skipped() {
+        let dir = std::env::temp_dir().join("russh_test_include_missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("main.conf"),
+            "Host real\n  User alice\nInclude nonexistent.conf\n",
+        )
+        .unwrap();
+
+        let result = parse_config_file(&dir.join("main.conf")).unwrap();
+        assert!(
+            result
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Host(h) if h == "real"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_tilde_expansion() {
+        use std::path::PathBuf;
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(
+            expand_include_tilde("~/foo/bar"),
+            PathBuf::from(format!("{home}/foo/bar"))
+        );
+        assert_eq!(
+            expand_include_tilde("/absolute/path"),
+            PathBuf::from("/absolute/path")
+        );
+        assert_eq!(
+            expand_include_tilde("relative/path"),
+            PathBuf::from("relative/path")
+        );
+    }
+
+    #[test]
+    fn include_preserves_directive_order() {
+        let dir = std::env::temp_dir().join("russh_test_include_order");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("main.conf"),
+            "Host first\nInclude middle.conf\nHost last\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("middle.conf"), "Host middle\n").unwrap();
+
+        let result = parse_config_file(&dir.join("main.conf")).unwrap();
+        let hosts: Vec<&str> = result
+            .directives
+            .iter()
+            .filter_map(|d| match d {
+                Directive::Host(h) => Some(h.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hosts, vec!["first", "middle", "last"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_with_includes_at_zero_depth() {
+        use std::path::Path;
+
+        let result =
+            parse_config_with_includes("Host test\n  User bob\n", Path::new("."), 0).unwrap();
+        assert!(
+            result
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Host(h) if h == "test"))
+        );
+    }
+
+    #[test]
+    fn parse_tcp_keepalive_yes() {
+        let file = parse_config("TCPKeepAlive yes\n").expect("parse should succeed");
+        assert!(matches!(file.directives[0], Directive::TcpKeepAlive(true)));
+    }
+
+    #[test]
+    fn parse_tcp_keepalive_no() {
+        let file = parse_config("TCPKeepAlive no\n").expect("parse should succeed");
+        assert!(matches!(file.directives[0], Directive::TcpKeepAlive(false)));
+    }
+
+    #[test]
+    fn resolve_tcp_keepalive_first_match_wins() {
+        let config = parse_config(
+            "
+Host *
+  TCPKeepAlive no
+Host myhost
+  TCPKeepAlive yes
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("myhost");
+        assert_eq!(resolved.tcp_keepalive, Some(false), "first-match-wins should apply");
+    }
+
+    #[test]
+    fn resolve_tcp_keepalive_default_is_none() {
+        let config = parse_config("Host *\n  User alice\n").expect("parse should succeed");
+        let resolved = config.resolve_for_host("any");
+        assert_eq!(resolved.tcp_keepalive, None);
     }
 }
