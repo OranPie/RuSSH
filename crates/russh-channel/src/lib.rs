@@ -1103,6 +1103,21 @@ impl ForwardHandle {
         let bind_port = read_u32(data, &mut off)?;
         Ok((bind_address, bind_port))
     }
+
+    /// Build the data payload for a `cancel-tcpip-forward` global request (RFC 4254 §7.1).
+    ///
+    /// Wire format is identical to `tcpip-forward`: `string(bind_address) + uint32(bind_port)`.
+    #[must_use]
+    pub fn build_cancel_tcpip_forward_data(bind_address: &str, bind_port: u32) -> Vec<u8> {
+        Self::build_tcpip_forward_data(bind_address, bind_port)
+    }
+
+    /// Parse the data payload from a `cancel-tcpip-forward` global request.
+    ///
+    /// Wire format is identical to `tcpip-forward`: `string(bind_address) + uint32(bind_port)`.
+    pub fn parse_cancel_tcpip_forward_data(data: &[u8]) -> Result<(String, u32), RusshError> {
+        Self::parse_tcpip_forward_data(data)
+    }
 }
 
 #[cfg(test)]
@@ -1644,6 +1659,28 @@ mod channel_tests {
         assert_eq!(orig_host, "127.0.0.1");
         assert_eq!(orig_port, 12345);
         assert_eq!(off, extra.len(), "no trailing bytes");
+    }
+
+    #[test]
+    fn cancel_tcpip_forward_data_round_trip() {
+        let data = ForwardHandle::build_cancel_tcpip_forward_data("192.168.1.1", 2222);
+        let (addr, port) = ForwardHandle::parse_cancel_tcpip_forward_data(&data).expect("parse");
+        assert_eq!(addr, "192.168.1.1");
+        assert_eq!(port, 2222);
+    }
+
+    #[test]
+    fn cancel_tcpip_forward_data_empty_address() {
+        let data = ForwardHandle::build_cancel_tcpip_forward_data("", 0);
+        let (addr, port) = ForwardHandle::parse_cancel_tcpip_forward_data(&data).expect("parse");
+        assert_eq!(addr, "");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn cancel_tcpip_forward_parse_truncated_payload() {
+        // Only 3 bytes — too short for a valid string length
+        assert!(ForwardHandle::parse_cancel_tcpip_forward_data(&[0, 0, 0]).is_err());
     }
 }
 

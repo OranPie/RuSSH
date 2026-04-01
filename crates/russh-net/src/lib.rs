@@ -2699,6 +2699,39 @@ impl SshServerConnection {
 
     /// Drive the full connection lifecycle: handshake → auth → channel loop.
     pub async fn run(mut self, handler: impl SessionHandler) -> Result<(), RusshError> {
+        let login_grace_time = self.config.login_grace_time;
+
+        let mut session = self.run_handshake_auth(login_grace_time).await?;
+
+        // ── Channel loop ──
+        info!("entering channel loop");
+        self.run_channels(&mut session, &handler).await
+    }
+
+    /// Banner exchange, KEX, and authentication — guarded by login grace time.
+    async fn run_handshake_auth(
+        &mut self,
+        login_grace_time: std::time::Duration,
+    ) -> Result<ServerSession, RusshError> {
+        let fut = self.run_handshake_auth_inner();
+        if login_grace_time.is_zero() {
+            fut.await
+        } else {
+            match tokio::time::timeout(login_grace_time, fut).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!("login grace time expired, disconnecting");
+                    Err(RusshError::new(
+                        RusshErrorCategory::Timeout,
+                        "login grace time expired before authentication completed",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Inner handshake + auth without timeout wrapper.
+    async fn run_handshake_auth_inner(&mut self) -> Result<ServerSession, RusshError> {
         let mut session = ServerSession::new(self.config.clone());
         session.set_local_version(OUR_BANNER);
 
@@ -3014,6 +3047,73 @@ impl SshServerConnection {
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "tcpip-forward: parse failed");
+                                    if want_reply {
+                                        let _ = self
+                                            .stream
+                                            .write_packet(&PacketFrame::new(vec![82]))
+                                            .await;
+                                    }
+                                }
+                            }
+                        } else if request_name == "cancel-tcpip-forward" {
+                            let name_len = u32::from_be_bytes([
+                                frame.payload[1],
+                                frame.payload[2],
+                                frame.payload[3],
+                                frame.payload[4],
+                            ]) as usize;
+                            let data_start = 5 + name_len + 1;
+                            let data = &frame.payload[data_start..];
+                            match ForwardHandle::parse_cancel_tcpip_forward_data(data) {
+                                Ok((cancel_host, cancel_port)) => {
+                                    let cancel_addr =
+                                        if cancel_host.is_empty() || cancel_host == "0.0.0.0" {
+                                            "0.0.0.0"
+                                        } else if cancel_host == "localhost"
+                                            || cancel_host == "127.0.0.1"
+                                        {
+                                            "127.0.0.1"
+                                        } else {
+                                            &cancel_host
+                                        };
+                                    let cp = cancel_port as u16;
+                                    if let Some(idx) =
+                                        remote_forward_listeners.iter().position(|(_, h, p)| {
+                                            let stored = if h.is_empty() || h == "0.0.0.0" {
+                                                "0.0.0.0"
+                                            } else if h == "localhost" || h == "127.0.0.1" {
+                                                "127.0.0.1"
+                                            } else {
+                                                h.as_str()
+                                            };
+                                            stored == cancel_addr && *p == cp
+                                        })
+                                    {
+                                        let (listener, host, port) =
+                                            remote_forward_listeners.remove(idx);
+                                        drop(listener);
+                                        info!(host, port, "cancel-tcpip-forward: listener removed");
+                                        if want_reply {
+                                            let _ = self
+                                                .stream
+                                                .write_packet(&PacketFrame::new(vec![81]))
+                                                .await;
+                                        }
+                                    } else {
+                                        warn!(
+                                            cancel_addr,
+                                            cp, "cancel-tcpip-forward: no matching listener"
+                                        );
+                                        if want_reply {
+                                            let _ = self
+                                                .stream
+                                                .write_packet(&PacketFrame::new(vec![82]))
+                                                .await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "cancel-tcpip-forward: parse failed");
                                     if want_reply {
                                         let _ = self
                                             .stream
@@ -4398,5 +4498,49 @@ mod tests {
         assert!(!state.agent_forwarding_requested);
         state.agent_forwarding_requested = true;
         assert!(state.agent_forwarding_requested);
+    }
+
+    #[test]
+    fn parse_cancel_tcpip_forward_global_request() {
+        // Build a SSH_MSG_GLOBAL_REQUEST for cancel-tcpip-forward.
+        let name = b"cancel-tcpip-forward";
+        let mut payload = Vec::new();
+        payload.push(80); // SSH_MSG_GLOBAL_REQUEST
+        payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        payload.extend_from_slice(name);
+        payload.push(1); // want_reply = true
+        payload.extend_from_slice(&ForwardHandle::build_cancel_tcpip_forward_data(
+            "127.0.0.1",
+            8080,
+        ));
+
+        let (request_name, want_reply) = parse_global_request(&payload);
+        assert_eq!(request_name, "cancel-tcpip-forward");
+        assert!(want_reply);
+
+        // Extract the data portion and parse it.
+        let name_len =
+            u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+        let data_start = 5 + name_len + 1;
+        let data = &payload[data_start..];
+        let (addr, port) =
+            ForwardHandle::parse_cancel_tcpip_forward_data(data).expect("parse cancel data");
+        assert_eq!(addr, "127.0.0.1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn parse_cancel_tcpip_forward_no_reply() {
+        let name = b"cancel-tcpip-forward";
+        let mut payload = Vec::new();
+        payload.push(80);
+        payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        payload.extend_from_slice(name);
+        payload.push(0); // want_reply = false
+        payload.extend_from_slice(&ForwardHandle::build_cancel_tcpip_forward_data("", 0));
+
+        let (request_name, want_reply) = parse_global_request(&payload);
+        assert_eq!(request_name, "cancel-tcpip-forward");
+        assert!(!want_reply);
     }
 }
