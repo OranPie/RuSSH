@@ -24,6 +24,7 @@ use std::{
 
 use crossterm::terminal;
 use russh_auth::AuthMethod;
+use russh_channel::socks::{self, SocksVersion};
 use russh_cli::ParsedPrivateKey;
 use russh_config::{ResolvedConfig, parse_config};
 use russh_crypto::{
@@ -33,6 +34,7 @@ use russh_crypto::{
 use russh_net::{SshClient, SshClientConnection};
 use russh_observability::{Severity, StderrLogger, VerboseLevel};
 use russh_transport::ClientConfig;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 fn usage() -> ! {
@@ -99,7 +101,6 @@ struct Args {
     /// Whether to request SSH agent forwarding (`-A`).
     agent_forwarding: bool,
     /// Dynamic SOCKS forwarding specs: `(bind_host, bind_port)`.
-    #[allow(dead_code)]
     dynamic_forwards: Vec<(String, u16)>,
     /// `-N`: do not execute a remote command (forwarding-only / keepalive mode).
     no_command: bool,
@@ -892,10 +893,7 @@ async fn main() {
 
     // -f: release the terminal after auth by closing stdin and printing the PID.
     if args.fork_background {
-        eprintln!(
-            "russh: backgrounding (pid {})",
-            std::process::id()
-        );
+        eprintln!("russh: backgrounding (pid {})", std::process::id());
         // Drop our handle to stdin so the terminal is released.
         // The process continues running the event loop for forwarding / keepalive.
         drop(std::io::stdin());
@@ -905,7 +903,9 @@ async fn main() {
     // Port forwarding without a command: forward-only mode.
     // Also entered when -N is active (no remote command).
     // ──────────────────────────────────────────────────────────
-    let has_forwards = !args.local_forwards.is_empty() || !args.remote_forwards.is_empty();
+    let has_forwards = !args.local_forwards.is_empty()
+        || !args.remote_forwards.is_empty()
+        || !args.dynamic_forwards.is_empty();
     if no_command || (has_forwards && args.command.is_empty()) {
         let conn = Arc::new(tokio::sync::Mutex::new(conn));
 
@@ -1021,6 +1021,44 @@ async fn main() {
             handles.push(handle);
         }
 
+        // Dynamic SOCKS forwards (-D): SOCKS4/5 proxy → direct-tcpip channels.
+        for (bind_host, bind_port) in args.dynamic_forwards.clone() {
+            let conn = Arc::clone(&conn);
+            let log_fwd = StderrLogger::new(log_level, "russh");
+            let handle = tokio::spawn(async move {
+                let listener = match TcpListener::bind(format!("{bind_host}:{bind_port}")).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("russh: cannot bind {bind_host}:{bind_port} for -D forward: {e}");
+                        return;
+                    }
+                };
+                log_fwd.log(
+                    Severity::Info,
+                    &format!("SOCKS proxy listening on {bind_host}:{bind_port}"),
+                );
+
+                loop {
+                    let (mut tcp_stream, peer) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    log_fwd.log(Severity::Debug, &format!("SOCKS connection from {peer}"));
+
+                    let conn = Arc::clone(&conn);
+                    let log_inner = StderrLogger::new(log_level, "russh");
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            handle_socks_client(&mut tcp_stream, &conn, &log_inner).await
+                        {
+                            log_inner.log(Severity::Debug, &format!("SOCKS session error: {e}"));
+                        }
+                    });
+                }
+            });
+            handles.push(handle);
+        }
+
         // Wait for forwarding tasks, or just keep the connection alive (-N).
         if handles.is_empty() {
             log.log(
@@ -1091,6 +1129,214 @@ async fn main() {
     io::stderr().write_all(&result.stderr).ok();
     conn.disconnect().await.ok();
     process::exit(result.exit_code.unwrap_or(0) as i32);
+}
+
+// ─── SOCKS dynamic forwarding ───────────────────────────────────────────
+
+/// Handle a single SOCKS client connection: perform the SOCKS handshake,
+/// open an SSH direct-tcpip channel to the requested target, and relay
+/// data bidirectionally.
+async fn handle_socks_client(
+    tcp: &mut TcpStream,
+    conn: &Arc<tokio::sync::Mutex<SshClientConnection>>,
+    log: &StderrLogger,
+) -> Result<(), russh_core::RusshError> {
+    // Peek at the first byte to detect SOCKS version.
+    let mut first = [0u8; 1];
+    tcp.read_exact(&mut first).await.map_err(|e| {
+        russh_core::RusshError::new(russh_core::RusshErrorCategory::Io, e.to_string())
+    })?;
+
+    let version = socks::detect_version(first[0])?;
+    let target = match version {
+        SocksVersion::V5 => socks5_handshake(tcp, &first).await?,
+        SocksVersion::V4 => socks4_handshake(tcp, &first).await?,
+    };
+
+    log.log(
+        Severity::Debug,
+        &format!("SOCKS target: {}:{}", target.host(), target.port()),
+    );
+
+    let peer = tcp.peer_addr().map_err(|e| {
+        russh_core::RusshError::new(russh_core::RusshErrorCategory::Io, e.to_string())
+    })?;
+    let peer_ip = peer.ip().to_string();
+    let peer_port = peer.port();
+
+    let mut locked = conn.lock().await;
+    let channel = locked
+        .open_direct_tcpip(&target.host(), target.port(), &peer_ip, peer_port)
+        .await;
+
+    match channel {
+        Ok((local_id, remote_id)) => {
+            // Send SOCKS success reply.
+            let reply = match version {
+                SocksVersion::V5 => socks::build_socks5_reply_success(),
+                SocksVersion::V4 => socks::build_socks4_reply_granted(),
+            };
+            if tcp.write_all(&reply).await.is_err() {
+                return Ok(());
+            }
+
+            if let Err(e) = locked.relay_tcp_channel(local_id, remote_id, tcp).await {
+                log.log(Severity::Debug, &format!("SOCKS relay error: {e}"));
+            }
+        }
+        Err(e) => {
+            log.log(
+                Severity::Warn,
+                &format!("direct-tcpip open failed for SOCKS: {e}"),
+            );
+            let reply = match version {
+                SocksVersion::V5 => socks::build_socks5_reply_failure(),
+                SocksVersion::V4 => socks::build_socks4_reply_rejected(),
+            };
+            tcp.write_all(&reply).await.ok();
+        }
+    }
+
+    Ok(())
+}
+
+/// Complete a SOCKS5 handshake: read greeting remainder, reply no-auth,
+/// read CONNECT request, and return the target.
+async fn socks5_handshake<S>(
+    tcp: &mut S,
+    first: &[u8],
+) -> Result<socks::SocksTarget, russh_core::RusshError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let io_err = |e: std::io::Error| {
+        russh_core::RusshError::new(russh_core::RusshErrorCategory::Io, e.to_string())
+    };
+
+    // Read nmethods byte, then the method list.
+    let mut nmethods_buf = [0u8; 1];
+    tcp.read_exact(&mut nmethods_buf).await.map_err(io_err)?;
+    let nmethods = nmethods_buf[0] as usize;
+    let mut methods = vec![0u8; nmethods];
+    tcp.read_exact(&mut methods).await.map_err(io_err)?;
+
+    // Build full greeting buffer and parse to validate.
+    let mut greeting_buf = Vec::with_capacity(2 + nmethods);
+    greeting_buf.push(first[0]);
+    greeting_buf.push(nmethods_buf[0]);
+    greeting_buf.extend_from_slice(&methods);
+    socks::parse_socks5_greeting(&greeting_buf)?;
+
+    // Reply: no authentication required.
+    let reply = socks::build_socks5_greeting_reply();
+    tcp.write_all(&reply).await.map_err(io_err)?;
+
+    // Read the CONNECT request. Max size: 4 (header) + 1 + 255 + 2 (domain) = 262.
+    let mut req_buf = vec![0u8; 4];
+    tcp.read_exact(&mut req_buf).await.map_err(io_err)?;
+
+    // Read the rest based on address type.
+    let atyp = req_buf[3];
+    let addr_data = match atyp {
+        0x01 => {
+            // IPv4: 4 bytes addr + 2 bytes port
+            let mut rest = vec![0u8; 6];
+            tcp.read_exact(&mut rest).await.map_err(io_err)?;
+            rest
+        }
+        0x03 => {
+            // Domain: 1 byte len, domain, 2 bytes port
+            let mut len_buf = [0u8; 1];
+            tcp.read_exact(&mut len_buf).await.map_err(io_err)?;
+            let dlen = len_buf[0] as usize;
+            let mut rest = vec![0u8; dlen + 2];
+            tcp.read_exact(&mut rest).await.map_err(io_err)?;
+            let mut full = vec![len_buf[0]];
+            full.extend_from_slice(&rest);
+            full
+        }
+        0x04 => {
+            // IPv6: 16 bytes addr + 2 bytes port
+            let mut rest = vec![0u8; 18];
+            tcp.read_exact(&mut rest).await.map_err(io_err)?;
+            rest
+        }
+        _ => {
+            let reply = socks::build_socks5_reply_failure();
+            tcp.write_all(&reply).await.ok();
+            return Err(russh_core::RusshError::new(
+                russh_core::RusshErrorCategory::Protocol,
+                "unsupported SOCKS5 address type",
+            ));
+        }
+    };
+
+    req_buf.extend_from_slice(&addr_data);
+
+    // Validate the command is CONNECT; send cmd-not-supported otherwise.
+    if req_buf[1] != 0x01 {
+        let reply = socks::build_socks5_reply_cmd_not_supported();
+        tcp.write_all(&reply).await.ok();
+        return Err(russh_core::RusshError::new(
+            russh_core::RusshErrorCategory::Protocol,
+            "only CONNECT command is supported",
+        ));
+    }
+
+    socks::parse_socks5_request(&req_buf)
+}
+
+/// Complete a SOCKS4/4a handshake: read the remainder of the request
+/// (first byte already consumed) and return the target.
+async fn socks4_handshake<S>(
+    tcp: &mut S,
+    first: &[u8],
+) -> Result<socks::SocksTarget, russh_core::RusshError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let io_err = |e: std::io::Error| {
+        russh_core::RusshError::new(russh_core::RusshErrorCategory::Io, e.to_string())
+    };
+
+    // Read the fixed part: cmd(1) + port(2) + ip(4) = 7 bytes.
+    let mut fixed = [0u8; 7];
+    tcp.read_exact(&mut fixed).await.map_err(io_err)?;
+
+    // Read the null-terminated userid + possibly a null-terminated domain.
+    // Cap at 512 bytes to avoid unbounded reads.
+    let mut trailing = Vec::new();
+    let mut null_count = 0u8;
+    let is_socks4a = fixed[3] == 0 && fixed[4] == 0 && fixed[5] == 0 && fixed[6] != 0;
+    let need_nulls: u8 = if is_socks4a { 2 } else { 1 };
+
+    loop {
+        let mut b = [0u8; 1];
+        tcp.read_exact(&mut b).await.map_err(io_err)?;
+        trailing.push(b[0]);
+        if b[0] == 0 {
+            null_count += 1;
+            if null_count >= need_nulls {
+                break;
+            }
+        }
+        if trailing.len() > 512 {
+            let reply = socks::build_socks4_reply_rejected();
+            tcp.write_all(&reply).await.ok();
+            return Err(russh_core::RusshError::new(
+                russh_core::RusshErrorCategory::Protocol,
+                "SOCKS4 request too large",
+            ));
+        }
+    }
+
+    // Assemble the full request buffer.
+    let mut buf = Vec::with_capacity(1 + 7 + trailing.len());
+    buf.push(first[0]);
+    buf.extend_from_slice(&fixed);
+    buf.extend_from_slice(&trailing);
+
+    socks::parse_socks4_request(&buf)
 }
 
 #[cfg(test)]
@@ -1557,5 +1803,163 @@ mod tests {
         assert!(args.fork_background);
         assert_eq!(args.local_forwards.len(), 1);
         assert_eq!(args.remote_forwards.len(), 1);
+    }
+
+    // ── -D (dynamic SOCKS forwarding) tests ─────────────────────────────
+
+    #[test]
+    fn d_flag_parsed_into_args() {
+        let args = parse_args_from(make_argv(&["-D", "1080", "host"]));
+        assert_eq!(args.dynamic_forwards, vec![("127.0.0.1".to_string(), 1080)]);
+    }
+
+    #[test]
+    fn d_flag_with_bind_address() {
+        let args = parse_args_from(make_argv(&["-D", "0.0.0.0:8080", "host"]));
+        assert_eq!(args.dynamic_forwards, vec![("0.0.0.0".to_string(), 8080)]);
+    }
+
+    #[test]
+    fn d_flag_multiple() {
+        let args = parse_args_from(make_argv(&["-D", "1080", "-D", "0.0.0.0:9090", "host"]));
+        assert_eq!(args.dynamic_forwards.len(), 2);
+        assert_eq!(args.dynamic_forwards[0], ("127.0.0.1".to_string(), 1080));
+        assert_eq!(args.dynamic_forwards[1], ("0.0.0.0".to_string(), 9090));
+    }
+
+    #[test]
+    fn d_flag_empty_by_default() {
+        let args = parse_args_from(make_argv(&["host"]));
+        assert!(args.dynamic_forwards.is_empty());
+    }
+
+    #[test]
+    fn d_flag_with_n_flag() {
+        let args = parse_args_from(make_argv(&["-N", "-D", "1080", "host"]));
+        assert!(args.no_command);
+        assert_eq!(args.dynamic_forwards.len(), 1);
+    }
+
+    // ── SOCKS handshake / target extraction tests ────────────────────────
+
+    #[test]
+    fn socks5_connect_domain_target_extraction() {
+        // Full SOCKS5 CONNECT request for example.com:80
+        let request = [
+            0x05, // version
+            0x01, // cmd = CONNECT
+            0x00, // reserved
+            0x03, // atyp = domain
+            0x0b, // domain length = 11
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', // "example.com"
+            0x00, 0x50, // port 80
+        ];
+        let target = socks::parse_socks5_request(&request).unwrap();
+        assert_eq!(target.host(), "example.com");
+        assert_eq!(target.port(), 80);
+    }
+
+    #[test]
+    fn socks5_connect_ipv4_target_extraction() {
+        // SOCKS5 CONNECT to 192.168.1.1:443
+        let request = [
+            0x05, 0x01, 0x00, 0x01, // version, CONNECT, rsv, IPv4
+            192, 168, 1, 1, // IP
+            0x01, 0xBB, // port 443
+        ];
+        let target = socks::parse_socks5_request(&request).unwrap();
+        assert_eq!(target.host(), "192.168.1.1");
+        assert_eq!(target.port(), 443);
+    }
+
+    #[test]
+    fn socks4_connect_target_extraction() {
+        // SOCKS4 CONNECT to 10.0.0.1:22
+        let mut request = vec![
+            0x04, 0x01, // version, CONNECT
+            0x00, 0x16, // port 22
+            10, 0, 0, 1,    // IP
+            0x00, // empty userid, null terminated
+        ];
+        let target = socks::parse_socks4_request(&request).unwrap();
+        assert_eq!(target.host(), "10.0.0.1");
+        assert_eq!(target.port(), 22);
+
+        // SOCKS4a with domain
+        request = vec![
+            0x04, 0x01, // version, CONNECT
+            0x00, 0x50, // port 80
+            0, 0, 0, 1,    // 0.0.0.1 triggers SOCKS4a
+            0x00, // empty userid
+            b'g', b'i', b't', b'h', b'u', b'b', b'.', b'c', b'o', b'm',
+            0x00, // "github.com\0"
+        ];
+        let target = socks::parse_socks4_request(&request).unwrap();
+        assert_eq!(target.host(), "github.com");
+        assert_eq!(target.port(), 80);
+    }
+
+    #[test]
+    fn socks5_version_detection() {
+        assert_eq!(socks::detect_version(0x05).unwrap(), SocksVersion::V5);
+        assert_eq!(socks::detect_version(0x04).unwrap(), SocksVersion::V4);
+        assert!(socks::detect_version(0x03).is_err());
+    }
+
+    #[tokio::test]
+    async fn socks5_handshake_via_mock_stream() {
+        // Simulate a SOCKS5 handshake over a tokio duplex stream.
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let handshake = tokio::spawn(async move {
+            // First byte already consumed by the caller — pass it in.
+            let first = [0x05u8];
+            socks5_handshake(&mut server, &first).await
+        });
+
+        // Client side: send greeting body (nmethods=1, method=0x00).
+        client.write_all(&[0x01, 0x00]).await.unwrap();
+
+        // Read greeting reply (should be [0x05, 0x00]).
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0x00]);
+
+        // Send CONNECT request for example.com:443.
+        let request = [
+            0x05, 0x01, 0x00, 0x03, // ver, CONNECT, rsv, domain
+            0x0b, // domain length
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', // domain
+            0x01, 0xBB, // port 443
+        ];
+        client.write_all(&request).await.unwrap();
+
+        let target = handshake.await.unwrap().unwrap();
+        assert_eq!(target.host(), "example.com");
+        assert_eq!(target.port(), 443);
+    }
+
+    #[tokio::test]
+    async fn socks4_handshake_via_mock_stream() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+
+        let handshake = tokio::spawn(async move {
+            let first = [0x04u8];
+            socks4_handshake(&mut server, &first).await
+        });
+
+        // Send the rest of a SOCKS4a request for github.com:22.
+        let body = [
+            0x01, // CONNECT
+            0x00, 0x16, // port 22
+            0, 0, 0, 1,    // SOCKS4a marker IP
+            0x00, // empty userid null
+            b'g', b'i', b't', b'h', b'u', b'b', b'.', b'c', b'o', b'm', 0x00,
+        ];
+        client.write_all(&body).await.unwrap();
+
+        let target = handshake.await.unwrap().unwrap();
+        assert_eq!(target.host(), "github.com");
+        assert_eq!(target.port(), 22);
     }
 }

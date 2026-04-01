@@ -12,9 +12,10 @@ description = "Command-line SSH client and server binaries for RuSSH"
 workspace = true
 
 [dependencies]
-russh-core   = { path = "../russh-core" }
-russh-crypto = { path = "../russh-crypto" }
-russh-net    = { path = "../russh-net" }
+russh-core    = { path = "../russh-core" }
+russh-channel = { path = "../russh-channel" }
+russh-crypto  = { path = "../russh-crypto" }
+russh-net     = { path = "../russh-net" }
 russh-transport = { path = "../russh-transport" }
 russh-auth   = { path = "../russh-auth" }
 russh-observability = { path = "../russh-observability" }
