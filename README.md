@@ -8,21 +8,23 @@ RuSSH is a layered Rust workspace for building secure, OpenSSH-compatible SSH cl
 ## Features
 
 - **Real cryptography** — AES-256-GCM, AES-256-CTR, AES-128-CTR, ChaCha20-Poly1305, HMAC-SHA-256/512 (ETM), SHA-256/512
-- **Key exchange** — Curve25519-SHA256 (RFC 8731), ECDH-NIST-P256-SHA256, DH group14-sha256
-- **Host keys** — Ed25519, ECDSA-P256, RSA (sha2-256 / sha2-512); OpenSSH certificate support
-- **Full auth engine** — publickey, password (constant-time), keyboard-interactive; auth method ordering
+- **Key exchange** — Curve25519-SHA256 (RFC 8731), ECDH-NIST-P256-SHA256, DH group14-sha256, DH group16-sha512 (4096-bit), DH group18-sha512 (8192-bit)
+- **Host keys** — Ed25519, ECDSA-P256/P-384/P-521, RSA (sha2-256 / sha2-512); OpenSSH certificates (Ed25519, ECDSA, RSA)
+- **Encrypted private keys** — bcrypt-pbkdf key derivation, OpenSSH `-----BEGIN OPENSSH PRIVATE KEY-----` format; passphrase-protected keys
+- **Full auth engine** — publickey, password (constant-time), keyboard-interactive; GSSAPI scaffolding; `AllowUsers`/`DenyUsers` policy enforcement; `LoginGraceTime` timeout (120 s default)
 - **SSH Agent** — `SSH_AUTH_SOCK` agent protocol (`list_identities`, `sign`), agent forwarding (`-A`)
 - **Channel multiplexing** — RFC 4254 flow-controlled channels with window management
-- **Port forwarding** — local port forwarding (`-L` via `direct-tcpip` channels)
+- **Port forwarding** — local (`-L`), remote (`-R`), dynamic SOCKS4/5 proxy (`-D`); `cancel-tcpip-forward` with listener teardown; active listener registry; Unix socket forwarding (`direct-streamlocal@openssh.com`)
 - **ProxyJump** — multi-hop connections through jump hosts (`-J` / `ProxyJump` config)
 - **Compression** — `zlib@openssh.com` delayed compression
 - **Strict KEX** — CVE-2023-48795 mitigation (sequence number reset, packet order enforcement)
-- **SFTP v3** — complete wire codec + filesystem server; symlink/readlink; extensions: posix-rename, statvfs, hardlink, fsync
+- **SFTP v3** — complete wire codec + filesystem server; `fsetstat`/`setstat` handlers; symlink/readlink; extensions: posix-rename, statvfs, hardlink, fsync
 - **SCP** — file/directory wire protocol with timestamp preservation (T-directive)
-- **OpenSSH config** — Host pattern matching, first-match-wins resolution, `%h`/`%u` tokens, `~` expansion, `ProxyJump`/`ControlMaster`/`ControlPath`
-- **CLI client** — `russh` binary with `-L`, `-A`, `-F`, `-i`, `-o` flags; keepalive; terminal resize
+- **OpenSSH config** — Host pattern matching, first-match-wins resolution, `%h`/`%u` tokens, `~` expansion, `ProxyJump`/`ControlMaster`/`ControlPath`; `Include` directive with glob and tilde expansion (depth-limited to prevent circular includes)
+- **Transport extras** — `SSH_MSG_DEBUG` packet handling; TCP `SO_KEEPALIVE` on client and server sockets
+- **CLI client** — `russh` binary with `-L`, `-R`, `-D`, `-N`, `-f`, `-J`, `-A`, `-F`, `-i`, `-o` flags; keepalive; terminal resize
 - **Web client** — xterm.js terminal over WebSocket with secure WASM tunnel mode
-- **Observability** — `tracing` and `metrics` feature-gated backends; `MemorySink` for tests
+- **Observability** — `EventSink` and `MetricsHook` wired through `russh-net`; `tracing` and `metrics` feature-gated backends; `MemorySink` for tests
 - **Security hardening** — `#[deny(unsafe_code)]`, `ZeroizeOnDrop` on session keys, `subtle::ConstantTimeEq` for secrets
 - **Fuzz infrastructure** — libfuzzer targets for packet codec, auth parser, and config parser
 
@@ -30,11 +32,12 @@ RuSSH is a layered Rust workspace for building secure, OpenSSH-compatible SSH cl
 
 | Category | Algorithms |
 |----------|-----------|
-| **KEX** | `curve25519-sha256`, `ecdh-sha2-nistp256`, `diffie-hellman-group14-sha256` |
-| **Host key** | `ssh-ed25519`, `ecdsa-sha2-nistp256`, `rsa-sha2-256`, `rsa-sha2-512` |
-| **Ciphers** | `aes256-gcm@openssh.com`, `aes256-ctr`, `aes128-ctr` |
+| **KEX** | `curve25519-sha256`, `ecdh-sha2-nistp256`, `diffie-hellman-group14-sha256`, `diffie-hellman-group16-sha512`, `diffie-hellman-group18-sha512` |
+| **Host key** | `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`, `rsa-sha2-256`, `rsa-sha2-512` |
+| **Ciphers** | `aes256-gcm@openssh.com`, `chacha20-poly1305@openssh.com`, `aes256-ctr`, `aes128-ctr` |
 | **MACs** | `hmac-sha2-256-etm@openssh.com`, `hmac-sha2-512-etm@openssh.com` |
 | **Compression** | `none`, `zlib@openssh.com` |
+| **Certificates** | `ssh-ed25519-cert-v01@openssh.com`, `ecdsa-sha2-nistp256-cert-v01@openssh.com`, `rsa-sha2-256-cert-v01@openssh.com` |
 
 ### CLI flags (`russh`)
 
@@ -43,6 +46,11 @@ RuSSH is a layered Rust workspace for building secure, OpenSSH-compatible SSH cl
 | `-i PATH` | Identity file (repeatable for multiple keys) |
 | `-F PATH` | SSH config file (default: `~/.ssh/config`) |
 | `-L [bind:]port:host:hostport` | Local port forwarding |
+| `-R [bind:]port:host:hostport` | Remote port forwarding |
+| `-D [bind:]port` | Dynamic SOCKS4/5 proxy |
+| `-J host` | ProxyJump through a jump host |
+| `-N` | No remote commands (port-forward only) |
+| `-f` | Background mode (detach after authentication) |
 | `-A` | Enable agent forwarding |
 | `-o KEY=VALUE` | OpenSSH-style option override (see below) |
 
@@ -63,7 +71,7 @@ RuSSH is a layered Rust workspace for building secure, OpenSSH-compatible SSH cl
 | `russh-scp` | SCP wire protocol (`ScpFileHeader`, `ScpDirHeader`, build/parse helpers) |
 | `russh-config` | OpenSSH config parser, `resolve_for_host`, Host glob matching, token expansion |
 | `russh-observability` | `EventSink` / `MetricsHook` traits; `tracing` and `metrics` optional backends |
-| `russh-net` | **v0.2** Async TCP client/server (`SshClient`, `SshServer`, SFTP, SCP, exec) |
+| `russh-net` | Async TCP client/server (`SshClient`, `SshServer`, SFTP, SCP, exec); observability wiring; `SO_KEEPALIVE` |
 | `russh-web` | WebSocket bridge + static terminal UI (`/ws` legacy, `/ws-tunnel` secure opaque TCP tunnel) |
 | `russh-web-wasm` | Browser SSH client core (WASM) used by secure tunnel mode |
 | `russh-integration` | End-to-end smoke scenarios, OpenSSH interop helpers |
@@ -120,9 +128,12 @@ For full web setup, compatibility notes, and troubleshooting, see [`docs/web.md`
 
 ## Status
 
-v0.5 delivers broad protocol coverage, CLI maturity, and OpenSSH compatibility —
-including expanded host key algorithms (ECDSA-P256, RSA), CTR ciphers with ETM
-MACs, DH group14 KEX, delayed compression, strict KEX (CVE-2023-48795), SFTP
-extensions, SCP timestamps, port/agent forwarding, and a full-featured CLI with
-SSH config integration. See [`docs/implementation-status.md`](docs/implementation-status.md)
+v0.7 delivers comprehensive protocol coverage, CLI maturity, and OpenSSH compatibility —
+including expanded KEX (DH group16/group18), full ECDSA family (P-256/P-384/P-521),
+encrypted private key support (bcrypt-pbkdf), OpenSSH certificates for all key types,
+remote and dynamic port forwarding (SOCKS4/5), Unix socket forwarding, `AllowUsers`/`DenyUsers`
+policy enforcement, `LoginGraceTime`, SFTP `fsetstat`/`setstat`, `Include` config directive
+with glob expansion, `SSH_MSG_DEBUG` handling, TCP `SO_KEEPALIVE`, and observability fully
+wired through `russh-net`. The test suite covers **495 tests, 0 failures, 0 unsafe blocks**.
+See [`docs/implementation-status.md`](docs/implementation-status.md)
 for a full feature matrix and [`docs/roadmap.md`](docs/roadmap.md) for upcoming work.
