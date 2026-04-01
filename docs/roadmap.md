@@ -42,7 +42,7 @@ Advanced SSH features:
   added to `russh-config`; token expansion (`%h`/`%u`/`%%`) and tilde expansion applied
   to `ControlPath`. Mux-socket protocol defers to v0.6+.
 
-## v0.5 ✅ (current)
+## v0.5 ✅
 Broad protocol coverage, CLI maturity, and OpenSSH compatibility:
 - **Crypto**: ECDSA-P256, RSA (sha2-256/sha2-512) host keys; AES-256-CTR, AES-128-CTR
   ciphers with ETM MACs; DH group14-sha256 KEX.
@@ -60,13 +60,36 @@ Broad protocol coverage, CLI maturity, and OpenSSH compatibility:
 
 258 tests, 0 unsafe blocks.
 
-## v0.6 — Hardening and performance
-- Remote port forwarding (`-R`)
-- ControlMaster mux-socket protocol
-- Corpus-based fuzz campaigns; coverage-guided CI
+## v0.6 ✅
+Algorithm expansion, server hardening, and advanced forwarding:
+- **Crypto**: ECDSA P-384/P-521 host key algorithms; DH group16-sha512 (4096-bit) and group18-sha512 (8192-bit) KEX; encrypted private key support (bcrypt-pbkdf / OpenSSH format)
+- **Certificates**: Multi-algorithm cert support (Ed25519, RSA, ECDSA) in OpenSshCertificate
+- **Server hardening**: AllowUsers/DenyUsers policy enforcement; LoginGraceTime (auth phase timeout); cancel-tcpip-forward with listener teardown
+- **Forwarding**: SOCKS4/5 dynamic proxy (-D), remote port forwarding (-R), unix socket forwarding (direct-streamlocal), GSSAPI auth scaffolding
+- **CLI**: -N (no shell) and -f (background) flags
+
+399 tests, 0 unsafe blocks.
+
+## v0.7 ✅ (current)
+Protocol completeness and observability wiring:
+- **Transport**: SSH_MSG_DEBUG handling (passed to EventSink, no longer dropped)
+- **Config**: Include directive with glob expansion, tilde, circular-include depth limiting
+- **SFTP**: fsetstat / setstat attribute handlers
+- **Network**: SO_KEEPALIVE on all client and server sockets; tcpip-forward lifecycle tracking with cancel cleanup
+- **Observability**: EventSink and MetricsHook wired through SshClientConnection / SshServerConnection
+- **SOCKS**: SOCKS4/5 proxy fully wired to direct-tcpip channels (domain name forwarding, SOCKS4a)
+- **Tests**: +87 edge case and security tests covering AEAD tampering, seq# wraparound, cert expiry boundaries, window overflow, circular includes, large offsets
+
+495 tests, 0 unsafe blocks.
+
+## v0.8 — Interop completeness
+- X11 forwarding (x11-req channel request, X11 forwarding channel)
+- ControlMaster mux-socket protocol (multiplexed sessions over Unix socket)
+- ProxyCommand support (pipe through arbitrary command)
+- hostbased authentication (RFC 4252 §9)
+- Full GSSAPI/Kerberos wiring (beyond scaffolding)
+- Corpus-based fuzz campaigns with coverage-guided CI
 - Performance benchmark harness (handshake/s, MB/s throughput)
-- Constant-time audit by external reviewer
-- API stabilization pass; deprecation of internal-only symbols
 
 ## v1.0 — Stable release
 - External security review gate
