@@ -1230,4 +1230,171 @@ Host myhost
         let resolved = config.resolve_for_host("any");
         assert_eq!(resolved.tcp_keepalive, None);
     }
+
+    #[test]
+    fn circular_include_mutual_hits_depth_limit() {
+        let dir = std::env::temp_dir().join("russh_test_circular_mutual");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A includes B, B includes A — mutual circular include
+        std::fs::write(dir.join("a.conf"), "Host alpha\nInclude b.conf\n").unwrap();
+        std::fs::write(dir.join("b.conf"), "Host beta\nInclude a.conf\n").unwrap();
+
+        let err = parse_config_file(&dir.join("a.conf")).unwrap_err();
+        assert!(err.message().contains("include depth limit"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_depth_at_max_succeeds_one_more_fails() {
+        use std::path::Path;
+
+        let simple = "Host test\n  User bob\n";
+
+        // At exactly MAX_INCLUDE_DEPTH (16) with no further includes: succeeds
+        let result = parse_config_with_includes(simple, Path::new("."), 16);
+        assert!(result.is_ok());
+
+        // One past the limit: immediately fails
+        let result = parse_config_with_includes(simple, Path::new("."), 17);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("include depth limit"));
+    }
+
+    #[test]
+    fn include_glob_matching_no_files_succeeds() {
+        let dir = std::env::temp_dir().join("russh_test_empty_glob");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Glob pattern matches nothing in empty directory — should not error
+        std::fs::write(
+            dir.join("main.conf"),
+            "Host real\n  User alice\nInclude *.nonexistent\n",
+        )
+        .unwrap();
+
+        let result = parse_config_file(&dir.join("main.conf")).unwrap();
+        assert!(
+            result
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Host(h) if h == "real"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn negated_only_host_pattern_never_matches() {
+        // Only negation patterns — no positive match is possible
+        let patterns = vec!["!*.example.com".to_string()];
+        assert!(!matches_host_patterns(&patterns, "foo.example.com"));
+        assert!(!matches_host_patterns(&patterns, "anything.else"));
+        assert!(!matches_host_patterns(&patterns, "bar"));
+    }
+
+    #[test]
+    fn multiple_host_patterns_on_one_line() {
+        let config =
+            parse_config("Host foo bar baz\n  User shared\n").expect("parse should succeed");
+
+        assert_eq!(config.resolve_for_host("foo").user.as_deref(), Some("shared"));
+        assert_eq!(config.resolve_for_host("bar").user.as_deref(), Some("shared"));
+        assert_eq!(config.resolve_for_host("baz").user.as_deref(), Some("shared"));
+        assert_eq!(config.resolve_for_host("other").user, None);
+    }
+
+    #[test]
+    fn directive_names_are_case_insensitive() {
+        let lower = parse_config("hostname foo.example.com\n").expect("lowercase");
+        assert!(matches!(&lower.directives[0], Directive::HostName(h) if h == "foo.example.com"));
+
+        let mixed = parse_config("HostName bar.example.com\n").expect("mixed case");
+        assert!(matches!(&mixed.directives[0], Directive::HostName(h) if h == "bar.example.com"));
+
+        let upper = parse_config("HOSTNAME baz.example.com\n").expect("uppercase");
+        assert!(matches!(&upper.directives[0], Directive::HostName(h) if h == "baz.example.com"));
+
+        // Also verify port parsing is case-insensitive
+        let port = parse_config("PORT 2222\n").expect("uppercase PORT");
+        assert!(matches!(port.directives[0], Directive::Port(2222)));
+    }
+
+    #[test]
+    fn duplicate_directive_first_match_wins_for_port() {
+        let config = parse_config("Host *\n  Port 2222\n  Port 3333\n")
+            .expect("parse should succeed");
+
+        // Both Port directives are parsed into the AST
+        let port_count = config
+            .directives
+            .iter()
+            .filter(|d| matches!(d, Directive::Port(_)))
+            .count();
+        assert_eq!(port_count, 2);
+
+        // Resolution picks the first value
+        let resolved = config.resolve_for_host("any");
+        assert_eq!(resolved.port, Some(2222));
+    }
+
+    #[test]
+    fn empty_value_for_directive_produces_error() {
+        // Directive keyword with no value should error
+        let err = parse_config("Port\n").expect_err("empty port should fail");
+        assert!(err.message().contains("requires at least one value"));
+
+        let err = parse_config("User\n").expect_err("empty user should fail");
+        assert!(err.message().contains("requires at least one value"));
+
+        let err = parse_config("HostName\n").expect_err("empty hostname should fail");
+        assert!(err.message().contains("requires at least one value"));
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_ignored() {
+        let config = parse_config(
+            "# This is a comment\n\n  \nHost myhost\n  # Inline comment\n  User alice\n\n",
+        )
+        .expect("parse should succeed");
+
+        assert_eq!(config.directives.len(), 2);
+        assert!(matches!(&config.directives[0], Directive::Host(h) if h == "myhost"));
+        assert!(matches!(&config.directives[1], Directive::User(u) if u == "alice"));
+        assert!(config.warnings.is_empty());
+    }
+
+    #[test]
+    fn unknown_directives_preserved_with_warnings() {
+        let config = parse_config(
+            "Host myhost\nCustomKey value1 value2\nAnotherUnknown x\nUser alice\n",
+        )
+        .expect("parse should succeed");
+
+        // Unknown directives don't cause parse failure
+        assert_eq!(config.directives.len(), 4);
+        assert_eq!(config.warnings.len(), 2);
+
+        // First unknown directive is preserved with keyword and arguments
+        if let Directive::Unknown(u) = &config.directives[1] {
+            assert_eq!(u.keyword, "CustomKey");
+            assert_eq!(u.arguments, vec!["value1", "value2"]);
+        } else {
+            panic!("expected Unknown directive at index 1");
+        }
+
+        // Second unknown directive
+        if let Directive::Unknown(u) = &config.directives[2] {
+            assert_eq!(u.keyword, "AnotherUnknown");
+            assert_eq!(u.arguments, vec!["x"]);
+        } else {
+            panic!("expected Unknown directive at index 2");
+        }
+
+        // Known directives still parse correctly alongside unknowns
+        assert!(matches!(&config.directives[3], Directive::User(u) if u == "alice"));
+    }
 }

@@ -756,4 +756,223 @@ mod tests {
         assert_ne!(n0, n1);
         assert_ne!(n1, n2);
     }
+
+    #[test]
+    fn encode_at_max_packet_size_succeeds() {
+        let max = 1024;
+        let codec = PacketCodec::new(max);
+        let frame = PacketFrame::new(vec![0xAB; max]);
+
+        let encoded = codec.encode(&frame).expect("encode at exact max should succeed");
+        let decoded = codec.decode(&encoded).expect("decode should succeed");
+        assert_eq!(decoded.payload.len(), max);
+    }
+
+    #[test]
+    fn encode_over_max_packet_size_fails() {
+        let max = 1024;
+        let codec = PacketCodec::new(max);
+        let frame = PacketFrame::new(vec![0xAB; max + 1]);
+
+        let err = codec
+            .encode(&frame)
+            .expect_err("should reject oversized payload");
+        assert_eq!(err.category(), RusshErrorCategory::Protocol);
+        assert!(err.message().contains("max packet size"));
+    }
+
+    #[test]
+    fn zero_length_payload_round_trip() {
+        let codec = PacketCodec::with_defaults();
+        let original = PacketFrame::new(vec![]);
+
+        let encoded = codec
+            .encode(&original)
+            .expect("encode empty payload should succeed");
+        assert!(encoded.len() >= 5);
+        assert_eq!(encoded.len() % codec.block_size(), 0);
+
+        let decoded = codec
+            .decode(&encoded)
+            .expect("decode empty payload should succeed");
+        assert_eq!(decoded, original);
+        assert!(decoded.payload.is_empty());
+        assert_eq!(decoded.message_type(), None);
+    }
+
+    #[test]
+    fn padding_within_bounds_block_size_8() {
+        let codec = PacketCodec::with_block_size(PacketCodec::DEFAULT_MAX_PACKET_SIZE, 8);
+        for payload_len in [0, 1, 2, 7, 8, 15, 16, 100, 255] {
+            let frame = PacketFrame::new(vec![0xCC; payload_len]);
+            let encoded = codec.encode(&frame).expect("encode should succeed");
+            let padding_len = usize::from(encoded[4]);
+
+            assert!(
+                padding_len >= PacketCodec::MIN_PADDING_LENGTH,
+                "padding {padding_len} below minimum for payload_len={payload_len}"
+            );
+            assert!(
+                padding_len <= 255,
+                "padding {padding_len} exceeds u8 max for payload_len={payload_len}"
+            );
+            assert_eq!(
+                encoded.len() % 8,
+                0,
+                "total not aligned to block_size=8 for payload_len={payload_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn padding_within_bounds_block_size_16() {
+        let codec = PacketCodec::with_block_size(PacketCodec::DEFAULT_MAX_PACKET_SIZE, 16);
+        for payload_len in [0, 1, 2, 7, 8, 15, 16, 100, 255] {
+            let frame = PacketFrame::new(vec![0xCC; payload_len]);
+            let encoded = codec.encode(&frame).expect("encode should succeed");
+            let padding_len = usize::from(encoded[4]);
+
+            assert!(
+                padding_len >= PacketCodec::MIN_PADDING_LENGTH,
+                "padding {padding_len} below minimum for payload_len={payload_len}"
+            );
+            assert!(
+                padding_len <= 255,
+                "padding {padding_len} exceeds u8 max for payload_len={payload_len}"
+            );
+            assert_eq!(
+                encoded.len() % 16,
+                0,
+                "total not aligned to block_size=16 for payload_len={payload_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_truncated_packet_does_not_panic() {
+        let codec = PacketCodec::with_defaults();
+        // Length field says 100 bytes but buffer has only 10 bytes total
+        let mut buf = vec![0u8; 10];
+        buf[0..4].copy_from_slice(&100u32.to_be_bytes());
+        buf[4] = 4;
+
+        let result = codec.decode_prefix(&buf).expect("should not hard-error");
+        assert!(result.is_none(), "should need more data");
+
+        let err = codec
+            .decode(&buf)
+            .expect_err("decode should fail on truncated packet");
+        assert_eq!(err.category(), RusshErrorCategory::Protocol);
+    }
+
+    #[test]
+    fn decode_length_field_overflow_rejected() {
+        let codec = PacketCodec::with_defaults();
+        let mut buf = vec![0u8; 8];
+        buf[0..4].copy_from_slice(&u32::MAX.to_be_bytes());
+        buf[4] = 4;
+
+        // Must not panic — either Ok(None) or Err is acceptable
+        match codec.decode_prefix(&buf) {
+            Ok(None) => {}
+            Err(e) => assert_eq!(e.category(), RusshErrorCategory::Protocol),
+            Ok(Some(_)) => panic!("should not decode with u32::MAX length and 8 bytes"),
+        }
+    }
+
+    #[test]
+    fn single_byte_payload_round_trip() {
+        let codec = PacketCodec::with_defaults();
+        let original = PacketFrame::new(vec![0xFF]);
+
+        let encoded = codec
+            .encode(&original)
+            .expect("encode single byte should succeed");
+        let decoded = codec
+            .decode(&encoded)
+            .expect("decode single byte should succeed");
+
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.message_type(), Some(0xFF));
+    }
+
+    #[test]
+    fn algorithm_set_empty_intersection() {
+        use super::AlgorithmSet;
+
+        let set_a = AlgorithmSet {
+            kex: vec!["curve25519-sha256".to_string()],
+            host_key: vec!["ssh-ed25519".to_string()],
+            ciphers: vec!["aes256-ctr".to_string()],
+            macs: vec!["hmac-sha2-256".to_string()],
+            compression: vec!["none".to_string()],
+        };
+        let set_b = AlgorithmSet {
+            kex: vec!["diffie-hellman-group14-sha256".to_string()],
+            host_key: vec!["rsa-sha2-256".to_string()],
+            ciphers: vec!["aes128-ctr".to_string()],
+            macs: vec!["hmac-sha2-512".to_string()],
+            compression: vec!["zlib".to_string()],
+        };
+
+        let common = |a: &[String], b: &[String]| -> Vec<String> {
+            a.iter().filter(|x| b.contains(x)).cloned().collect()
+        };
+
+        assert!(common(&set_a.kex, &set_b.kex).is_empty());
+        assert!(common(&set_a.host_key, &set_b.host_key).is_empty());
+        assert!(common(&set_a.ciphers, &set_b.ciphers).is_empty());
+        assert!(common(&set_a.macs, &set_b.macs).is_empty());
+        assert!(common(&set_a.compression, &set_b.compression).is_empty());
+    }
+
+    #[test]
+    fn error_category_mapping() {
+        use super::RusshError;
+
+        let cases = [
+            (RusshErrorCategory::Protocol, "bad packet"),
+            (RusshErrorCategory::Crypto, "key mismatch"),
+            (RusshErrorCategory::Auth, "denied"),
+            (RusshErrorCategory::Io, "connection lost"),
+            (RusshErrorCategory::Timeout, "timed out"),
+            (RusshErrorCategory::Config, "invalid"),
+            (RusshErrorCategory::Channel, "closed"),
+            (RusshErrorCategory::Interop, "version mismatch"),
+        ];
+
+        for (category, msg) in &cases {
+            let err = RusshError::new(*category, *msg);
+            assert_eq!(err.category(), *category);
+            assert_eq!(err.message(), *msg);
+
+            let display = format!("{err}");
+            assert!(display.contains(msg), "Display should include message");
+        }
+    }
+
+    #[test]
+    fn block_size_one_clamped_to_default() {
+        let codec = PacketCodec::with_block_size(PacketCodec::DEFAULT_MAX_PACKET_SIZE, 1);
+        assert_eq!(codec.block_size(), PacketCodec::DEFAULT_BLOCK_SIZE);
+
+        let frame = PacketFrame::new(vec![42, 1, 2, 3]);
+        let encoded = codec.encode(&frame).expect("encode should succeed");
+        assert_eq!(encoded.len() % PacketCodec::DEFAULT_BLOCK_SIZE, 0);
+
+        let decoded = codec.decode(&encoded).expect("decode should succeed");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn large_valid_payload_round_trip() {
+        let max = 4096;
+        let codec = PacketCodec::new(max);
+        let payload = vec![0x42; max - 64];
+        let original = PacketFrame::new(payload);
+
+        let encoded = codec.encode(&original).expect("encode should succeed");
+        let decoded = codec.decode(&encoded).expect("decode should succeed");
+        assert_eq!(decoded, original);
+    }
 }

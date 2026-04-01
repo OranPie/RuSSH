@@ -520,4 +520,40 @@ mod tests {
     fn detect_unknown_version() {
         assert!(detect_version(0x03).is_err());
     }
+
+    // ── Edge-case coverage ───────────────────────────────────
+
+    #[test]
+    fn socks5_domain_length_zero_truncated() {
+        // atyp=domain, dlen=0, but no port bytes → truncated
+        let data = [0x05, 0x01, 0x00, 0x03, 0x00];
+        assert!(parse_socks5_request(&data).is_err());
+    }
+
+    #[test]
+    fn socks5_domain_length_max_255() {
+        let mut data = vec![0x05, 0x01, 0x00, 0x03, 0xFF];
+        data.extend_from_slice(&[b'a'; 255]);
+        data.extend_from_slice(&[0x00, 0x50]); // port 80
+        let target = parse_socks5_request(&data).unwrap();
+        assert_eq!(target, SocksTarget::Domain("a".repeat(255), 80));
+    }
+
+    #[test]
+    fn socks4_missing_null_terminator() {
+        let data = [
+            0x04, 0x01, // ver, cmd
+            0x00, 0x50, // port 80
+            10, 0, 0, 1, // ip
+            b'a', b'l', b'i', b'c', b'e', // userid without null terminator
+        ];
+        assert!(parse_socks4_request(&data).is_err());
+    }
+
+    #[test]
+    fn socks5_udp_associate_rejected() {
+        // cmd=0x03 (UDP ASSOCIATE) — not supported
+        let data = [0x05, 0x03, 0x00, 0x01, 127, 0, 0, 1, 0, 80];
+        assert!(parse_socks5_request(&data).is_err());
+    }
 }

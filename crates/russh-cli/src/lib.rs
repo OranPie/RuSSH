@@ -761,4 +761,197 @@ AwQFBg==
             _ => panic!("expected Ed25519 from RUSSH-SEED-V1 format"),
         }
     }
+
+    #[test]
+    fn truncated_pem_missing_end_line() {
+        let pem = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDxVI5PETr/maZNd6SV9ljHauAMiQBFBgUMC6rvzfHt7AAAAJDkMK0I5DCt
+";
+        let tmp = std::env::temp_dir().join("russh_test_truncated_pem");
+        std::fs::write(&tmp, pem).unwrap();
+        let result = load_private_key(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_err(), "truncated PEM should return an error");
+    }
+
+    #[test]
+    fn invalid_base64_in_pem() {
+        let pem = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+!!!not-valid-base64@@@$$$
+-----END OPENSSH PRIVATE KEY-----";
+        let tmp = std::env::temp_dir().join("russh_test_invalid_b64");
+        std::fs::write(&tmp, pem).unwrap();
+        let result = load_private_key(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_err(), "invalid base64 should return an error");
+    }
+
+    #[test]
+    fn empty_pem_body() {
+        let pem = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+-----END OPENSSH PRIVATE KEY-----";
+        let tmp = std::env::temp_dir().join("russh_test_empty_pem");
+        std::fs::write(&tmp, pem).unwrap();
+        let result = load_private_key(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_err(), "empty PEM body should return an error");
+    }
+
+    #[test]
+    fn wrong_pem_type_rsa_private_key() {
+        // An RSA PRIVATE KEY PEM (PKCS#1) is not the OPENSSH PRIVATE KEY format
+        let pem = "\
+-----BEGIN RSA PRIVATE KEY-----
+MIIBogIBAAJBALRiMLAHudeSA/x3hB2f+2NRkJfIqPpF
+-----END RSA PRIVATE KEY-----";
+        let tmp = std::env::temp_dir().join("russh_test_wrong_pem_type");
+        std::fs::write(&tmp, pem).unwrap();
+        let result = load_private_key(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_err(), "wrong PEM type should return an error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("magic") || err.contains("parse"),
+            "expected magic/parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn seed_v1_wrong_length_too_short() {
+        let tmp = std::env::temp_dir().join("russh_test_seed_short");
+        let mut data = b"RUSSH-SEED-V1\n".to_vec();
+        data.extend_from_slice(&[0u8; 16]); // only 16 bytes, need 32
+        std::fs::write(&tmp, &data).unwrap();
+        let result = load_private_key(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_err(), "short seed should return an error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("truncated"),
+            "expected 'truncated' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn seed_v1_valid_roundtrip() {
+        let seed = [0xAB_u8; 32];
+        let tmp = std::env::temp_dir().join("russh_test_seed_roundtrip");
+        save_seed_file(&tmp, &seed).expect("save failed");
+        // Read back and verify the key matches
+        let loaded = load_private_key(&tmp).expect("load failed");
+        let _ = std::fs::remove_file(&tmp);
+        let ParsedPrivateKey::Ed25519(loaded_seed) = loaded else {
+            panic!("expected Ed25519 from seed file");
+        };
+        assert_eq!(loaded_seed, seed, "round-tripped seed must match");
+        // Verify we can sign with the loaded seed
+        let signer = russh_crypto::Ed25519Signer::from_seed(&loaded_seed);
+        use russh_crypto::Signer;
+        let sig = signer.sign(b"test").expect("sign failed");
+        assert_eq!(sig.len(), 64);
+    }
+
+    #[test]
+    fn encrypted_key_wrong_passphrase() {
+        let tmp = std::env::temp_dir().join("russh_test_wrong_pass2");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-f"])
+            .arg(&tmp)
+            .args(["-N", "real-passphrase", "-q"])
+            .status()
+            .expect("ssh-keygen not found");
+        assert!(status.success());
+        let result = load_private_key_with_passphrase(&tmp, Some(b"wrong-passphrase"));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        assert!(result.is_err(), "wrong passphrase should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("check values mismatch") || err.contains("wrong passphrase"),
+            "expected decrypt error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn key_type_detection() {
+        // Ed25519
+        let ed_decoded = decode_pem(ED25519_PEM);
+        let ed_key = parse_openssh_private_key(&ed_decoded).unwrap();
+        assert!(
+            matches!(ed_key, ParsedPrivateKey::Ed25519(_)),
+            "should detect Ed25519"
+        );
+
+        // ECDSA P-256
+        let ec_decoded = decode_pem(ECDSA_P256_PEM);
+        let ec_key = parse_openssh_private_key(&ec_decoded).unwrap();
+        assert!(
+            matches!(ec_key, ParsedPrivateKey::EcdsaP256(_)),
+            "should detect ECDSA P-256"
+        );
+
+        // RSA (generated key)
+        let tmp = std::env::temp_dir().join("russh_test_keytype_rsa");
+        let _ = std::fs::remove_file(&tmp);
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-t", "rsa", "-b", "2048", "-f"])
+            .arg(&tmp)
+            .args(["-N", "", "-q"])
+            .status()
+            .expect("ssh-keygen not found");
+        assert!(status.success());
+        let rsa_key = load_private_key(&tmp).expect("load RSA failed");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("pub"));
+        assert!(
+            matches!(rsa_key, ParsedPrivateKey::Rsa { .. }),
+            "should detect RSA"
+        );
+    }
+
+    #[test]
+    fn sign_and_verify_roundtrip() {
+        let decoded = decode_pem(ED25519_PEM);
+        let key = parse_openssh_private_key(&decoded).unwrap();
+        let ParsedPrivateKey::Ed25519(seed) = key else {
+            panic!("expected Ed25519");
+        };
+        let signer = russh_crypto::Ed25519Signer::from_seed(&seed);
+        let verifier = signer.verifier();
+        use russh_crypto::{Signer, Verifier};
+        let msg = b"sign-verify roundtrip message";
+        let sig = signer.sign(msg).expect("sign failed");
+        verifier
+            .verify(msg, &sig)
+            .expect("verify should succeed with matching key");
+    }
+
+    #[test]
+    fn verify_with_wrong_public_key() {
+        // Sign with ED25519_PEM key
+        let decoded_a = decode_pem(ED25519_PEM);
+        let key_a = parse_openssh_private_key(&decoded_a).unwrap();
+        let ParsedPrivateKey::Ed25519(seed_a) = key_a else {
+            panic!("expected Ed25519");
+        };
+        let signer_a = russh_crypto::Ed25519Signer::from_seed(&seed_a);
+        use russh_crypto::{Signer, Verifier};
+        let msg = b"test message for wrong key";
+        let sig = signer_a.sign(msg).expect("sign failed");
+
+        // Create a different Ed25519 key (key B) and get its verifier
+        let seed_b = [0x99u8; 32];
+        let signer_b = russh_crypto::Ed25519Signer::from_seed(&seed_b);
+        let verifier_b = signer_b.verifier();
+
+        // Verification with wrong key should fail
+        let result = verifier_b.verify(msg, &sig);
+        assert!(result.is_err(), "verify with wrong public key should fail");
+    }
 }

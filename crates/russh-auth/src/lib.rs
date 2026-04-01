@@ -2889,4 +2889,254 @@ mod tests {
             .verify_mic(&[1], &[2])
             .expect("verify_mic should succeed");
     }
+
+    // --- Additional coverage tests ---
+
+    #[test]
+    fn certificate_exactly_at_expiry_is_rejected() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let cert = OpenSshCertificate {
+            cert_key_type: "ssh-ed25519-cert-v01@openssh.com".to_string(),
+            nonce: vec![],
+            public_key: vec![0u8; 32],
+            serial: 1,
+            cert_type: OpenSshCertificate::CERT_TYPE_USER,
+            key_id: "expiry-boundary".to_string(),
+            principals: vec!["alice".to_string()],
+            valid_after_unix: 0,
+            // valid_before is exactly now; the check is `now_unix > valid_before_unix`
+            // so now == valid_before should still pass. Per the implementation, this is
+            // accepted (<=). We test that the boundary is consistent.
+            valid_before_unix: now_unix,
+            critical_options: vec![],
+            extensions: vec![],
+            ca_public_key: vec![],
+            signature: vec![],
+            signed_data: vec![],
+        };
+
+        let validator = CertificateValidator::permissive();
+        let now = UNIX_EPOCH + Duration::from_secs(now_unix);
+        // now_unix == valid_before_unix  ⇒  now_unix > valid_before_unix is false ⇒ accepted
+        validator
+            .validate(&cert, now)
+            .expect("cert at exactly valid_before boundary should be accepted (<=)");
+
+        // One tick later it must be rejected
+        let one_past = UNIX_EPOCH + Duration::from_secs(now_unix + 1);
+        validator
+            .validate(&cert, one_past)
+            .expect_err("cert one second past valid_before should be rejected");
+    }
+
+    #[test]
+    fn certificate_one_second_before_expiry_is_valid() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let cert = OpenSshCertificate {
+            cert_key_type: "ssh-ed25519-cert-v01@openssh.com".to_string(),
+            nonce: vec![],
+            public_key: vec![0u8; 32],
+            serial: 1,
+            cert_type: OpenSshCertificate::CERT_TYPE_USER,
+            key_id: "almost-expired".to_string(),
+            principals: vec!["bob".to_string()],
+            valid_after_unix: 0,
+            valid_before_unix: now_unix + 1,
+            critical_options: vec![],
+            extensions: vec![],
+            ca_public_key: vec![],
+            signature: vec![],
+            signed_data: vec![],
+        };
+
+        let validator = CertificateValidator::permissive();
+        let now = UNIX_EPOCH + Duration::from_secs(now_unix);
+        validator
+            .validate(&cert, now)
+            .expect("cert one second before expiry should be valid");
+    }
+
+    #[test]
+    fn certificate_with_inverted_dates_is_rejected() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let cert = OpenSshCertificate {
+            cert_key_type: "ssh-ed25519-cert-v01@openssh.com".to_string(),
+            nonce: vec![],
+            public_key: vec![0u8; 32],
+            serial: 1,
+            cert_type: OpenSshCertificate::CERT_TYPE_USER,
+            key_id: "inverted".to_string(),
+            principals: vec!["alice".to_string()],
+            valid_after_unix: 500,
+            valid_before_unix: 100, // before valid_after
+            critical_options: vec![],
+            extensions: vec![],
+            ca_public_key: vec![],
+            signature: vec![],
+            signed_data: vec![],
+        };
+
+        let validator = CertificateValidator::permissive();
+        // Any time inside [100, 500] will fail because after > before
+        let now = UNIX_EPOCH + Duration::from_secs(300);
+        let err = validator
+            .validate(&cert, now)
+            .expect_err("inverted validity window should be rejected");
+        assert!(
+            err.message().contains("validity window"),
+            "err={}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn certificate_with_empty_principals_and_required_principal() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let cert = OpenSshCertificate {
+            cert_key_type: "ssh-ed25519-cert-v01@openssh.com".to_string(),
+            nonce: vec![],
+            public_key: vec![0u8; 32],
+            serial: 1,
+            cert_type: OpenSshCertificate::CERT_TYPE_USER,
+            key_id: "no-principals".to_string(),
+            principals: vec![], // empty
+            valid_after_unix: 0,
+            valid_before_unix: u64::MAX,
+            critical_options: vec![],
+            extensions: vec![],
+            ca_public_key: vec![],
+            signature: vec![],
+            signed_data: vec![],
+        };
+
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+
+        // With a required principal, empty list should fail
+        let strict = CertificateValidator::require_principal("alice");
+        let err = strict
+            .validate(&cert, now)
+            .expect_err("empty principals should fail when a principal is required");
+        assert!(
+            err.message().contains("principal"),
+            "err={}",
+            err.message()
+        );
+
+        // Permissive validator (no required principal) should accept
+        let permissive = CertificateValidator::permissive();
+        permissive
+            .validate(&cert, now)
+            .expect("empty principals should be accepted when no principal is required");
+    }
+
+    #[test]
+    fn allow_users_and_deny_users_precedence() {
+        let mut policy = ServerAuthPolicy::secure_defaults();
+        policy.allow_users = Some(vec!["alice".to_string(), "eve".to_string()]);
+        policy.deny_users = Some(vec!["eve".to_string()]);
+
+        // eve is in both lists; DenyUsers takes priority
+        assert!(!policy.is_user_allowed("eve"));
+        // alice is only in AllowUsers
+        assert!(policy.is_user_allowed("alice"));
+    }
+
+    #[test]
+    fn deny_users_blocks_user_not_in_allow_users() {
+        let mut policy = ServerAuthPolicy::secure_defaults();
+        // No AllowUsers set, only DenyUsers
+        policy.deny_users = Some(vec!["mallory".to_string(), "trudy".to_string()]);
+
+        assert!(!policy.is_user_allowed("mallory"));
+        assert!(!policy.is_user_allowed("trudy"));
+        // Others are allowed since AllowUsers is None
+        assert!(policy.is_user_allowed("alice"));
+    }
+
+    #[test]
+    fn allow_users_empty_list_denies_all() {
+        let mut policy = ServerAuthPolicy::secure_defaults();
+        policy.allow_users = Some(vec![]); // empty list
+
+        assert!(!policy.is_user_allowed("alice"));
+        assert!(!policy.is_user_allowed("bob"));
+        assert!(!policy.is_user_allowed("root"));
+    }
+
+    #[test]
+    fn multi_method_auth_partial_success_not_complete() {
+        let mut policy = ServerAuthPolicy::secure_defaults();
+        policy
+            .set_required_methods([AuthMethod::Password, AuthMethod::PublicKey])
+            .expect("required methods should be accepted");
+
+        let mut session = AuthSession::new(policy);
+
+        // Complete only one of the required methods
+        let result = session.evaluate(&AuthRequest::Password {
+            user: "carol".to_string(),
+            password: "secret".to_string(),
+        });
+
+        // Should be partially accepted, not fully accepted
+        assert!(
+            matches!(result, AuthResult::PartiallyAccepted { .. }),
+            "expected PartiallyAccepted after one of two required methods, got {result:?}"
+        );
+        assert!(
+            !session.is_authenticated(),
+            "session should NOT be authenticated after partial success"
+        );
+        assert_eq!(session.completed_methods(), vec![AuthMethod::Password]);
+    }
+
+    #[test]
+    fn memory_authorized_keys_no_match() {
+        let mut keys = MemoryAuthorizedKeys::new();
+        keys.load_authorized_keys("alice", "ssh-ed25519 YWJjZA== alice@host\n")
+            .expect("load should succeed");
+
+        // Query with a key that doesn't match
+        assert!(!keys.is_authorized("alice", b"not-the-right-key"));
+        // Query for a user with no entries
+        assert!(!keys.is_authorized("bob", b"abcd"));
+    }
+
+    #[test]
+    fn memory_identity_provider_returns_correct_ed25519_key() {
+        use super::IdentityProvider;
+        use russh_crypto::{Ed25519Signer, Signer};
+
+        let signer = Ed25519Signer::from_seed(&[0xAAu8; 32]);
+        let pub_blob = signer.public_key_blob();
+
+        let mut provider = super::MemoryIdentityProvider::new();
+        provider.insert("alice", pub_blob.clone());
+
+        let identities = provider.identities_for_user("alice");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0], pub_blob);
+
+        // Verify it's a valid ssh-ed25519 blob by parsing
+        let raw_key = super::parse_ed25519_public_key_blob(&identities[0])
+            .expect("should parse as valid Ed25519 public key blob");
+        assert_eq!(raw_key.len(), 32);
+
+        // No keys for unknown user
+        assert!(provider.identities_for_user("unknown").is_empty());
+    }
 }

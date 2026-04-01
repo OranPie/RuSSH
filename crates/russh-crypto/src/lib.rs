@@ -2596,4 +2596,183 @@ mod tests {
         let result = cipher.open(0, &enc_length, &ct_and_tag);
         assert!(result.is_err(), "tampered ciphertext should fail MAC check");
     }
+
+    // ---- Additional security & edge-case tests ----
+
+    #[test]
+    fn chacha20poly1305_aead_tag_tampering() {
+        let key = [0xABu8; 32];
+        let nonce = [0x01u8; 12];
+        let cipher = ChaCha20Poly1305Cipher::new(&key).unwrap();
+        let mut ct = cipher.seal(&nonce, b"aad", b"payload data").unwrap();
+        // Flip one bit in the last byte (auth tag region)
+        let last = ct.len() - 1;
+        ct[last] ^= 0x01;
+        assert!(
+            cipher.open(&nonce, b"aad", &ct).is_err(),
+            "flipped tag bit must cause decryption failure"
+        );
+    }
+
+    #[test]
+    fn chacha20poly1305_aead_ciphertext_tampering() {
+        let key = [0xCDu8; 32];
+        let nonce = [0x02u8; 12];
+        let cipher = ChaCha20Poly1305Cipher::new(&key).unwrap();
+        let mut ct = cipher.seal(&nonce, b"", b"some secret text").unwrap();
+        // Flip one bit in the ciphertext body (first byte)
+        ct[0] ^= 0x01;
+        assert!(
+            cipher.open(&nonce, b"", &ct).is_err(),
+            "flipped ciphertext bit must cause decryption failure"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_bit_flip_detection() {
+        let key = b"hmac-test-key";
+        let data = b"message to authenticate";
+        let mut tag = HmacSha256::sign(key, data);
+        assert!(HmacSha256::verify(key, data, &tag));
+        // Flip one bit
+        tag[0] ^= 0x01;
+        assert!(
+            !HmacSha256::verify(key, data, &tag),
+            "single bit flip in MAC must be detected"
+        );
+    }
+
+    #[test]
+    fn aes256_gcm_wrong_key_decryption_fails() {
+        let key_a = [0x11u8; 32];
+        let key_b = [0x22u8; 32];
+        let nonce = [0x00u8; 12];
+        let cipher_a = Aes256GcmCipher::new(&key_a).unwrap();
+        let cipher_b = Aes256GcmCipher::new(&key_b).unwrap();
+        let ct = cipher_a.seal(&nonce, b"", b"secret").unwrap();
+        assert!(
+            cipher_b.open(&nonce, b"", &ct).is_err(),
+            "decryption with wrong key must fail"
+        );
+    }
+
+    #[test]
+    fn dh_group14_shared_secret_consistency() {
+        let mut rng_a = LcgRandom::seeded(500);
+        let mut rng_b = LcgRandom::seeded(501);
+        let alice = DhGroup14Sha256::generate_keypair(&mut rng_a);
+        let bob = DhGroup14Sha256::generate_keypair(&mut rng_b);
+        let secret_ab =
+            DhGroup14Sha256::compute_shared_secret(alice.secret_bytes(), &bob.public_key).unwrap();
+        let secret_ba =
+            DhGroup14Sha256::compute_shared_secret(bob.secret_bytes(), &alice.public_key).unwrap();
+        assert_eq!(
+            secret_ab.shared_secret, secret_ba.shared_secret,
+            "DH shared secrets computed from both sides must match"
+        );
+        assert!(
+            !secret_ab.shared_secret.is_empty(),
+            "shared secret must not be empty"
+        );
+    }
+
+    #[test]
+    fn derive_key_sha256_different_labels_differ() {
+        let shared = b"shared-secret";
+        let hash = b"exchange-hash";
+        let session = b"session-id";
+        let key_a = derive_key_sha256(shared, hash, b'A', session, 32);
+        let key_b = derive_key_sha256(shared, hash, b'B', session, 32);
+        assert_ne!(
+            key_a, key_b,
+            "keys derived with different labels must differ"
+        );
+    }
+
+    #[test]
+    fn derive_key_sha256_determinism() {
+        let shared = b"K-material";
+        let hash = b"H-hash";
+        let session = b"S-session";
+        let first = derive_key_sha256(shared, hash, b'C', session, 48);
+        let second = derive_key_sha256(shared, hash, b'C', session, 48);
+        assert_eq!(first, second, "same inputs must produce identical output");
+    }
+
+    #[test]
+    fn ed25519_sign_verify_wrong_key_rejected() {
+        let mut rng_a = LcgRandom::seeded(600);
+        let mut rng_b = LcgRandom::seeded(601);
+        let signer_a = Ed25519Signer::generate(&mut rng_a);
+        let signer_b = Ed25519Signer::generate(&mut rng_b);
+        let verifier_b = signer_b.verifier();
+        let msg = b"signed by A";
+        let sig = signer_a.sign(msg).unwrap();
+        assert!(
+            verifier_b.verify(msg, &sig).is_err(),
+            "verifying with wrong public key must fail"
+        );
+    }
+
+    #[test]
+    fn ecdsa_p256_sign_verify_wrong_message_fails() {
+        let mut rng = LcgRandom::seeded(700);
+        let signer = EcdsaP256Signer::generate(&mut rng);
+        let verifier = signer.verifier();
+        let msg = b"original message";
+        let sig = signer.sign(msg).unwrap();
+        // Correct message verifies
+        assert!(verifier.verify(msg, &sig).is_ok());
+        // Different message must fail
+        assert!(
+            verifier.verify(b"different message", &sig).is_err(),
+            "ECDSA P-256 verify with wrong message must fail"
+        );
+    }
+
+    #[test]
+    fn crypto_policy_secure_defaults_excludes_legacy() {
+        let policy = CryptoPolicy::secure_defaults();
+        let algos = policy.algorithms();
+        for cipher in &algos.ciphers {
+            assert!(
+                !cipher.contains("cbc"),
+                "secure_defaults must not include CBC cipher: {cipher}"
+            );
+        }
+        for mac in &algos.macs {
+            assert!(
+                !mac.contains("sha1"),
+                "secure_defaults must not include SHA-1 MAC: {mac}"
+            );
+        }
+    }
+
+    #[test]
+    fn aes256_gcm_empty_plaintext_encryption() {
+        let key = [0x33u8; 32];
+        let nonce = [0x44u8; 12];
+        let cipher = Aes256GcmCipher::new(&key).unwrap();
+        let ct = cipher.seal(&nonce, b"aad", b"").unwrap();
+        // Empty plaintext → ciphertext is just the 16-byte auth tag
+        assert_eq!(ct.len(), 16);
+        let pt = cipher.open(&nonce, b"aad", &ct).unwrap();
+        assert!(pt.is_empty());
+    }
+
+    #[test]
+    fn aes256_ctr_counter_continuity() {
+        let key = [0x55u8; 32];
+        let iv = [0x00u8; 16];
+        let mut cipher = Aes256CtrCipher::new(&key, &iv).unwrap();
+        // Encrypt two consecutive 16-byte blocks of zeros
+        let mut block1 = [0u8; 16];
+        let mut block2 = [0u8; 16];
+        cipher.encrypt_in_place(&mut block1);
+        cipher.encrypt_in_place(&mut block2);
+        assert_ne!(
+            block1, block2,
+            "consecutive CTR blocks of zeros must produce different ciphertext"
+        );
+    }
 }

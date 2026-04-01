@@ -1800,6 +1800,71 @@ mod channel_tests {
     fn streamlocal_forward_data_truncated() {
         assert!(ForwardHandle::parse_streamlocal_forward_data(&[0, 0]).is_err());
     }
+
+    // ── Window credit edge cases ─────────────────────────────
+
+    #[test]
+    fn window_credit_saturates_at_u32_max() {
+        let mut s = ChannelState::new(ChannelId::next(), 0, ChannelKind::Session);
+        s.remote_window_size = u32::MAX;
+        s.credit_local_window(1);
+        assert_eq!(s.remote_window_size, u32::MAX, "remote window must saturate");
+
+        s.local_window_size = u32::MAX;
+        let _ = s.build_window_adjust(1);
+        assert_eq!(s.local_window_size, u32::MAX, "local window must saturate");
+    }
+
+    #[test]
+    fn consume_entire_remote_window_then_blocked() {
+        let mut s = ChannelState::new(ChannelId::next(), 0, ChannelKind::Session);
+        s.consume_remote_window(ChannelState::DEFAULT_WINDOW_SIZE)
+            .expect("drain all");
+        assert_eq!(s.remote_window_size, 0);
+        assert!(
+            s.consume_remote_window(1).is_err(),
+            "must reject sends when window is zero"
+        );
+    }
+
+    // ── Channel message edge cases ───────────────────────────
+
+    #[test]
+    fn channel_data_truncated_payload_errors() {
+        // Data message: type=94, recipient_channel(4), string_len(4), data...
+        let mut payload = vec![94u8];
+        payload.extend_from_slice(&0u32.to_be_bytes()); // recipient_channel
+        payload.extend_from_slice(&100u32.to_be_bytes()); // string length = 100
+        payload.extend_from_slice(&[0u8; 4]); // only 4 bytes (need 100)
+        assert!(ChannelMessage::from_bytes(&payload).is_err());
+    }
+
+    #[test]
+    fn channel_data_empty_payload_round_trip() {
+        let msg = ChannelMessage::Data {
+            recipient_channel: 7,
+            data: vec![],
+        };
+        let bytes = msg.to_bytes().expect("encode");
+        let decoded = ChannelMessage::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, msg);
+    }
+
+    // ── ForwardHandle field preservation ─────────────────────
+
+    #[test]
+    fn forward_handle_fields_preserved() {
+        let fh = ForwardHandle::new("0.0.0.0", 2222);
+        assert_eq!(fh.bind_host, "0.0.0.0");
+        assert_eq!(fh.bind_port, 2222);
+        assert!(fh.active);
+
+        let mut fh2 = fh.clone();
+        fh2.deactivate();
+        assert!(!fh2.active);
+        assert_eq!(fh2.bind_host, "0.0.0.0");
+        assert_eq!(fh2.bind_port, 2222);
+    }
 }
 
 #[cfg(test)]
@@ -1830,5 +1895,13 @@ mod tests {
         pool.insert("main", session).expect("insert should succeed");
         let found = pool.get("main").expect("get should succeed");
         assert!(found.is_some());
+    }
+
+    #[test]
+    fn channel_id_sequential_allocations_are_unique() {
+        use super::ChannelId;
+        let ids: Vec<ChannelId> = (0..100).map(|_| ChannelId::next()).collect();
+        let unique: std::collections::HashSet<u32> = ids.iter().map(|id| id.value()).collect();
+        assert_eq!(unique.len(), 100);
     }
 }

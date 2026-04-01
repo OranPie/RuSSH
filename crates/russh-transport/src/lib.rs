@@ -44,8 +44,7 @@ use russh_crypto::{
     derive_key_sha512, encode_mpint, encode_ssh_string,
 };
 use russh_observability::{
-    AuthEvent, EventSink, TelemetryEvent,
-    TransportEvent as ObservabilityTransportEvent,
+    AuthEvent, EventSink, TelemetryEvent, TransportEvent as ObservabilityTransportEvent,
 };
 
 const SSH_USERAUTH_SERVICE: &str = "ssh-userauth";
@@ -2010,7 +2009,6 @@ impl ServerSession {
                 let (result, _event) = auth_session.evaluate_with_event(&auth_request);
                 match result {
                     AuthResult::Accepted => {
-                        
                         self.emit_auth_event(AuthEvent::Success);
                         self.authenticated_user = Some(user);
                         self.bump_outgoing_sequence();
@@ -2023,7 +2021,7 @@ impl ServerSession {
                             .map(AuthMethod::as_ssh_name)
                             .map(ToOwned::to_owned)
                             .collect();
-                        
+
                         self.emit_auth_event(AuthEvent::Failure {
                             reason: "keyboard-interactive failed".to_string(),
                         });
@@ -2367,14 +2365,12 @@ impl ServerSession {
         let (result, _event) = auth_session.evaluate_with_event(&auth_request);
         match result {
             AuthResult::Accepted => {
-                
                 self.emit_auth_event(AuthEvent::Success);
                 self.authenticated_user = Some(user);
                 self.bump_outgoing_sequence();
                 Ok(Some(UserAuthMessage::Success))
             }
             AuthResult::PartiallyAccepted { next_methods } => {
-                
                 self.emit_auth_event(AuthEvent::Failure {
                     reason: "partial success".to_string(),
                 });
@@ -2395,7 +2391,7 @@ impl ServerSession {
                     .map(AuthMethod::as_ssh_name)
                     .map(ToOwned::to_owned)
                     .collect();
-                
+
                 self.emit_auth_event(AuthEvent::Failure {
                     reason: "rejected".to_string(),
                 });
@@ -4354,11 +4350,298 @@ mod tests {
             "expected MethodAttempt event"
         );
         assert!(
-            events.iter().any(|e| matches!(
-                e,
-                TelemetryEvent::Auth(AuthEvent::Success)
-            )),
+            events
+                .iter()
+                .any(|e| matches!(e, TelemetryEvent::Auth(AuthEvent::Success))),
             "expected auth Success event"
         );
+    }
+
+    // ── Sequence number wraparound ──────────────────────────────────────
+
+    #[test]
+    fn sequence_number_wraps_around_at_u32_max() {
+        let mut session = ClientSession::new(ClientConfig::secure_defaults("alice"));
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+        session
+            .receive_message(TransportMessage::NewKeys)
+            .expect("NEWKEYS should establish session");
+
+        // Directly set incoming sequence near u32::MAX (child module can access private fields).
+        session.incoming_sequence = u32::MAX - 1;
+
+        // First receive bumps to u32::MAX.
+        session
+            .receive_message(TransportMessage::Ignore { data: vec![1] })
+            .expect("ignore should succeed");
+        assert_eq!(session.incoming_sequence(), u32::MAX);
+
+        // Second receive wraps to 0.
+        session
+            .receive_message(TransportMessage::Ignore { data: vec![2] })
+            .expect("ignore should succeed after wrap");
+        assert_eq!(session.incoming_sequence(), 0);
+    }
+
+    #[test]
+    fn outgoing_sequence_number_wraps_around_at_u32_max() {
+        let mut session = ClientSession::new(ClientConfig::secure_defaults("alice"));
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+        session
+            .receive_message(TransportMessage::NewKeys)
+            .expect("NEWKEYS should establish session");
+
+        session.outgoing_sequence = u32::MAX - 1;
+
+        session
+            .send_service_request("ssh-userauth")
+            .expect("service request should send");
+        assert_eq!(session.outgoing_sequence(), u32::MAX);
+
+        // Reset state so we can send another service request.
+        session.state = SessionState::Established;
+        session.pending_service = None;
+
+        session
+            .send_service_request("ssh-userauth")
+            .expect("second service request should send");
+        assert_eq!(session.outgoing_sequence(), 0);
+    }
+
+    // ── Rekey threshold edge cases ──────────────────────────────────────
+
+    #[test]
+    fn rekey_triggers_at_exact_byte_threshold() {
+        let transport = TransportConfig::builder().rekey_after_bytes(256).build();
+        let mut config = ClientConfig::secure_defaults("alice");
+        config.transport = transport;
+
+        let mut session = ClientSession::new(config);
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+        session
+            .receive_message(TransportMessage::NewKeys)
+            .expect("NEWKEYS should establish session");
+
+        let rekeyed = session
+            .account_payload(256)
+            .expect("accounting should succeed");
+
+        assert!(rekeyed, "rekey should trigger at exactly the threshold");
+        assert!(
+            session
+                .events()
+                .iter()
+                .any(|e| matches!(e, TransportEvent::RekeyStarted))
+        );
+    }
+
+    #[test]
+    fn rekey_does_not_trigger_below_threshold() {
+        let transport = TransportConfig::builder().rekey_after_bytes(256).build();
+        let mut config = ClientConfig::secure_defaults("alice");
+        config.transport = transport;
+
+        let mut session = ClientSession::new(config);
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+        session
+            .receive_message(TransportMessage::NewKeys)
+            .expect("NEWKEYS should establish session");
+
+        let rekeyed = session
+            .account_payload(255)
+            .expect("accounting should succeed");
+
+        assert!(
+            !rekeyed,
+            "rekey should not trigger one byte below threshold"
+        );
+        assert!(
+            !session
+                .events()
+                .iter()
+                .any(|e| matches!(e, TransportEvent::RekeyStarted))
+        );
+    }
+
+    // ── Strict KEX behaviour ────────────────────────────────────────────
+
+    #[test]
+    fn strict_kex_negotiated_when_both_sides_advertise() {
+        let mut session = ClientSession::new(ClientConfig::secure_defaults("alice"));
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+
+        session
+            .send_kexinit()
+            .expect("local KEXINIT should be sent");
+        session
+            .receive_message(test_kexinit_with_server_extensions([0xAB; 16]))
+            .expect("peer KEXINIT should be accepted");
+        session
+            .receive_message(TransportMessage::NewKeys)
+            .expect("NEWKEYS should complete KEX");
+
+        let negotiated = session
+            .negotiated()
+            .expect("should have negotiated algorithms");
+        assert!(
+            negotiated.strict_kex,
+            "strict_kex should be true when both sides advertise"
+        );
+
+        // Verify sequence numbers tracked the messages exchanged (KEXINIT + NEWKEYS = 2 incoming).
+        assert_eq!(session.incoming_sequence(), 2);
+        assert_eq!(session.outgoing_sequence(), 1);
+    }
+
+    // ── Empty algorithm proposal ────────────────────────────────────────
+
+    #[test]
+    fn empty_algorithm_proposal_fails_decode_validation() {
+        let codec = PacketCodec::with_defaults();
+        let empty_proposal = TransportMessage::KexInit {
+            proposal: Box::new(KexInitProposal {
+                cookie: [0xEE; 16],
+                kex_algorithms: Vec::new(),
+                host_key_algorithms: Vec::new(),
+                ciphers_client_to_server: Vec::new(),
+                ciphers_server_to_client: Vec::new(),
+                macs_client_to_server: Vec::new(),
+                macs_server_to_client: Vec::new(),
+                compression_client_to_server: Vec::new(),
+                compression_server_to_client: Vec::new(),
+                languages_client_to_server: Vec::new(),
+                languages_server_to_client: Vec::new(),
+                first_kex_packet_follows: false,
+                ext_info_c: false,
+                ext_info_s: false,
+                strict_kex_c: false,
+                strict_kex_s: false,
+            }),
+        };
+
+        let encoded = empty_proposal
+            .encode(&codec)
+            .expect("encoding happens before validation");
+        let error = TransportMessage::decode(&codec, &encoded)
+            .expect_err("decode must reject KEXINIT with all empty algorithm lists");
+        assert_eq!(error.category(), RusshErrorCategory::Protocol);
+    }
+
+    // ── Banner parsing ──────────────────────────────────────────────────
+
+    #[test]
+    fn banner_with_maximum_length_is_accepted() {
+        let long_comment = "X".repeat(240);
+        let banner = format!("SSH-2.0-{long_comment}");
+
+        let mut session = ClientSession::new(ClientConfig::secure_defaults("alice"));
+        let result = block_on(session.handshake(&banner));
+        assert!(result.is_ok(), "long banner should be accepted: {result:?}");
+        assert_eq!(session.state(), SessionState::AlgorithmsNegotiated);
+    }
+
+    #[test]
+    fn banner_ssh_1_99_compat_is_accepted() {
+        let mut session = ClientSession::new(ClientConfig::secure_defaults("alice"));
+        let result = block_on(session.handshake("SSH-1.99-compat_server"));
+        assert!(result.is_ok(), "SSH-1.99 banner should be accepted");
+    }
+
+    #[test]
+    fn server_accepts_valid_client_banner() {
+        let mut server = ServerSession::new(test_server_config());
+        server
+            .accept_banner("SSH-2.0-PuTTY_0.80")
+            .expect("standard client banner should be accepted");
+        assert_eq!(server.state(), SessionState::BannerExchanged);
+    }
+
+    #[test]
+    fn server_rejects_unsupported_banner() {
+        let mut server = ServerSession::new(test_server_config());
+        let error = server
+            .accept_banner("SSH-1.5-legacy")
+            .expect_err("unsupported banner should be rejected");
+        assert_eq!(error.category(), RusshErrorCategory::Interop);
+    }
+
+    // ── Config builder defaults and overrides ───────────────────────────
+
+    #[test]
+    fn config_builder_defaults_are_sensible() {
+        let cfg = TransportConfig::builder().build();
+
+        assert!(
+            cfg.rekey_after_bytes > 0,
+            "rekey threshold should be positive"
+        );
+        assert_eq!(cfg.rekey_after_bytes, 1 << 30);
+        assert!(
+            !cfg.rekey_after_duration.is_zero(),
+            "rekey duration should be non-zero"
+        );
+        assert_eq!(cfg.rekey_after_duration, Duration::from_secs(3600));
+        assert!(
+            !cfg.idle_timeout.is_zero(),
+            "idle timeout should be non-zero"
+        );
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(300));
+        assert!(
+            !cfg.keepalive_interval.is_zero(),
+            "keepalive interval should be non-zero"
+        );
+        assert_eq!(cfg.keepalive_count_max, 3);
+    }
+
+    #[test]
+    fn config_builder_overrides_rekey_bytes() {
+        let cfg = TransportConfig::builder().rekey_after_bytes(42_000).build();
+        assert_eq!(cfg.rekey_after_bytes, 42_000);
+
+        // Other defaults unchanged.
+        assert_eq!(cfg.rekey_after_duration, Duration::from_secs(3600));
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(300));
+    }
+
+    // ── Multiple rekey cycles ───────────────────────────────────────────
+
+    #[test]
+    fn multiple_rekey_cycles_both_trigger() {
+        let transport = TransportConfig::builder().rekey_after_bytes(100).build();
+        let mut config = ClientConfig::secure_defaults("alice");
+        config.transport = transport;
+
+        let mut session = ClientSession::new(config);
+        block_on(session.handshake("SSH-2.0-OpenSSH_9.8")).expect("handshake should succeed");
+        session
+            .receive_message(TransportMessage::NewKeys)
+            .expect("NEWKEYS should establish session");
+
+        // First rekey cycle.
+        let first = session
+            .account_payload(100)
+            .expect("first accounting should succeed");
+        assert!(first, "first rekey should trigger");
+
+        // After rekey, counters reset so we can trigger a second cycle.
+        let below = session
+            .account_payload(50)
+            .expect("sub-threshold accounting should succeed");
+        assert!(!below, "should not rekey at 50/100 bytes");
+
+        let second = session
+            .account_payload(50)
+            .expect("second threshold accounting should succeed");
+        assert!(
+            second,
+            "second rekey should trigger at cumulative 100 bytes"
+        );
+
+        let rekey_count = session
+            .events()
+            .iter()
+            .filter(|e| matches!(e, TransportEvent::RekeyStarted))
+            .count();
+        assert_eq!(rekey_count, 2, "expected exactly two RekeyStarted events");
     }
 }

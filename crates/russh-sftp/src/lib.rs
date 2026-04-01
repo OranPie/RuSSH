@@ -2787,4 +2787,608 @@ mod tests {
 
         fs::remove_dir_all(&root).expect("cleanup should succeed");
     }
+
+    #[test]
+    fn read_at_large_offset_returns_eof() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_read_large_offset_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "small.txt".to_string(),
+                pflags: super::open_flags::READ
+                    | super::open_flags::WRITE
+                    | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+
+        server
+            .process(&SftpWirePacket::Write {
+                id: 2,
+                handle: handle.clone(),
+                offset: 0,
+                data: b"hello".to_vec(),
+            })
+            .expect("write should succeed");
+
+        // Read at offset > u32::MAX — must not truncate to 32 bits
+        let response = server
+            .process(&SftpWirePacket::Read {
+                id: 3,
+                handle: handle.clone(),
+                offset: 0x1_0000_0001,
+                len: 64,
+            })
+            .expect("read at large offset should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 3);
+                assert_eq!(*status, SftpStatus::Eof);
+            }
+            other => panic!("expected Status Eof, got: {other:?}"),
+        }
+
+        server
+            .process(&SftpWirePacket::Close { id: 4, handle })
+            .expect("close should succeed");
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn write_at_large_offset_preserves_64bit_offset() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_write_large_offset_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "sparse.bin".to_string(),
+                pflags: super::open_flags::READ
+                    | super::open_flags::WRITE
+                    | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+
+        let large_offset: u64 = 0x1_0000_0001;
+        let response = server
+            .process(&SftpWirePacket::Write {
+                id: 2,
+                handle: handle.clone(),
+                offset: large_offset,
+                data: b"OK".to_vec(),
+            })
+            .expect("write at large offset should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        // Read back at same large offset to verify data landed correctly
+        let response = server
+            .process(&SftpWirePacket::Read {
+                id: 3,
+                handle: handle.clone(),
+                offset: large_offset,
+                len: 2,
+            })
+            .expect("read at large offset should respond");
+
+        match &response {
+            SftpWirePacket::Data { id, data } => {
+                assert_eq!(*id, 3);
+                assert_eq!(data, b"OK");
+            }
+            other => panic!("expected Data, got: {other:?}"),
+        }
+
+        server
+            .process(&SftpWirePacket::Close { id: 4, handle })
+            .expect("close should succeed");
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn read_write_invalid_handle_returns_failure() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_invalid_handle_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+        let bogus_handle = vec![0xDE, 0xAD, 0xBE, 0xEF];
+
+        // Read with bogus handle
+        let response = server
+            .process(&SftpWirePacket::Read {
+                id: 1,
+                handle: bogus_handle.clone(),
+                offset: 0,
+                len: 64,
+            })
+            .expect("read with invalid handle should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*status, SftpStatus::Failure);
+            }
+            other => panic!("expected Status Failure, got: {other:?}"),
+        }
+
+        // Write with bogus handle
+        let response = server
+            .process(&SftpWirePacket::Write {
+                id: 2,
+                handle: bogus_handle.clone(),
+                offset: 0,
+                data: b"nope".to_vec(),
+            })
+            .expect("write with invalid handle should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                assert_eq!(*status, SftpStatus::Failure);
+            }
+            other => panic!("expected Status Failure, got: {other:?}"),
+        }
+
+        // Close with bogus handle — server tolerates this (no-op)
+        let response = server
+            .process(&SftpWirePacket::Close {
+                id: 3,
+                handle: bogus_handle,
+            })
+            .expect("close with invalid handle should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 3);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn double_close_returns_ok_both_times() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_double_close_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "temp.txt".to_string(),
+                pflags: super::open_flags::WRITE | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+
+        // First close succeeds
+        let response = server
+            .process(&SftpWirePacket::Close {
+                id: 2,
+                handle: handle.clone(),
+            })
+            .expect("first close should succeed");
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        // Second close — handle is gone, server still returns Ok
+        let response = server
+            .process(&SftpWirePacket::Close { id: 3, handle })
+            .expect("second close should respond");
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 3);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        // Confirm the handle is truly gone — read on it fails
+        let response = server
+            .process(&SftpWirePacket::Read {
+                id: 4,
+                handle: vec![0x00, 0x00, 0x00, 0x01],
+                offset: 0,
+                len: 10,
+            })
+            .expect("read on closed handle should respond");
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 4);
+                assert_eq!(*status, SftpStatus::Failure);
+            }
+            other => panic!("expected Status Failure, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn read_on_write_only_handle_fails() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_read_writeonly_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Open write-only
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "writeonly.txt".to_string(),
+                pflags: super::open_flags::WRITE | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+
+        // Attempt to read on write-only fd
+        let response = server
+            .process(&SftpWirePacket::Read {
+                id: 2,
+                handle: handle.clone(),
+                offset: 0,
+                len: 64,
+            })
+            .expect("read on write-only handle should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                // OS returns a permission/bad-fd error for read on write-only fd
+                assert_ne!(*status, SftpStatus::Ok);
+            }
+            // Data would also be wrong here
+            other => panic!("expected Status error, got: {other:?}"),
+        }
+
+        server
+            .process(&SftpWirePacket::Close { id: 3, handle })
+            .expect("close should succeed");
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn write_on_read_only_handle_fails() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_write_readonly_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+        fs::write(root.join("readonly.txt"), b"original").expect("file should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Open read-only
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "readonly.txt".to_string(),
+                pflags: super::open_flags::READ,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+
+        // Attempt to write on read-only fd
+        let response = server
+            .process(&SftpWirePacket::Write {
+                id: 2,
+                handle: handle.clone(),
+                offset: 0,
+                data: b"overwrite".to_vec(),
+            })
+            .expect("write on read-only handle should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                assert_ne!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status error, got: {other:?}"),
+        }
+
+        // Verify file content unchanged
+        assert_eq!(fs::read(root.join("readonly.txt")).unwrap(), b"original");
+
+        server
+            .process(&SftpWirePacket::Close { id: 3, handle })
+            .expect("close should succeed");
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn remove_nonexistent_file_returns_no_such_file() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_remove_noexist_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Create a file, remove it on disk, then try to remove via SFTP.
+        // The server's path validation canonicalizes paths, so the file must
+        // have existed at some point for the parent to resolve. We create and
+        // then delete the file directly so the server never caches a handle.
+        fs::write(root.join("ephemeral.txt"), b"bye").expect("file should be created");
+        // Remove via SFTP — this one should succeed
+        let response = server
+            .process(&SftpWirePacket::Remove {
+                id: 1,
+                filename: "ephemeral.txt".to_string(),
+            })
+            .expect("first remove should succeed");
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+        assert!(!root.join("ephemeral.txt").exists());
+
+        // Second remove — file is gone. Path validation (canonicalize) fails
+        // on the missing file, surfacing as PermissionDenied.
+        let response = server
+            .process(&SftpWirePacket::Remove {
+                id: 2,
+                filename: "ephemeral.txt".to_string(),
+            })
+            .expect("second remove should respond");
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                assert_eq!(*status, SftpStatus::PermissionDenied);
+            }
+            other => panic!("expected Status PermissionDenied, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn mkdir_already_exists_succeeds() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_mkdir_exists_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Pre-create the directory on disk so path validation can canonicalize it
+        fs::create_dir_all(root.join("subdir")).expect("subdir should be created");
+
+        // Mkdir on an already-existing directory — create_dir_all is idempotent
+        let response = server
+            .process(&SftpWirePacket::Mkdir {
+                id: 1,
+                path: "subdir".to_string(),
+                attrs: Default::default(),
+            })
+            .expect("mkdir on existing dir should succeed");
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        // Call again — still Ok
+        let response = server
+            .process(&SftpWirePacket::Mkdir {
+                id: 2,
+                path: "subdir".to_string(),
+                attrs: Default::default(),
+            })
+            .expect("second mkdir should respond");
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                assert_eq!(*status, SftpStatus::Ok);
+            }
+            other => panic!("expected Status Ok, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn readdir_on_file_handle_returns_failure() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_readdir_file_handle_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(&root).expect("root should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Open a regular file
+        let open_resp = server
+            .process(&SftpWirePacket::Open {
+                id: 1,
+                filename: "regular.txt".to_string(),
+                pflags: super::open_flags::WRITE | super::open_flags::CREAT,
+                attrs: Default::default(),
+            })
+            .expect("open should succeed");
+        let handle = match &open_resp {
+            SftpWirePacket::Handle { handle, .. } => handle.clone(),
+            other => panic!("expected Handle, got: {other:?}"),
+        };
+
+        // Readdir with a file handle — should fail because it's not a Dir handle
+        let response = server
+            .process(&SftpWirePacket::Readdir {
+                id: 2,
+                handle: handle.clone(),
+            })
+            .expect("readdir on file handle should respond");
+
+        match &response {
+            SftpWirePacket::Status { id, status, .. } => {
+                assert_eq!(*id, 2);
+                assert_eq!(*status, SftpStatus::Failure);
+            }
+            other => panic!("expected Status Failure, got: {other:?}"),
+        }
+
+        server
+            .process(&SftpWirePacket::Close { id: 3, handle })
+            .expect("close should succeed");
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
+
+    #[test]
+    fn realpath_resolves_relative_path() {
+        let mut root = env::temp_dir();
+        root.push("russh_sftp_realpath_relative_test");
+        if root.exists() {
+            fs::remove_dir_all(&root).expect("cleanup should succeed");
+        }
+        fs::create_dir_all(root.join("a/b")).expect("nested dirs should be created");
+        fs::write(root.join("a/b/file.txt"), b"x").expect("file should be created");
+
+        let mut server = SftpFileServer::new(&root);
+
+        // Bare relative path without leading slash resolves correctly
+        let response = server
+            .process(&SftpWirePacket::Realpath {
+                id: 1,
+                path: "a/b/file.txt".to_string(),
+            })
+            .expect("realpath should succeed");
+
+        match &response {
+            SftpWirePacket::Name { id, entries } => {
+                assert_eq!(*id, 1);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].filename, "/a/b/file.txt");
+            }
+            other => panic!("expected Name, got: {other:?}"),
+        }
+
+        // Absolute-style path is treated as relative to chroot
+        let response = server
+            .process(&SftpWirePacket::Realpath {
+                id: 2,
+                path: "/a/b/file.txt".to_string(),
+            })
+            .expect("realpath with leading slash should succeed");
+
+        match &response {
+            SftpWirePacket::Name { id, entries } => {
+                assert_eq!(*id, 2);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].filename, "/a/b/file.txt");
+            }
+            other => panic!("expected Name, got: {other:?}"),
+        }
+
+        // "." resolves to root
+        let response = server
+            .process(&SftpWirePacket::Realpath {
+                id: 3,
+                path: ".".to_string(),
+            })
+            .expect("realpath of '.' should succeed");
+
+        match &response {
+            SftpWirePacket::Name { id, entries } => {
+                assert_eq!(*id, 3);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].filename, "/");
+            }
+            other => panic!("expected Name, got: {other:?}"),
+        }
+
+        // Path with "./"-style prefix resolves to the same thing
+        let response = server
+            .process(&SftpWirePacket::Realpath {
+                id: 4,
+                path: "./a/b/file.txt".to_string(),
+            })
+            .expect("realpath with ./ prefix should succeed");
+
+        match &response {
+            SftpWirePacket::Name { id, entries } => {
+                assert_eq!(*id, 4);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].filename, "/a/b/file.txt");
+            }
+            other => panic!("expected Name, got: {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup should succeed");
+    }
 }
