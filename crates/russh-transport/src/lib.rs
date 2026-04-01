@@ -28,6 +28,7 @@
 //! - [`SessionKeys`] — derived encryption keys, zeroized on drop.
 
 use std::future::ready;
+use std::sync::Arc;
 use std::time::Duration;
 
 use russh_auth::{
@@ -42,6 +43,7 @@ use russh_crypto::{
     RsaVerifier, Sha256, Sha512, Signer, Verifier, decode_ssh_string, derive_key_sha256,
     derive_key_sha512, encode_mpint, encode_ssh_string,
 };
+use russh_observability::EventSink;
 
 const SSH_USERAUTH_SERVICE: &str = "ssh-userauth";
 const SSH_CONNECTION_SERVICE: &str = "ssh-connection";
@@ -759,7 +761,7 @@ pub enum SessionState {
 }
 
 /// Bootstrap client session handle with explicit handshake/rekey state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ClientSession {
     pub config: ClientConfig,
     state: SessionState,
@@ -784,6 +786,17 @@ pub struct ClientSession {
     remote_version: String,
     /// Raw SSH wire-format blob of the server's host public key, stored after KEX.
     server_host_key_blob: Option<Vec<u8>>,
+    event_sink: Option<Arc<dyn EventSink>>,
+}
+
+impl std::fmt::Debug for ClientSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientSession")
+            .field("config", &self.config)
+            .field("state", &self.state)
+            .field("event_sink", &self.event_sink.as_ref().map(|_| ".."))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientSession {
@@ -812,7 +825,13 @@ impl ClientSession {
             local_version: String::new(),
             remote_version: String::new(),
             server_host_key_blob: None,
+            event_sink: None,
         }
+    }
+
+    /// Set the event sink after construction.
+    pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
+        self.event_sink = Some(sink);
     }
 
     pub async fn handshake(&mut self, remote_version: &str) -> Result<(), RusshError> {
@@ -1595,7 +1614,7 @@ impl ClientSession {
 }
 
 /// Bootstrap server session handle.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerSession {
     pub config: ServerConfig,
     state: SessionState,
@@ -1614,6 +1633,17 @@ pub struct ServerSession {
     remote_version: String,
     /// Raw client KEXINIT payload (original wire bytes, used for exchange hash).
     raw_client_kexinit: Option<Vec<u8>>,
+    event_sink: Option<Arc<dyn EventSink>>,
+}
+
+impl std::fmt::Debug for ServerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerSession")
+            .field("config", &self.config)
+            .field("state", &self.state)
+            .field("event_sink", &self.event_sink.as_ref().map(|_| ".."))
+            .finish_non_exhaustive()
+    }
 }
 
 impl ServerSession {
@@ -1636,7 +1666,13 @@ impl ServerSession {
             local_version: String::new(),
             remote_version: String::new(),
             raw_client_kexinit: None,
+            event_sink: None,
         }
+    }
+
+    /// Set the event sink after construction.
+    pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
+        self.event_sink = Some(sink);
     }
 
     /// Store the raw (wire-format) bytes of the client's KEXINIT payload.
@@ -2241,7 +2277,9 @@ impl ServerSession {
                     prompts: vec![("Password: ".to_string(), false)],
                 }));
             }
-            UserAuthRequest::GssApi { user: _, service, .. } => {
+            UserAuthRequest::GssApi {
+                user: _, service, ..
+            } => {
                 // GSSAPI auth is not implemented yet - return failure.
                 // When a GssApiProvider is configured in ServerAuthPolicy, this would handle the token exchange.
                 if service != SSH_CONNECTION_SERVICE {
@@ -4170,5 +4208,25 @@ mod tests {
             })
             .expect("server should accept SSH_MSG_DEBUG");
         assert!(reply.is_none(), "SSH_MSG_DEBUG should not produce a reply");
+    }
+
+    #[test]
+    fn transport_config_default_tcp_keepalive_is_60s() {
+        let cfg = TransportConfig::builder().build();
+        assert_eq!(cfg.tcp_keepalive_secs, Some(60));
+    }
+
+    #[test]
+    fn transport_config_builder_can_disable_tcp_keepalive() {
+        let cfg = TransportConfig::builder().tcp_keepalive_secs(None).build();
+        assert_eq!(cfg.tcp_keepalive_secs, None);
+    }
+
+    #[test]
+    fn transport_config_builder_can_set_custom_tcp_keepalive() {
+        let cfg = TransportConfig::builder()
+            .tcp_keepalive_secs(Some(120))
+            .build();
+        assert_eq!(cfg.tcp_keepalive_secs, Some(120));
     }
 }

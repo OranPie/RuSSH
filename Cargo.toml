@@ -49,6 +49,7 @@ subtle = "2"
 bcrypt-pbkdf = "0.10"
 filetime = "0.2"
 flate2 = "1.0"
+socket2 = "0.5"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

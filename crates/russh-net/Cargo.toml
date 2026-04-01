@@ -19,9 +19,11 @@ russh-crypto  = { path = "../russh-crypto" }
 russh-scp     = { path = "../russh-scp" }
 russh-sftp    = { path = "../russh-sftp" }
 russh-transport = { path = "../russh-transport" }
+russh-observability = { path = "../russh-observability" }
 tokio.workspace = true
 tracing.workspace = true
 flate2.workspace = true
+socket2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 pty-process = { version = "0.4", features = ["async"] }

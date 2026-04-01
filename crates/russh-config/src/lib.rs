@@ -1217,7 +1217,11 @@ Host myhost
         .expect("parse should succeed");
 
         let resolved = config.resolve_for_host("myhost");
-        assert_eq!(resolved.tcp_keepalive, Some(false), "first-match-wins should apply");
+        assert_eq!(
+            resolved.tcp_keepalive,
+            Some(false),
+            "first-match-wins should apply"
+        );
     }
 
     #[test]

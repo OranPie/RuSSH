@@ -38,6 +38,8 @@ mod agent;
 pub use agent::SshAgentClient;
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 #[cfg(unix)]
@@ -53,6 +55,7 @@ use russh_crypto::{
     Aes256GcmCipher, HmacSha256, HmacSha512, MacAlgorithm, Signer, SshChaCha20Poly1305,
     StreamCipher,
 };
+use russh_observability::EventSink;
 use russh_scp::build_scp_file_upload;
 use russh_sftp::{SftpFileServer, SftpFramer, SftpWirePacket};
 use russh_transport::{
@@ -86,6 +89,23 @@ pub type AnyStream = Box<dyn AsyncReadWrite + Unpin + Send>;
 
 fn io_err(e: std::io::Error) -> RusshError {
     RusshError::new(RusshErrorCategory::Io, e.to_string())
+}
+
+/// Best-effort attempt to enable TCP keepalive on a socket.
+/// Logs a warning instead of failing the connection if the OS rejects the call.
+fn apply_tcp_keepalive(tcp: &TcpStream, tcp_keepalive_secs: Option<u32>) {
+    let sock_ref = socket2::SockRef::from(tcp);
+    if let Err(e) = sock_ref.set_keepalive(true) {
+        warn!("failed to enable SO_KEEPALIVE: {e}");
+        return;
+    }
+    if let Some(secs) = tcp_keepalive_secs {
+        let keepalive =
+            socket2::TcpKeepalive::new().with_time(Duration::from_secs(u64::from(secs)));
+        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+            warn!("failed to set TCP keepalive interval: {e}");
+        }
+    }
 }
 
 fn protocol_err(msg: impl Into<String>) -> RusshError {
@@ -1197,6 +1217,8 @@ pub struct SshClientConnection {
     stream: PacketStream<AnyStream>,
     session: ClientSession,
     channel_manager: ChannelManager,
+    #[allow(dead_code)]
+    event_sink: Option<Arc<dyn EventSink>>,
 }
 
 impl SshClientConnection {
@@ -1236,7 +1258,19 @@ impl SshClientConnection {
         config: ClientConfig,
     ) -> Result<Self, RusshError> {
         let tcp = TcpStream::connect(addr).await.map_err(io_err)?;
+        apply_tcp_keepalive(&tcp, config.transport.tcp_keepalive_secs);
         Self::connect_via_stream(Box::new(tcp), config).await
+    }
+
+    /// Connect like [`connect`] but attach an [`EventSink`] for telemetry.
+    pub async fn connect_with_event_sink(
+        addr: impl ToSocketAddrs,
+        config: ClientConfig,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<Self, RusshError> {
+        let tcp = TcpStream::connect(addr).await.map_err(io_err)?;
+        apply_tcp_keepalive(&tcp, config.transport.tcp_keepalive_secs);
+        Self::connect_via_stream_with_sink(Box::new(tcp), config, Some(sink)).await
     }
 
     /// Perform SSH handshake over an already-open async stream.
@@ -1247,6 +1281,15 @@ impl SshClientConnection {
         stream: AnyStream,
         config: ClientConfig,
     ) -> Result<Self, RusshError> {
+        Self::connect_via_stream_with_sink(stream, config, None).await
+    }
+
+    /// Internal: performs handshake, optionally wiring an event sink into the session.
+    async fn connect_via_stream_with_sink(
+        stream: AnyStream,
+        config: ClientConfig,
+        event_sink: Option<Arc<dyn EventSink>>,
+    ) -> Result<Self, RusshError> {
         let mut stream = PacketStream::new(stream);
 
         // ── Banner exchange ──
@@ -1256,6 +1299,9 @@ impl SshClientConnection {
         info!(server_version = %remote_banner, "banner exchanged");
 
         let mut session = ClientSession::new(config);
+        if let Some(ref sink) = event_sink {
+            session.set_event_sink(Arc::clone(sink));
+        }
         session.set_local_version(OUR_BANNER);
         // Advance state machine through banner → AlgorithmsNegotiated.
         session.handshake(&remote_banner).await?;
@@ -1319,6 +1365,7 @@ impl SshClientConnection {
             stream,
             session,
             channel_manager: ChannelManager::new(),
+            event_sink,
         })
     }
 
@@ -2687,6 +2734,7 @@ impl SessionHandler for DefaultSessionHandler {
 pub struct SshServerConnection {
     stream: PacketStream<AnyStream>,
     config: ServerConfig,
+    event_sink: Option<Arc<dyn EventSink>>,
 }
 
 impl SshServerConnection {
@@ -2694,6 +2742,19 @@ impl SshServerConnection {
         Self {
             stream: PacketStream::new(Box::new(tcp)),
             config,
+            event_sink: None,
+        }
+    }
+
+    fn new_with_event_sink(
+        tcp: TcpStream,
+        config: ServerConfig,
+        event_sink: Option<Arc<dyn EventSink>>,
+    ) -> Self {
+        Self {
+            stream: PacketStream::new(Box::new(tcp)),
+            config,
+            event_sink,
         }
     }
 
@@ -2733,6 +2794,9 @@ impl SshServerConnection {
     /// Inner handshake + auth without timeout wrapper.
     async fn run_handshake_auth_inner(&mut self) -> Result<ServerSession, RusshError> {
         let mut session = ServerSession::new(self.config.clone());
+        if let Some(ref sink) = self.event_sink {
+            session.set_event_sink(Arc::clone(sink));
+        }
         session.set_local_version(OUR_BANNER);
 
         // ── Banner exchange ──
@@ -2883,24 +2947,58 @@ impl SshServerConnection {
             std::collections::HashMap::new();
         let mut next_server_id: u32 = 0;
         let mut remote_forward_listeners: Vec<(TcpListener, String, u16)> = Vec::new();
+        #[cfg(unix)]
+        let mut streamlocal_forward_listeners: Vec<(tokio::net::UnixListener, String)> = Vec::new();
 
         loop {
             // Multiplex between reading SSH packets and accepting TCP
-            // connections on remote-forward listeners.
+            // connections on remote-forward listeners (and Unix socket
+            // listeners on platforms that support them).
             enum LoopEvent {
                 Packet(Result<PacketFrame, RusshError>),
                 ForwardAccept(usize, std::io::Result<(TcpStream, std::net::SocketAddr)>),
+                #[cfg(unix)]
+                UnixForwardAccept(
+                    usize,
+                    std::io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)>,
+                ),
             }
 
-            let event = if remote_forward_listeners.is_empty() {
+            #[cfg(unix)]
+            let has_any_listeners =
+                !remote_forward_listeners.is_empty() || !streamlocal_forward_listeners.is_empty();
+            #[cfg(not(unix))]
+            let has_any_listeners = !remote_forward_listeners.is_empty();
+
+            let event = if !has_any_listeners {
                 LoopEvent::Packet(self.stream.read_packet().await)
             } else {
-                tokio::select! {
-                    biased;
-                    frame = self.stream.read_packet() => LoopEvent::Packet(frame),
-                    result = accept_any(&remote_forward_listeners) => {
-                        let (idx, res) = result;
-                        LoopEvent::ForwardAccept(idx, res)
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        biased;
+                        frame = self.stream.read_packet() => LoopEvent::Packet(frame),
+                        result = accept_any(&remote_forward_listeners),
+                            if !remote_forward_listeners.is_empty() => {
+                            let (idx, res) = result;
+                            LoopEvent::ForwardAccept(idx, res)
+                        }
+                        result = accept_any_unix(&streamlocal_forward_listeners),
+                            if !streamlocal_forward_listeners.is_empty() => {
+                            let (idx, res) = result;
+                            LoopEvent::UnixForwardAccept(idx, res)
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    tokio::select! {
+                        biased;
+                        frame = self.stream.read_packet() => LoopEvent::Packet(frame),
+                        result = accept_any(&remote_forward_listeners) => {
+                            let (idx, res) = result;
+                            LoopEvent::ForwardAccept(idx, res)
+                        }
                     }
                 }
             };
@@ -2965,6 +3063,64 @@ impl SshServerConnection {
                         }
                         Err(e) => {
                             warn!(error = %e, "forward listener accept error");
+                        }
+                    }
+                }
+                #[cfg(unix)]
+                LoopEvent::UnixForwardAccept(idx, accept_result) => {
+                    let (_, ref socket_path) = streamlocal_forward_listeners[idx];
+                    let socket_path = socket_path.clone();
+
+                    match accept_result {
+                        Ok((mut unix_stream, _peer_addr)) => {
+                            debug!(
+                                socket_path = %socket_path,
+                                "accepted connection on streamlocal forward listener"
+                            );
+                            let our_id = next_server_id;
+                            next_server_id += 1;
+                            let extra_data =
+                                ForwardHandle::build_forwarded_streamlocal_open_extra(&socket_path);
+                            let open_msg = ChannelMessage::Open {
+                                channel_type: "forwarded-streamlocal@openssh.com".to_string(),
+                                sender_channel: our_id,
+                                initial_window_size: 2 * 1024 * 1024,
+                                maximum_packet_size: 32768,
+                                extra_data,
+                            };
+                            if self
+                                .stream
+                                .write_packet(&open_msg.to_frame()?)
+                                .await
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            let client_ch = loop {
+                                let f = match self.stream.read_packet().await {
+                                    Ok(f) => f,
+                                    Err(_) => break None,
+                                };
+                                match ChannelMessage::from_bytes(&f.payload) {
+                                    Ok(ChannelMessage::OpenConfirmation {
+                                        recipient_channel,
+                                        sender_channel,
+                                        ..
+                                    }) if recipient_channel == our_id => {
+                                        break Some(sender_channel);
+                                    }
+                                    Ok(ChannelMessage::OpenFailure { .. }) => break None,
+                                    _ => {}
+                                }
+                            };
+                            if let Some(client_ch) = client_ch {
+                                let _ = self
+                                    .relay_server_unix_channel(our_id, client_ch, &mut unix_stream)
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "streamlocal forward listener accept error");
                         }
                     }
                 }
@@ -3131,18 +3287,11 @@ impl SshServerConnection {
                                 ]) as usize;
                                 let data_start = 5 + name_len + 1;
                                 let data = &frame.payload[data_start..];
-                                // Streamlocal forward data is a single SSH string (socket path).
-                                if data.len() >= 4 {
-                                    let path_len =
-                                        u32::from_be_bytes([data[0], data[1], data[2], data[3]])
-                                            as usize;
-                                    if data.len() >= 4 + path_len {
-                                        let socket_path =
-                                            String::from_utf8_lossy(&data[4..4 + path_len])
-                                                .to_string();
+                                match ForwardHandle::parse_streamlocal_forward_data(data) {
+                                    Ok(socket_path) => {
                                         let _ = std::fs::remove_file(&socket_path);
                                         match tokio::net::UnixListener::bind(&socket_path) {
-                                            Ok(_listener) => {
+                                            Ok(listener) => {
                                                 info!(
                                                     socket_path,
                                                     "streamlocal-forward: listener bound"
@@ -3153,6 +3302,8 @@ impl SshServerConnection {
                                                         .write_packet(&PacketFrame::new(vec![81]))
                                                         .await;
                                                 }
+                                                streamlocal_forward_listeners
+                                                    .push((listener, socket_path));
                                             }
                                             Err(e) => {
                                                 warn!(
@@ -3167,15 +3318,16 @@ impl SshServerConnection {
                                                 }
                                             }
                                         }
-                                    } else if want_reply {
-                                        let _ = self
-                                            .stream
-                                            .write_packet(&PacketFrame::new(vec![82]))
-                                            .await;
                                     }
-                                } else if want_reply {
-                                    let _ =
-                                        self.stream.write_packet(&PacketFrame::new(vec![82])).await;
+                                    Err(e) => {
+                                        warn!(error = %e, "streamlocal-forward: parse failed");
+                                        if want_reply {
+                                            let _ = self
+                                                .stream
+                                                .write_packet(&PacketFrame::new(vec![82]))
+                                                .await;
+                                        }
+                                    }
                                 }
                             }
                             #[cfg(not(unix))]
@@ -3183,9 +3335,66 @@ impl SshServerConnection {
                                 let _ = self.stream.write_packet(&PacketFrame::new(vec![82])).await;
                             }
                         } else if request_name == "cancel-streamlocal-forward@openssh.com" {
-                            // Stub: acknowledge the request but don't track listeners yet.
+                            #[cfg(unix)]
+                            {
+                                let name_len = u32::from_be_bytes([
+                                    frame.payload[1],
+                                    frame.payload[2],
+                                    frame.payload[3],
+                                    frame.payload[4],
+                                ]) as usize;
+                                let data_start = 5 + name_len + 1;
+                                let data = &frame.payload[data_start..];
+                                match ForwardHandle::parse_streamlocal_forward_data(data) {
+                                    Ok(cancel_path) => {
+                                        if let Some(idx) = streamlocal_forward_listeners
+                                            .iter()
+                                            .position(|(_, p)| *p == cancel_path)
+                                        {
+                                            let (listener, path) =
+                                                streamlocal_forward_listeners.remove(idx);
+                                            drop(listener);
+                                            let _ = std::fs::remove_file(&path);
+                                            info!(
+                                                path,
+                                                "cancel-streamlocal-forward: listener removed"
+                                            );
+                                            if want_reply {
+                                                let _ = self
+                                                    .stream
+                                                    .write_packet(&PacketFrame::new(vec![81]))
+                                                    .await;
+                                            }
+                                        } else {
+                                            warn!(
+                                                cancel_path,
+                                                "cancel-streamlocal-forward: no matching listener"
+                                            );
+                                            if want_reply {
+                                                let _ = self
+                                                    .stream
+                                                    .write_packet(&PacketFrame::new(vec![82]))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            "cancel-streamlocal-forward: parse failed"
+                                        );
+                                        if want_reply {
+                                            let _ = self
+                                                .stream
+                                                .write_packet(&PacketFrame::new(vec![82]))
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            #[cfg(not(unix))]
                             if want_reply {
-                                let _ = self.stream.write_packet(&PacketFrame::new(vec![81])).await;
+                                let _ = self.stream.write_packet(&PacketFrame::new(vec![82])).await;
                             }
                         } else if want_reply {
                             let reply = if request_name == "keepalive@openssh.com" {
@@ -4227,6 +4436,33 @@ async fn accept_any(
     .await
 }
 
+/// Accept a Unix-domain connection on any of the given listeners.
+///
+/// Returns `(index, result)` where `index` is the position of the listener
+/// that accepted the connection.
+#[cfg(unix)]
+async fn accept_any_unix(
+    listeners: &[(tokio::net::UnixListener, String)],
+) -> (
+    usize,
+    std::io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)>,
+) {
+    assert!(!listeners.is_empty());
+
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    poll_fn(|cx| {
+        for (i, (listener, _)) in listeners.iter().enumerate() {
+            if let Poll::Ready(result) = listener.poll_accept(cx) {
+                return Poll::Ready((i, result));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 // ── SshServer ────────────────────────────────────────────────────────────────
 
 /// A bound SSH server that accepts incoming connections.
@@ -4245,7 +4481,22 @@ impl SshServer {
     /// Accept the next incoming connection.
     pub async fn accept(&self) -> Result<SshServerConnection, RusshError> {
         let (tcp, _peer) = self.listener.accept().await.map_err(io_err)?;
+        apply_tcp_keepalive(&tcp, self.config.transport.tcp_keepalive_secs);
         Ok(SshServerConnection::new(tcp, self.config.clone()))
+    }
+
+    /// Accept the next incoming connection with an attached [`EventSink`].
+    pub async fn accept_with_event_sink(
+        &self,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<SshServerConnection, RusshError> {
+        let (tcp, _peer) = self.listener.accept().await.map_err(io_err)?;
+        apply_tcp_keepalive(&tcp, self.config.transport.tcp_keepalive_secs);
+        Ok(SshServerConnection::new_with_event_sink(
+            tcp,
+            self.config.clone(),
+            Some(sink),
+        ))
     }
 
     /// Return the local address the server is bound to.
@@ -4814,5 +5065,23 @@ mod tests {
             "error message should mention login grace time, got: {}",
             err.message()
         );
+    }
+
+    #[tokio::test]
+    async fn apply_tcp_keepalive_on_real_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let client_tcp = TcpStream::connect(addr).await.expect("connect");
+        let (server_tcp, _) = listener.accept().await.expect("accept");
+
+        // Apply keepalive with 60-second interval — should not panic or error.
+        apply_tcp_keepalive(&client_tcp, Some(60));
+        apply_tcp_keepalive(&server_tcp, Some(60));
+
+        // Apply with None (system default) — should also succeed.
+        apply_tcp_keepalive(&client_tcp, None);
     }
 }
