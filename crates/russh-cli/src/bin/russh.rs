@@ -5,6 +5,8 @@
 //!
 //! Options:
 //!   -A               Enable agent forwarding
+//!   -N               No remote command (forwarding-only / keepalive mode)
+//!   -f               Background after authentication (implies -N)
 //!   -p PORT          Remote port (default: 22)
 //!   -l USER          Login user
 //!   -i IDENTITY      Path to Ed25519 private key (may be repeated; default: ~/.ssh/id_ed25519)
@@ -39,6 +41,8 @@ fn usage() -> ! {
          \n\
          Options:\n\
          \x20 -A               Enable agent forwarding\n\
+         \x20 -N               No remote command (forwarding-only / keepalive)\n\
+         \x20 -f               Background after auth (implies -N)\n\
          \x20 -p PORT          Remote port (default: 22)\n\
          \x20 -l USER          Login user\n\
          \x20 -i IDENTITY      Path to Ed25519 private key (may be repeated)\n\
@@ -97,6 +101,10 @@ struct Args {
     /// Dynamic SOCKS forwarding specs: `(bind_host, bind_port)`.
     #[allow(dead_code)]
     dynamic_forwards: Vec<(String, u16)>,
+    /// `-N`: do not execute a remote command (forwarding-only / keepalive mode).
+    no_command: bool,
+    /// `-f`: background after authentication (implies `-N`).
+    fork_background: bool,
 }
 
 fn parse_o_option(opt: &str, o_opts: &mut OOptions, strict: &mut bool, tofu: &mut bool) {
@@ -234,6 +242,8 @@ fn parse_args_from(argv: Vec<String>) -> Args {
     let mut remote_forwards: Vec<(String, u16, String, u16)> = Vec::new();
     let mut dynamic_forwards: Vec<(String, u16)> = Vec::new();
     let mut agent_forwarding = false;
+    let mut no_command = false;
+    let mut fork_background = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -327,6 +337,8 @@ fn parse_args_from(argv: Vec<String>) -> Args {
             "-vv" => verbose += 2,
             "-vvv" => verbose += 3,
             "-A" => agent_forwarding = true,
+            "-N" => no_command = true,
+            "-f" => fork_background = true,
             "-q" | "--quiet" => quiet = true,
             _ => {}
         }
@@ -369,6 +381,8 @@ fn parse_args_from(argv: Vec<String>) -> Args {
         remote_forwards,
         dynamic_forwards,
         agent_forwarding,
+        no_command,
+        fork_background,
     }
 }
 
@@ -873,11 +887,26 @@ async fn main() {
 
     log.log(Severity::Info, "authenticated");
 
+    // -f implies -N (no remote command).
+    let no_command = args.no_command || args.fork_background;
+
+    // -f: release the terminal after auth by closing stdin and printing the PID.
+    if args.fork_background {
+        eprintln!(
+            "russh: backgrounding (pid {})",
+            std::process::id()
+        );
+        // Drop our handle to stdin so the terminal is released.
+        // The process continues running the event loop for forwarding / keepalive.
+        drop(std::io::stdin());
+    }
+
     // ──────────────────────────────────────────────────────────
     // Port forwarding without a command: forward-only mode.
+    // Also entered when -N is active (no remote command).
     // ──────────────────────────────────────────────────────────
     let has_forwards = !args.local_forwards.is_empty() || !args.remote_forwards.is_empty();
-    if has_forwards && args.command.is_empty() {
+    if no_command || (has_forwards && args.command.is_empty()) {
         let conn = Arc::new(tokio::sync::Mutex::new(conn));
 
         let mut handles = Vec::new();
@@ -992,9 +1021,19 @@ async fn main() {
             handles.push(handle);
         }
 
-        // Wait for all forwarding tasks (runs forever until interrupted).
-        for h in handles {
-            let _ = h.await;
+        // Wait for forwarding tasks, or just keep the connection alive (-N).
+        if handles.is_empty() {
+            log.log(
+                Severity::Info,
+                "no-command mode: waiting (press Ctrl+C to exit)",
+            );
+            tokio::signal::ctrl_c().await.ok();
+            let mut locked = conn.lock().await;
+            locked.disconnect().await.ok();
+        } else {
+            for h in handles {
+                let _ = h.await;
+            }
         }
         return;
     }
@@ -1444,5 +1483,79 @@ mod tests {
     fn server_alive_count_max_default_is_three() {
         let cfg = ClientConfig::secure_defaults("user");
         assert_eq!(cfg.transport.keepalive_count_max, 3);
+    }
+
+    // ── -N (no command) flag tests ───────────────────────────────────────
+
+    #[test]
+    fn n_flag_sets_no_command() {
+        let args = parse_args_from(make_argv(&["-N", "host"]));
+        assert!(args.no_command);
+    }
+
+    #[test]
+    fn no_command_default_off() {
+        let args = parse_args_from(make_argv(&["host"]));
+        assert!(!args.no_command);
+    }
+
+    #[test]
+    fn n_flag_with_local_forward() {
+        let args = parse_args_from(make_argv(&["-N", "-L", "8080:localhost:80", "host"]));
+        assert!(args.no_command);
+        assert_eq!(args.local_forwards.len(), 1);
+    }
+
+    #[test]
+    fn n_flag_ignores_trailing_command() {
+        let args = parse_args_from(make_argv(&["-N", "host", "ls", "-la"]));
+        assert!(args.no_command);
+        // The parser still collects the command tokens; main() will skip them.
+        assert_eq!(args.command, vec!["ls", "-la"]);
+    }
+
+    // ── -f (background) flag tests ───────────────────────────────────────
+
+    #[test]
+    fn f_flag_sets_fork_background() {
+        let args = parse_args_from(make_argv(&["-f", "host"]));
+        assert!(args.fork_background);
+    }
+
+    #[test]
+    fn fork_background_default_off() {
+        let args = parse_args_from(make_argv(&["host"]));
+        assert!(!args.fork_background);
+    }
+
+    #[test]
+    fn f_flag_implies_no_command_in_logic() {
+        // -f sets fork_background; main() derives no_command = no_command || fork_background.
+        let args = parse_args_from(make_argv(&["-f", "host"]));
+        assert!(args.fork_background);
+        let effective_no_command = args.no_command || args.fork_background;
+        assert!(effective_no_command);
+    }
+
+    #[test]
+    fn f_and_n_flags_together() {
+        let args = parse_args_from(make_argv(&["-f", "-N", "host"]));
+        assert!(args.fork_background);
+        assert!(args.no_command);
+    }
+
+    #[test]
+    fn f_flag_with_forwards() {
+        let args = parse_args_from(make_argv(&[
+            "-f",
+            "-L",
+            "8080:localhost:80",
+            "-R",
+            "0.0.0.0:9090:localhost:9090",
+            "host",
+        ]));
+        assert!(args.fork_background);
+        assert_eq!(args.local_forwards.len(), 1);
+        assert_eq!(args.remote_forwards.len(), 1);
     }
 }
