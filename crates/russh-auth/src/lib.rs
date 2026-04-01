@@ -144,6 +144,10 @@ pub struct ServerAuthPolicy {
     /// If set, only public keys present in this store are accepted.
     /// When `None`, any cryptographically valid key is accepted (insecure default).
     pub authorized_keys: Option<MemoryAuthorizedKeys>,
+    /// If set, only these usernames are permitted to authenticate.
+    pub allow_users: Option<Vec<String>>,
+    /// If set, these usernames are denied authentication (takes priority over allow_users).
+    pub deny_users: Option<Vec<String>>,
 }
 
 impl ServerAuthPolicy {
@@ -163,6 +167,8 @@ impl ServerAuthPolicy {
             max_attempts: 6,
             certificate_validator: None,
             authorized_keys: None,
+            allow_users: None,
+            deny_users: None,
         }
     }
 
@@ -174,6 +180,24 @@ impl ServerAuthPolicy {
     /// Configure the authorized keys store for public-key auth.
     pub fn set_authorized_keys(&mut self, keys: MemoryAuthorizedKeys) {
         self.authorized_keys = Some(keys);
+    }
+
+    /// Check whether a username is permitted by AllowUsers/DenyUsers policy.
+    ///
+    /// DenyUsers takes priority over AllowUsers (matching OpenSSH semantics).
+    #[must_use]
+    pub fn is_user_allowed(&self, username: &str) -> bool {
+        if let Some(deny) = &self.deny_users {
+            if deny.iter().any(|u| u == username) {
+                return false;
+            }
+        }
+        if let Some(allow) = &self.allow_users {
+            if !allow.iter().any(|u| u == username) {
+                return false;
+            }
+        }
+        true
     }
 
     #[must_use]
@@ -1432,6 +1456,12 @@ impl AuthSession {
         self.policy.certificate_validator.as_ref()
     }
 
+    /// Delegate to the policy's AllowUsers/DenyUsers check.
+    #[must_use]
+    pub fn is_user_allowed(&self, username: &str) -> bool {
+        self.policy.is_user_allowed(username)
+    }
+
     /// Returns `true` if the given public-key blob is authorized for `user`.
     ///
     /// When no authorized-keys store is configured, all cryptographically valid keys
@@ -2508,5 +2538,41 @@ mod tests {
                 Some(method)
             );
         }
+    }
+
+    #[test]
+    fn is_user_allowed_no_filters() {
+        let policy = ServerAuthPolicy::secure_defaults();
+        assert!(policy.is_user_allowed("alice"));
+        assert!(policy.is_user_allowed("bob"));
+        assert!(policy.is_user_allowed("root"));
+    }
+
+    #[test]
+    fn is_user_allowed_allow_users_set() {
+        let mut policy = ServerAuthPolicy::secure_defaults();
+        policy.allow_users = Some(vec!["alice".to_string(), "bob".to_string()]);
+        assert!(policy.is_user_allowed("alice"));
+        assert!(policy.is_user_allowed("bob"));
+        assert!(!policy.is_user_allowed("charlie"));
+    }
+
+    #[test]
+    fn is_user_allowed_deny_users_set() {
+        let mut policy = ServerAuthPolicy::secure_defaults();
+        policy.deny_users = Some(vec!["mallory".to_string()]);
+        assert!(!policy.is_user_allowed("mallory"));
+        assert!(policy.is_user_allowed("alice"));
+        assert!(policy.is_user_allowed("bob"));
+    }
+
+    #[test]
+    fn is_user_allowed_deny_takes_priority() {
+        let mut policy = ServerAuthPolicy::secure_defaults();
+        policy.allow_users = Some(vec!["alice".to_string(), "mallory".to_string()]);
+        policy.deny_users = Some(vec!["mallory".to_string()]);
+        assert!(policy.is_user_allowed("alice"));
+        assert!(!policy.is_user_allowed("mallory"));
+        assert!(!policy.is_user_allowed("bob"));
     }
 }

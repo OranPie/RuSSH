@@ -808,4 +808,75 @@ Host special
         let resolved = config.resolve_for_host("special");
         assert_eq!(resolved.login_grace_time, Some(60));
     }
+
+    #[test]
+    fn parse_allow_users_directive() {
+        let config = parse_config("AllowUsers alice bob charlie\n").expect("parse should succeed");
+        assert_eq!(config.directives.len(), 1);
+        assert!(matches!(
+            &config.directives[0],
+            Directive::AllowUsers(users) if users == &["alice", "bob", "charlie"]
+        ));
+    }
+
+    #[test]
+    fn parse_deny_users_directive() {
+        let config = parse_config("DenyUsers mallory eve\n").expect("parse should succeed");
+        assert_eq!(config.directives.len(), 1);
+        assert!(matches!(
+            &config.directives[0],
+            Directive::DenyUsers(users) if users == &["mallory", "eve"]
+        ));
+    }
+
+    #[test]
+    fn parse_allow_deny_users_case_insensitive() {
+        let config =
+            parse_config("allowusers alice\ndenyusers bob\n").expect("parse should succeed");
+        assert_eq!(config.directives.len(), 2);
+        assert!(matches!(&config.directives[0], Directive::AllowUsers(_)));
+        assert!(matches!(&config.directives[1], Directive::DenyUsers(_)));
+    }
+
+    #[test]
+    fn resolve_allow_deny_users() {
+        let config = parse_config(
+            "
+Host myserver
+  AllowUsers admin deploy
+  DenyUsers intruder
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("myserver");
+        assert_eq!(
+            resolved.allow_users.as_deref(),
+            Some(&["admin".to_string(), "deploy".to_string()] as &[String])
+        );
+        assert_eq!(
+            resolved.deny_users.as_deref(),
+            Some(&["intruder".to_string()] as &[String])
+        );
+    }
+
+    #[test]
+    fn resolve_allow_users_first_match_wins() {
+        let config = parse_config(
+            "
+Host *
+  AllowUsers alice
+Host myserver
+  AllowUsers bob
+",
+        )
+        .expect("parse should succeed");
+
+        let resolved = config.resolve_for_host("myserver");
+        assert_eq!(
+            resolved.allow_users.as_deref(),
+            Some(&["alice".to_string()] as &[String]),
+            "first-match-wins should apply"
+        );
+    }
 }

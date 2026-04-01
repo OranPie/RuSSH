@@ -2014,6 +2014,28 @@ impl ServerSession {
         &mut self,
         request: UserAuthRequest,
     ) -> Result<Option<UserAuthMessage>, RusshError> {
+        // Check AllowUsers/DenyUsers before processing any auth method.
+        let request_user = match &request {
+            UserAuthRequest::None { .. } => None,
+            UserAuthRequest::PublicKey { user, .. }
+            | UserAuthRequest::Password { user, .. }
+            | UserAuthRequest::KeyboardInteractive { user, .. } => Some(user.as_str()),
+        };
+        if let Some(username) = request_user {
+            let user_allowed = self
+                .auth_session
+                .as_ref()
+                .is_none_or(|s| s.is_user_allowed(username));
+            if !user_allowed {
+                let methods = self.allowed_userauth_methods();
+                self.bump_outgoing_sequence();
+                return Ok(Some(UserAuthMessage::Failure {
+                    methods,
+                    partial_success: false,
+                }));
+            }
+        }
+
         let (user, auth_request) = match request {
             UserAuthRequest::None {
                 user: _,
