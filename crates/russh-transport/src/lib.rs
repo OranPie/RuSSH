@@ -169,6 +169,9 @@ pub struct ServerConfig {
     /// Override the default auth policy (e.g. to configure a certificate validator).
     /// When `None`, `ServerAuthPolicy::secure_defaults()` is used.
     pub auth_policy: Option<ServerAuthPolicy>,
+    /// Maximum time a client may take to complete authentication.
+    /// Mirrors OpenSSH `LoginGraceTime`. Default: 120 seconds.
+    pub login_grace_time: Duration,
 }
 
 impl ServerConfig {
@@ -180,6 +183,7 @@ impl ServerConfig {
             permit_password_auth: true,
             host_key_seed: None,
             auth_policy: None,
+            login_grace_time: Duration::from_secs(120),
         }
     }
 }
@@ -3983,5 +3987,11 @@ mod tests {
             .expect_err("should error without pending keyboard-interactive request");
 
         assert_eq!(error.category(), RusshErrorCategory::Auth);
+    }
+
+    #[test]
+    fn server_config_login_grace_time_default_is_120s() {
+        let cfg = ServerConfig::secure_defaults();
+        assert_eq!(cfg.login_grace_time, Duration::from_secs(120));
     }
 }

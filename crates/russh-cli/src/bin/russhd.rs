@@ -9,6 +9,7 @@
 //!   -k KEY        Path to Ed25519 host key file (generated + saved if absent)
 //!   -r ROOT       SFTP/SCP root directory (default: current directory)
 //!   -A AUTHKEYS   Path to authorized_keys file (default: ~/.ssh/authorized_keys)
+//!   -g SECS       Login grace time in seconds (default: 120, 0 to disable)
 //!   --help        Print this help
 //!
 //! The server executes `exec` requests via `sh -c` and supports interactive
@@ -32,6 +33,7 @@ fn usage() -> ! {
          \x20 -k KEY        Path to host key file (generated + saved if absent)\n\
          \x20 -r ROOT       SFTP/SCP root directory (default: \".\")\n\
          \x20 -A AUTHKEYS   Path to authorized_keys file\n\
+         \x20 -g SECS       Login grace time in seconds (default: 120, 0 to disable)\n\
          \x20 -v            Increase verbosity (-vv, -vvv for more)\n\
          \x20 -q, --quiet   Suppress all diagnostic output\n\
          \x20 --help        Print this help"
@@ -45,6 +47,7 @@ struct CliArgs {
     host_key: Option<PathBuf>,
     root: PathBuf,
     authorized_keys: Option<PathBuf>,
+    login_grace_time: Option<u64>,
     verbose: u8,
     quiet: bool,
 }
@@ -56,6 +59,7 @@ fn parse_args() -> CliArgs {
     let mut host_key: Option<PathBuf> = None;
     let mut root = PathBuf::from(".");
     let mut authorized_keys: Option<PathBuf> = None;
+    let mut login_grace_time: Option<u64> = None;
     let mut verbose: u8 = 0;
     let mut quiet = false;
 
@@ -86,6 +90,14 @@ fn parse_args() -> CliArgs {
                 i += 1;
                 authorized_keys = argv.get(i).map(PathBuf::from);
             }
+            "-g" => {
+                i += 1;
+                login_grace_time =
+                    Some(argv.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                        eprintln!("error: -g requires a number of seconds");
+                        process::exit(1);
+                    }));
+            }
             "-v" => verbose += 1,
             "-vv" => verbose += 2,
             "-vvv" => verbose += 3,
@@ -101,6 +113,7 @@ fn parse_args() -> CliArgs {
         host_key,
         root,
         authorized_keys,
+        login_grace_time,
         verbose,
         quiet,
     }
@@ -236,6 +249,9 @@ async fn main() {
 
     let mut cfg = ServerConfig::secure_defaults();
     cfg.host_key_seed = Some(seed);
+    if let Some(grace) = args.login_grace_time {
+        cfg.login_grace_time = std::time::Duration::from_secs(grace);
+    }
 
     // Build auth policy: allow all methods; if authorized_keys is present,
     // use it to verify pubkey auth.  Password auth stays available via

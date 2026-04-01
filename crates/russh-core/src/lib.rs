@@ -49,6 +49,7 @@ pub enum RusshErrorCategory {
     Channel,
     Io,
     Interop,
+    Timeout,
 }
 
 /// Shared RuSSH error type.

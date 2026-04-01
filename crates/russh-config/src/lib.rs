@@ -113,6 +113,15 @@ impl ConfigFile {
                 Directive::ControlPath(v) => {
                     normalized.insert("ControlPath".to_string(), v.clone());
                 }
+                Directive::AllowUsers(users) => {
+                    normalized.insert("AllowUsers".to_string(), users.join(" "));
+                }
+                Directive::DenyUsers(users) => {
+                    normalized.insert("DenyUsers".to_string(), users.join(" "));
+                }
+                Directive::LoginGraceTime(seconds) => {
+                    normalized.insert("LoginGraceTime".to_string(), seconds.to_string());
+                }
                 Directive::Unknown(unknown) => {
                     normalized.insert(
                         format!("Unknown:{}", unknown.keyword),
@@ -151,6 +160,9 @@ pub enum Directive {
     ProxyJump(String),
     ControlMaster(String),
     ControlPath(String),
+    AllowUsers(Vec<String>),
+    DenyUsers(Vec<String>),
+    LoginGraceTime(u64),
     Unknown(UnknownDirective),
 }
 
@@ -184,6 +196,9 @@ pub struct ResolvedConfig {
     pub proxy_jump: Option<String>,
     pub control_master: Option<String>,
     pub control_path: Option<String>,
+    pub allow_users: Option<Vec<String>>,
+    pub deny_users: Option<Vec<String>>,
+    pub login_grace_time: Option<u64>,
     pub extra: std::collections::BTreeMap<String, String>,
 }
 
@@ -258,6 +273,13 @@ pub fn parse_config(input: &str) -> Result<ConfigFile, RusshError> {
                 Directive::ControlMaster(join_args(args, line_number, "ControlMaster")?)
             }
             "controlpath" => Directive::ControlPath(join_args(args, line_number, "ControlPath")?),
+            "allowusers" => {
+                Directive::AllowUsers(parse_space_list(args, line_number, "AllowUsers")?)
+            }
+            "denyusers" => Directive::DenyUsers(parse_space_list(args, line_number, "DenyUsers")?),
+            "logingracetime" => {
+                Directive::LoginGraceTime(parse_integer(args, line_number, "LoginGraceTime")?)
+            }
             _ => {
                 file.warnings.push(ConfigWarning {
                     line: line_number,
@@ -329,6 +351,16 @@ where
             format!("line {line}: {key} expects an integer"),
         )
     })
+}
+
+fn parse_space_list(args: &[String], line: usize, key: &str) -> Result<Vec<String>, RusshError> {
+    if args.is_empty() {
+        return Err(RusshError::new(
+            RusshErrorCategory::Config,
+            format!("line {line}: {key} requires at least one username"),
+        ));
+    }
+    Ok(args.to_vec())
 }
 
 fn parse_csv(args: &[String], line: usize, key: &str) -> Result<Vec<String>, RusshError> {
@@ -477,6 +509,15 @@ fn apply_directive_first_match(
         Directive::ControlPath(v) if resolved.control_path.is_none() => {
             resolved.control_path = Some(expand_tilde(&expand_tokens(v, hostname, &user), &home));
         }
+        Directive::AllowUsers(v) if resolved.allow_users.is_none() => {
+            resolved.allow_users = Some(v.clone());
+        }
+        Directive::DenyUsers(v) if resolved.deny_users.is_none() => {
+            resolved.deny_users = Some(v.clone());
+        }
+        Directive::LoginGraceTime(v) if resolved.login_grace_time.is_none() => {
+            resolved.login_grace_time = Some(*v);
+        }
         Directive::Unknown(u) => {
             resolved
                 .extra
@@ -569,7 +610,7 @@ fn glob_match_impl(pattern: &[u8], value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Directive, glob_match, matches_host_patterns, parse_config};
+    use super::{glob_match, matches_host_patterns, parse_config, Directive};
 
     #[test]
     fn parser_handles_known_and_unknown_directives() {
@@ -746,5 +787,25 @@ Host direct
             config.resolve_for_host("direct").proxy_jump.as_deref(),
             Some("none")
         );
+    }
+
+    #[test]
+    fn parse_and_resolve_login_grace_time() {
+        let config = parse_config(
+            "
+LoginGraceTime 60
+Host special
+  LoginGraceTime 30
+",
+        )
+        .expect("parse should succeed");
+
+        // Global directive applies to any host
+        let resolved = config.resolve_for_host("other.host");
+        assert_eq!(resolved.login_grace_time, Some(60));
+
+        // First-match-wins: global (60) beats host-specific (30)
+        let resolved = config.resolve_for_host("special");
+        assert_eq!(resolved.login_grace_time, Some(60));
     }
 }

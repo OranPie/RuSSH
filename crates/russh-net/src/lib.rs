@@ -2871,9 +2871,7 @@ impl SshServerConnection {
             }
         }
 
-        // ── Channel loop ──
-        info!("entering channel loop");
-        self.run_channels(&mut session, &handler).await
+        Ok(session)
     }
 
     async fn run_channels(
@@ -4542,5 +4540,49 @@ mod tests {
         let (request_name, want_reply) = parse_global_request(&payload);
         assert_eq!(request_name, "cancel-tcpip-forward");
         assert!(!want_reply);
+    }
+
+    /// Verify that a connection with a very short login grace time is
+    /// disconnected when the client does not authenticate in time.
+    #[tokio::test]
+    async fn login_grace_time_expires_disconnects_client() {
+        use russh_core::RusshErrorCategory;
+        use std::time::Duration;
+
+        let host_key_seed = [0x42u8; 32];
+        let mut server_config = ServerConfig::secure_defaults();
+        server_config.host_key_seed = Some(host_key_seed);
+        // Set a very short grace time so the test completes quickly.
+        server_config.login_grace_time = Duration::from_millis(200);
+
+        let server = SshServer::bind("127.0.0.1:0", server_config)
+            .await
+            .expect("bind server");
+        let addr = server.local_addr().expect("local addr");
+
+        let server_handle = task::spawn(async move {
+            let conn = server.accept().await.expect("accept");
+            conn.run(DefaultSessionHandler::new(".")).await
+        });
+
+        // Connect but deliberately never authenticate — just hold the TCP
+        // connection open so the server's grace timer fires.
+        let _tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("tcp connect");
+
+        // Wait for the server to time out and report the error.
+        let result = tokio::time::timeout(Duration::from_secs(5), server_handle)
+            .await
+            .expect("server should finish within 5s")
+            .expect("server task should not panic");
+
+        let err = result.expect_err("server should return an error on grace time expiry");
+        assert_eq!(err.category(), RusshErrorCategory::Timeout);
+        assert!(
+            err.message().contains("login grace time"),
+            "error message should mention login grace time, got: {}",
+            err.message()
+        );
     }
 }
