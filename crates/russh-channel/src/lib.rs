@@ -1134,8 +1134,7 @@ impl ForwardHandle {
                 "streamlocal extra data too short",
             ));
         }
-        let path_len =
-            u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let path_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
         if data.len() < 4 + path_len {
             return Err(RusshError::new(
                 RusshErrorCategory::Protocol,
@@ -1192,8 +1191,7 @@ impl ForwardHandle {
                 "streamlocal-forward data too short",
             ));
         }
-        let path_len =
-            u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let path_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
         if data.len() < 4 + path_len {
             return Err(RusshError::new(
                 RusshErrorCategory::Protocol,
@@ -1808,7 +1806,11 @@ mod channel_tests {
         let mut s = ChannelState::new(ChannelId::next(), 0, ChannelKind::Session);
         s.remote_window_size = u32::MAX;
         s.credit_local_window(1);
-        assert_eq!(s.remote_window_size, u32::MAX, "remote window must saturate");
+        assert_eq!(
+            s.remote_window_size,
+            u32::MAX,
+            "remote window must saturate"
+        );
 
         s.local_window_size = u32::MAX;
         let _ = s.build_window_adjust(1);

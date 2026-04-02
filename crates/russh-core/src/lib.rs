@@ -763,7 +763,9 @@ mod tests {
         let codec = PacketCodec::new(max);
         let frame = PacketFrame::new(vec![0xAB; max]);
 
-        let encoded = codec.encode(&frame).expect("encode at exact max should succeed");
+        let encoded = codec
+            .encode(&frame)
+            .expect("encode at exact max should succeed");
         let decoded = codec.decode(&encoded).expect("decode should succeed");
         assert_eq!(decoded.payload.len(), max);
     }

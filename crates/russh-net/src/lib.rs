@@ -2467,8 +2467,7 @@ impl SshClientConnection {
         bind_port: u16,
     ) -> Result<(), RusshError> {
         debug!(bind_host, bind_port, "requesting cancel-tcpip-forward");
-        let data =
-            ForwardHandle::build_cancel_tcpip_forward_data(bind_host, u32::from(bind_port));
+        let data = ForwardHandle::build_cancel_tcpip_forward_data(bind_host, u32::from(bind_port));
         let mut payload = Vec::new();
         payload.push(80); // SSH_MSG_GLOBAL_REQUEST
         let name = b"cancel-tcpip-forward";
@@ -2506,7 +2505,10 @@ impl SshClientConnection {
     ///
     /// Sends a `streamlocal-forward@openssh.com` global request.
     #[cfg(unix)]
-    pub async fn request_streamlocal_forward(&mut self, socket_path: &str) -> Result<(), RusshError> {
+    pub async fn request_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+    ) -> Result<(), RusshError> {
         debug!(socket_path, "requesting streamlocal-forward");
         let mut data = Vec::new();
         let path_bytes = socket_path.as_bytes();
@@ -2550,7 +2552,10 @@ impl SshClientConnection {
     ///
     /// Sends a `cancel-streamlocal-forward@openssh.com` global request.
     #[cfg(unix)]
-    pub async fn cancel_streamlocal_forward(&mut self, socket_path: &str) -> Result<(), RusshError> {
+    pub async fn cancel_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+    ) -> Result<(), RusshError> {
         debug!(socket_path, "requesting cancel-streamlocal-forward");
         let mut data = Vec::new();
         let path_bytes = socket_path.as_bytes();
@@ -5221,7 +5226,7 @@ mod tests {
     /// Test that tcpip-forward binds a listener and cancel-tcpip-forward cleans up properly.
     #[tokio::test]
     async fn tcpip_forward_lifecycle() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         // ── Server config ──
         let host_key_seed = [0x99u8; 32];
@@ -5307,7 +5312,7 @@ mod tests {
     /// Test that tcpip-forward with explicit port works.
     #[tokio::test]
     async fn tcpip_forward_explicit_port() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let host_key_seed = [0xAAu8; 32];
         let mut server_config = ServerConfig::secure_defaults();
@@ -5367,7 +5372,7 @@ mod tests {
     /// independently canceled.
     #[tokio::test]
     async fn tcpip_forward_multiple_listeners() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let host_key_seed = [0xBBu8; 32];
         let mut server_config = ServerConfig::secure_defaults();
@@ -5441,7 +5446,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn streamlocal_forward_lifecycle() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let host_key_seed = [0xCCu8; 32];
         let mut server_config = ServerConfig::secure_defaults();

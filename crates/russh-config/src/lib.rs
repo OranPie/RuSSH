@@ -1260,7 +1260,12 @@ Host myhost
         // One past the limit: immediately fails
         let result = parse_config_with_includes(simple, Path::new("."), 17);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message().contains("include depth limit"));
+        assert!(
+            result
+                .unwrap_err()
+                .message()
+                .contains("include depth limit")
+        );
     }
 
     #[test]
@@ -1301,9 +1306,18 @@ Host myhost
         let config =
             parse_config("Host foo bar baz\n  User shared\n").expect("parse should succeed");
 
-        assert_eq!(config.resolve_for_host("foo").user.as_deref(), Some("shared"));
-        assert_eq!(config.resolve_for_host("bar").user.as_deref(), Some("shared"));
-        assert_eq!(config.resolve_for_host("baz").user.as_deref(), Some("shared"));
+        assert_eq!(
+            config.resolve_for_host("foo").user.as_deref(),
+            Some("shared")
+        );
+        assert_eq!(
+            config.resolve_for_host("bar").user.as_deref(),
+            Some("shared")
+        );
+        assert_eq!(
+            config.resolve_for_host("baz").user.as_deref(),
+            Some("shared")
+        );
         assert_eq!(config.resolve_for_host("other").user, None);
     }
 
@@ -1325,8 +1339,8 @@ Host myhost
 
     #[test]
     fn duplicate_directive_first_match_wins_for_port() {
-        let config = parse_config("Host *\n  Port 2222\n  Port 3333\n")
-            .expect("parse should succeed");
+        let config =
+            parse_config("Host *\n  Port 2222\n  Port 3333\n").expect("parse should succeed");
 
         // Both Port directives are parsed into the AST
         let port_count = config
@@ -1369,10 +1383,9 @@ Host myhost
 
     #[test]
     fn unknown_directives_preserved_with_warnings() {
-        let config = parse_config(
-            "Host myhost\nCustomKey value1 value2\nAnotherUnknown x\nUser alice\n",
-        )
-        .expect("parse should succeed");
+        let config =
+            parse_config("Host myhost\nCustomKey value1 value2\nAnotherUnknown x\nUser alice\n")
+                .expect("parse should succeed");
 
         // Unknown directives don't cause parse failure
         assert_eq!(config.directives.len(), 4);

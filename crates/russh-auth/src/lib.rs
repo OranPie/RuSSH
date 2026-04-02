@@ -3030,11 +3030,7 @@ mod tests {
         let err = strict
             .validate(&cert, now)
             .expect_err("empty principals should fail when a principal is required");
-        assert!(
-            err.message().contains("principal"),
-            "err={}",
-            err.message()
-        );
+        assert!(err.message().contains("principal"), "err={}", err.message());
 
         // Permissive validator (no required principal) should accept
         let permissive = CertificateValidator::permissive();
